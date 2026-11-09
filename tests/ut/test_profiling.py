@@ -195,8 +195,8 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
 
         layout = _calculate_profile_layout(runtime_config)
 
-        self.assertEqual(layout.aic_required_records, 18)
-        self.assertEqual(layout.aiv_required_records, 3)
+        self.assertEqual(layout.aic_required_records, 20)
+        self.assertEqual(layout.aiv_required_records, 5)
         self.assertEqual(layout.aic_record_capacity, 32)
         self.assertEqual(layout.aiv_record_capacity, 16)
         self.assertEqual(layout.buffer_size, 53760)
@@ -211,8 +211,34 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
 
         layout = _calculate_profile_layout(runtime_config)
 
-        self.assertEqual(layout.aic_required_records, 258)
+        self.assertEqual(layout.aic_required_records, 260)
         self.assertEqual(layout.aic_record_capacity, 272)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_event_queue_reserves_each_workers_two_tail_records(self):
+        """Feature: MegaKernel diagnostics.
+        Description: Profile a queue whose task count exactly fills the previous capacity.
+        Expectation: Every worker retains space for both device tail markers.
+        """
+        runtime_config = _runtime_config(384)
+        runtime_config.num_workers = 48
+        runtime_config.all_tasks[0] = _three_record_task()
+        runtime_config.task_index_num[0] = 384
+        runtime_config.task_index_num[1] = 384
+
+        layout = _calculate_profile_layout(runtime_config)
+
+        self.assertEqual(layout.aic_required_records, 50)
+        self.assertEqual(layout.aiv_required_records, 50)
+        self.assertEqual(layout.aic_record_capacity, 64)
+        self.assertEqual(layout.aiv_record_capacity, 64)
+
+        runtime_config.task_index_num[0] = 0
+        runtime_config.task_index_num[1] = 0
+        empty = _calculate_profile_layout(runtime_config)
+        self.assertEqual(empty.aic_required_records, 2)
+        self.assertEqual(empty.aiv_required_records, 2)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

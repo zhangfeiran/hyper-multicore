@@ -299,8 +299,11 @@ def _calculate_event_driven_profile_layout(
         int(runtime_config.task_index_num[1]),
         num_workers // vector_worker_stride,
     )
-    aic_required_records += extra_aic_records
-    aiv_required_records = max(aiv_required_records, extra_aiv_records)
+    # WorkerKernel.ProcessProfiled records queue completion and device-read
+    # completion after the scheduled tasks, including on otherwise idle workers.
+    tail_records = 2 if num_workers else 0
+    aic_required_records += extra_aic_records + tail_records
+    aiv_required_records = max(aiv_required_records, extra_aiv_records) + tail_records
     return _ProfileLayout(
         aic_required_records=aic_required_records,
         aiv_required_records=aiv_required_records,
