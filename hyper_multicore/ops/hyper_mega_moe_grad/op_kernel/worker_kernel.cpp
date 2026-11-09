@@ -43,6 +43,17 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   static constexpr int64_t SWIGLU_DYNAMIC_FIELDS_BYTES =
     offsetof(SwiGluTilingData, baseRowLen) + sizeof(uint32_t) - SWIGLU_DYNAMIC_FIELDS_OFFSET;
 
+  static constexpr uint32_t GMM_BASE_M_OFFSET = static_cast<uint32_t>(
+    offsetof(GMMTilingData, gmmBaseParams) + offsetof(GMMBaseParams, m));
+  static constexpr uint32_t GMM_MATMUL_M_OFFSET = static_cast<uint32_t>(
+    offsetof(GMMTilingData, mmTilingData) + offsetof(TCubeTiling, M));
+  static constexpr int64_t GMM_MATMUL_M_FIELDS_BYTES =
+    offsetof(TCubeTiling, singleCoreM) + sizeof(int32_t) - offsetof(TCubeTiling, M);
+  static constexpr uint32_t GMM_MATMUL_K_OFFSET = static_cast<uint32_t>(
+    offsetof(GMMTilingData, mmTilingData) + offsetof(TCubeTiling, Ka));
+  static constexpr int64_t GMM_MATMUL_K_FIELDS_BYTES =
+    offsetof(TCubeTiling, singleCoreK) + sizeof(int32_t) - offsetof(TCubeTiling, Ka);
+
   __aicore__ inline void ResolveTaskDescriptor(TaskId &task_id, TaskDesc &task) {
 #ifdef __DAV_C220_CUBE__
     if ((task.extra_value_0 & GRADIENT_ORDER_MAGIC_MASK) != GRADIENT_ORDER_MAGIC) return;
@@ -265,6 +276,83 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     }
   }
 
+  __aicore__ inline void PrepareOwnerGroupedTiling(const TaskDesc &task_desc, GM_ADDR grouped_list_real,
+      uint32_t expert_num_single_rank, uint32_t data_index, int64_t value, GM_ADDR tiling_data_addr) {
+    GlobalTensor<int64_t> grouped_list_tensor_real;
+    grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
+
+    for (uint32_t i = 0; i < expert_num_single_rank; i++) {
+      if (i > data_index) {
+        grouped_list_tensor_real.SetValue(i, value);
+      } else if (i == data_index) {
+        grouped_list_tensor_real.SetValue(i, value);
+      } else {
+        grouped_list_tensor_real.SetValue(i, 0);
+      }
+    }
+    cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
+
+    __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
+    if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
+      tilingdata_data->mmTilingData.Ka = value;
+      tilingdata_data->mmTilingData.Kb = value;
+      tilingdata_data->mmTilingData.singleCoreK = value;
+      cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
+    } else {
+      tilingdata_data->gmmBaseParams.m = value;
+      tilingdata_data->mmTilingData.M = value;
+      tilingdata_data->mmTilingData.singleCoreM = value;
+      cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
+      cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
+    }
+    PipeBarrier<PIPE_ALL>();
+  }
+
+  __aicore__ inline bool UsesOwnerEoiGradient(const TaskDesc &task) const {
+    // EOI writes directly into parameter layout; preserve its validated group-list path.
+    const uint32_t position = task.outputs[0].input_position;
+    return this->home_experts_ == 0 &&
+           ((position == 18 && task.inputs[0].input_position == 10) ||
+            (position == 6 && task.inputs[0].input_position == 0));
+  }
+
+  __aicore__ inline void ResolveReplicaMatrices(const TaskDesc &task_desc, uint32_t data_index,
+      GM_ADDR &weight_base, GM_ADDR &output_base, int64_t &output_0_offset) {
+    if (this->home_experts_ > 0) {
+      if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
+        const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[0].dim[1]) *
+                                     task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
+        const uint32_t position = task_desc.outputs[0].input_position;
+        output_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 18 ? 2 : 3);
+        output_0_offset = 0;
+      } else {
+        const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
+                                     task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+        const uint32_t position = task_desc.inputs[1].input_position;
+        weight_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 11 ? 0 : 1);
+      }
+    }
+  }
+
+  struct GroupedCall {
+    GM_ADDR groups;
+    int64_t rows;
+    bool single_group;
+    uint32_t expert;
+    uint32_t lane;
+  };
+
+  __aicore__ inline GroupedCall PrepareGroupedCall(const TaskDesc &task, uint32_t experts,
+      uint32_t expert, int64_t rows, GM_ADDR tiling, bool bands) {
+    if (UsesOwnerEoiGradient(task)) {
+      GM_ADDR groups = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
+      PrepareOwnerGroupedTiling(task, groups, experts, expert, rows, tiling);
+      return {groups, 0, false, UINT32_MAX, GRADIENT_LANE_DISABLED};
+    }
+    const bool physical = this->home_experts_ > 0;
+    return {nullptr, rows, physical, physical ? 0 : expert, GradientLaneExpert(task, expert, bands)};
+  }
+
   __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
       DynamicData dynamic_data;
@@ -301,6 +389,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           return;
         }
         GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
+        const GroupedCall call = PrepareGroupedCall(task_desc, expert_num_single_rank, data_index, value,
+                                                     tiling_data_addr, band_flags != nullptr);
         int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
                                    ? start * task_desc.inputs[0].dim[1] * task_desc.inputs[0].data_type
                                    : task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type;
@@ -313,31 +403,17 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
 
         GM_ADDR weight_base = input_list[task_desc.inputs[1].input_position];
         GM_ADDR output_base = input_list[task_desc.outputs[0].input_position];
-        if (this->home_experts_ > 0) {
-          if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
-            const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[0].dim[1]) *
-                                         task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
-            const uint32_t position = task_desc.outputs[0].input_position;
-            output_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 18 ? 2 : 3);
-            output_0_offset = 0;
-          } else {
-            const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
-                                         task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
-            const uint32_t position = task_desc.inputs[1].input_position;
-            weight_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 11 ? 0 : 1);
-          }
-        }
+        ResolveReplicaMatrices(task_desc, data_index, weight_base, output_base, output_0_offset);
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
                        weight_base + input_1_offset, nullptr, nullptr, nullptr,
-                       nullptr, nullptr, nullptr, nullptr,
+                       nullptr, nullptr, call.groups, nullptr,
                        output_base + output_0_offset, input_list[WORKSPACE_IDX],
                        tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
                        getTransposeData(task_desc.inputs[1].transpose_flag),
                        task_desc.outputs[0].data_type == sizeof(float), band_flags, band_epoch, band_rows,
                        this->replica_trace_, task_desc.outputs[0].input_position == 18,
                        getExtraValueFromTiling(input_list[TILING_IDX], 0) % ep, data_index,
-                       value, this->home_experts_ > 0, this->home_experts_ > 0 ? 0 : data_index,
-                       GradientLaneExpert(task_desc, data_index, band_flags != nullptr));
+                       call.rows, call.single_group, call.expert, call.lane);
       }
       return;
     }
