@@ -71,9 +71,32 @@ alpha1/seed42的四组配对复测在两模式下全部回退；均衡点的配�
 
 ### 兼容性、解释与后续边界
 
-本轮不修改算法、准入门槛和产品运行时代码。旧分支按需inbox与精简分支共享B上限存储保留各自默认。
+本轮不修改算法、准入门槛和产品运行时代码。B1两边inbox配置均为None，
+全部98点的allocator allocated峰值和SHMEM Heap字节一致，本轮没有按需inbox存储差异。
 计划相同只能排除决策变化；host扩展、CPU准备或native执行等因素的因果归属需要独立单变量诊断。
 不依据本轮总时延直接认定某个已移除模块是原因。
+
+### 回退归因进展
+
+后续诊断沿用本轮冻结counts，分别对旧版host开/关、精简版，以及两个单变量控制做两个fresh process镜像复测。
+CPU控制路径使用相同核心、单线程、每点80样本；全部16个mode/route输入在各配置之间的完整计划一致。
+
+- 无表compact-home准入失败短路被删除。alpha1/seed42实际不用副本时，CPU route准备原版Push/Pull为
+  0.381/0.440ms，精简版为1.659/1.720ms。仅禁用原版短路就增加约0.57ms；此路径原版host开关基本不影响时延。
+- Python整数校验由普通int快判断变为每count调用`_integer`，一次增加约6144次Python函数调用。
+  仅恢复inline校验使精简版上述准备下降到1.121/1.186ms，无需成本模块或C++。
+- 无表host整数原语有实际加速作用。alpha0.01/seed42仅关闭旧版host，使CPU planner从
+  Push1.316→1.799ms、Pull1.334→1.841ms；精简版为2.354/2.398ms，恢复inline后为1.786/1.811ms。
+- 来源默认`auto`在受测ABI4 payload上支持active gradient lanes，owner-only还选择ActGrad优先。
+  精简版未保留这些默认执行优化；它们不应与默认关闭的研究队列混为一类。
+- 原默认owner免清零证明没有接回。在已证明所有专家正K的home路径，额外全量清零对应315MiB/rank的BF16 dW写入；
+  这是源码层面的流量差异，独立时延尚未做NPU单变量验证。
+
+CPU诊断不包含真实D2H、NPU kernel或通信；不能把上述差值机械相加为全EP32回退的完整分解。
+可选融合count库在受测旧包中未安装，所以不是本轮差异来源。
+完整样本、可达函数、ABI/构图证据及解释见交付目录
+`ep32-regression-diagnosis/REPORT-EP32-regression-diagnosis.md`。
+迁移范围应恢复这些与成本模型无关的默认加速；当前完成归因和清单更正，运行时代码尚未修复。
 
 这项跨分支测试回答迁移损失，不承担B0收益、成本模型收益、完整Trainer、FSDP大形状或峰值HBM验收。
 allocator包含相同的初始权重快照，外部SHMEM Heap另记，physical HBM仅为采样值。

@@ -60,15 +60,18 @@
 | --- | --- |
 | device planner 与其 ABI | CPU planner 已覆盖基本功能；未来单独迁移并验收策略差异 |
 | 可选融合 count kernel | 先保留精确 Torch 整数计数；表外回退本来就是合法路径，另测控制开销 |
-| 可选 host C++ extension | 先保留 Python reference；如全宽 CPU 准备开销过大，再独立接入必要整数原语 |
+| host C++ extension | 初版未迁移；EP32诊断证实无表整数原语有加速作用，应恢复其窄边界，成本专用评分函数继续移除 |
 | D2 metadata descriptor cache | 默认关闭，额外生命周期和资格证书不适合与基础迁移混合 |
 | hot replay readback、local-count upload、packed replay | 独立实验；基础 exact plan replay 与当前 token remap 必须保留 |
 | complete/projected guest search 等实验开关 | 保留默认无表生产策略；不为研究变体引入额外 API 和环境变量 |
-| 额外梯度队列、lookahead、双缓冲、详细因果 observer | 不改变既有静态 bands 顺序；必要的 ready/fence/ACK 与基础诊断仍保留 |
+| 研究梯度队列、lookahead、双缓冲、详细因果 observer | 默认关闭的研究变体继续延后；来源默认auto active lanes属于执行加速，初版未保留，应独立恢复并验收 |
 | 非副本的独立流水调优 | 可以另行评审；不从特性分支批量覆盖目标仓的 B0 实现 |
 
 首阶段移除的是可选加速入口和研究变体，不声称兼容这些旧隐藏开关。
 迁移基线以成本关闭、实验搜索关闭的旧默认无表策略为差分参考；后续验收不套用带表结果。
+EP32归因修正了此前“可选加速均延后”的裁剪边界：compact-home准入失败短路、Python整数快校验、
+无表host整数原语，以及原默认设备梯度调度都不属于成本模型。还需接回有完整覆盖证明的owner梯度免清零。
+CPU单变量已确认前三项开销，设备调度和清零的独立耗时仍需NPU对照；本轮诊断尚未修改运行时代码。
 
 ## 模块拆分与依赖方向
 
@@ -225,6 +228,8 @@ warning单列，不当作功能失败。Pylint、Lizard、Markdownlint及独立�
 纯 Python 阶段去掉可选 host 扩展，意味着计划一致不等于 CPU 延迟一致；
 指定EP32的跨分支对照已观察到回退，因果定位仍需分别测量计数、readback、规划与执行开销。
 减少成本体系和实验代码可以缩小维护面，不能自动消除 near-balance 开销。
+后续CPU诊断已确认compact-home短路和整数快路径的缺失，见[性能RFC中的归因进展](expert_replica_performance.zh-CN.md#回退归因进展)。
+不能把这些可恢复的默认加速损失当作移除成本模型的必然代价。
 
 普通驻留与外部FSDP桥接、reentrant重算、按需inbox增长及native band发布，
 是需要持续验收的主要边界。首版默认共享B上限存储，旧payload不能执行新增协议。
