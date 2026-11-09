@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
-from hyper_multicore import MegaMoeExperts, shmem
+from hyper_multicore import MegaMoeExperts
 from hyper_multicore.replica import ExpertReplicaConfig
 from hyper_multicore.replica.native import combine_native_replicas, dispatch_native_replicas, native_replica_experts
 from hyper_multicore.replica.recompute import replica_checkpoint
@@ -227,7 +227,6 @@ def test_replica_training() -> None:
         "cases": [],
         "performance_acceptance": False,
     }
-    shmem.acquire()
     try:
         patterns = (
             (0, "hot", "none"),
@@ -246,7 +245,6 @@ def test_replica_training() -> None:
             print(json.dumps({"rank": rank, **record}), flush=True)
         dist.barrier()
     finally:
-        shmem.release()
         torch.npu.synchronize(device)
         result["cleanup"] = "released"
         result["status"] = "passed" if len(result["cases"]) == len(patterns) else "failed"
