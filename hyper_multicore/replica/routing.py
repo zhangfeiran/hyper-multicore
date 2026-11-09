@@ -286,6 +286,21 @@ def _upload_route_metadata(
     return result
 
 
+def _home_route_counts(plan: ExpertExecutionPlan, rank: int, logical_counts: torch.Tensor) -> torch.Tensor:
+    """Retain owned compact counts without creating guest dispatch metadata."""
+    cache, recomputing = _recompute_metadata(plan)
+    if cache is not None and recomputing:
+        cached = cache.lookup(plan, rank, logical_counts.device, "home")
+        if cached is not None:
+            return cached[0]
+    counts = logical_counts.to(torch.int32).contiguous()
+    if cache is not None and not recomputing:
+        if counts is logical_counts:
+            counts = counts.clone()
+        cache.remember(plan, rank, logical_counts.device, "home", (counts,))
+    return counts
+
+
 def _remap_replica_ids(
     ids: torch.Tensor, plan: ExpertExecutionPlan, slots: torch.Tensor, lengths: torch.Tensor
 ) -> torch.Tensor:
@@ -560,7 +575,7 @@ def prepare_replica_route(
         return ReplicaRoute(
             plan,
             topk_ids,
-            logical.to(torch.int32).contiguous(),
+            _home_route_counts(plan, rank, logical),
             rank,
             group,
             home_only=True,

@@ -42,7 +42,7 @@ def _count_library() -> ctypes.CDLL:
     """Load the standalone count binary without multicore or SHMEM initialization."""
     path = _LIBRARY_PATH
     if not path.is_file():
-        raise RuntimeError("Build the shared replica counts library using hot_replica/README.md")
+        raise RuntimeError("Build the shared replica counts library with the repository build.sh")
     library = ctypes.CDLL(str(path))
     try:
         version = library.replica_counts_abi_version

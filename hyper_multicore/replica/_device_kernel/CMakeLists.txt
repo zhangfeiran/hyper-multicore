@@ -31,7 +31,8 @@ target_compile_options(count_kernel PRIVATE
   "SHELL:-mllvm -cce-aicore-addr-transform"
   "SHELL:-mllvm -cce-aicore-dcci-insert-for-scalar=false")
 add_library(hyper_multicore_replica_counts SHARED $<TARGET_OBJECTS:count_kernel>)
-target_link_options(hyper_multicore_replica_counts PRIVATE --cce-fatobj-link)
+target_link_options(hyper_multicore_replica_counts PRIVATE
+  --cce-fatobj-link "LINKER:-z,relro,-z,now,-z,noexecstack")
 target_link_directories(hyper_multicore_replica_counts PRIVATE ${CANN}/lib64)
 target_link_libraries(hyper_multicore_replica_counts PRIVATE runtime ascendcl stdc++ m dl)
 install(TARGETS hyper_multicore_replica_counts LIBRARY DESTINATION .)

@@ -561,7 +561,7 @@ cmake -S "${PROJECT_ROOT}/hyper_multicore/replica/_device_kernel" \
     -B "${WORK_ROOT}/replica-counts" -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${OUTPUT_ROOT}/replica"
 cmake --build "${WORK_ROOT}/replica-counts" --parallel "${NATIVE_JOBS}"
-cmake --install "${WORK_ROOT}/replica-counts"
+cmake --install "${WORK_ROOT}/replica-counts" --strip
 
 while IFS= read -r packaged_library; do
     validate_shared_library_security "${packaged_library}"

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Optional CPU primitives preserving the existing planner and calibration policy."""
+"""Optional exact integer primitives for the no-table replica planner."""
 
 from __future__ import annotations
 
