@@ -50,7 +50,7 @@ from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .configuration import execution_options as _execution_options
-from .configuration import summary_admission
+from .configuration import qualify_topology_schedule, summary_admission
 from .inactive_tasks import replica_runtime_schedule
 from .spec import (
     _COMMUNICATION_SPLIT,
@@ -152,6 +152,7 @@ class _MegaMoeExecutionResources:
         self.rank_nodes = (0,) * self.spec.ep_size
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
+        self.spec = qualify_topology_schedule(self.spec, self.rank_nodes)
         reservations = tuple(((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications))
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
         added_specifications = self.heap_manager.reserve(

@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 import torch
 
-from hyper_multicore.modules.mega_moe.configuration import execution_options
+from hyper_multicore.modules.mega_moe.configuration import execution_options, qualify_topology_schedule
 from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_multicore.modules.mega_moe.route import _owner_empty_experts, _read_replica_dynamic_route
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -71,6 +71,19 @@ class TestExecutionConfiguration(unittest.TestCase):
         self.assertIsNone(_owner_empty_experts(spec, [[0, 2, 15, 4, 0, 2, 4]], None))
         self.assertIsNone(_owner_empty_experts(replace(spec, replica_slots_per_rank=1), positive, None))
         self.assertIsNone(_owner_empty_experts(replace(spec, _selective_owner_gradient_init=False), positive, None))
+
+    def test_multi_node_auto_preserves_w2_communication_order(self) -> None:
+        """Qualify owner and guest plans from physical EP topology before native selection."""
+        nodes = (0,) * 16 + (1,) * 16
+        for budget in (0, 1):
+            spec = replace(self._spec(), replica_slots_per_rank=budget, _gradient_queue_order="auto")
+            selected = qualify_topology_schedule(spec, nodes)
+            self.assertEqual(selected._gradient_queue_order, "auto_w1")
+            self.assertEqual(spec._gradient_queue_order, "auto")
+            self.assertEqual(selected.replica_slots_per_rank, budget)
+            self.assertIs(qualify_topology_schedule(spec, (0,) * 32), spec)
+            explicit = replace(spec, _gradient_queue_order="device_active_lanes")
+            self.assertIs(qualify_topology_schedule(explicit, nodes), explicit)
 
     def test_dynamic_summary_retains_owner_overwrite_evidence(self) -> None:
         """The normal wide-table summary can prove owner initialization without another readback."""

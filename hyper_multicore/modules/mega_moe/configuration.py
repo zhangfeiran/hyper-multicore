@@ -15,11 +15,28 @@
 """Resolve execution accelerators independently of replica cost calibration."""
 
 import os
+from dataclasses import replace
 
 from hyper_multicore.replica.admission import reduction_basis_points, resolve_replica_admission
 
 from .event_refresh import event_refresh_intervals
 from .gradient_queue import ACTIVE_GRADIENT_PROJECTIONS, ADAPTIVE_GRADIENT_QUEUE
+from .spec import MegaMoeSpec
+
+
+def qualify_topology_schedule(spec: MegaMoeSpec, rank_nodes: tuple[int, ...]) -> MegaMoeSpec:
+    """Preserve the source cross-node W2 assignment for automatic scheduling.
+
+    Args:
+        spec: Shape specification after rank manifests have agreed.
+        rank_nodes: Canonical node identity for every EP rank.
+
+    Returns:
+        Automatic W1-only scheduling across nodes, or the original specification.
+    """
+    if len(set(rank_nodes)) > 1 and spec._gradient_queue_order == "auto":
+        return replace(spec, _gradient_queue_order="auto_w1")
+    return spec
 
 
 def summary_admission(budget: int) -> int:
