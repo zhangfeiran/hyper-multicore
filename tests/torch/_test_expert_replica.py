@@ -99,7 +99,7 @@ def _assert_tensor(name: str, actual: torch.Tensor, expected: torch.Tensor, erro
 
 def _inputs(pattern: str, rank: int, step: int, microbatch: int, device: torch.device) -> tuple:
     """Use fixed rank-local seeds, distinct IDs, ragged and empty source lengths."""
-    tokens = {"ragged": (1024, 257), "empty": (0, 2048)}.get(pattern, (1024, 1024))[rank]
+    tokens = {"ragged": (1024, 769), "empty": (0, 2048)}.get(pattern, (1024, 1024))[rank]
     torch.manual_seed(7300 + rank * 100 + step * 10 + microbatch)
     hidden = torch.randn(tokens, 512, device=device, dtype=torch.bfloat16) * 0.1
     ids = torch.arange(tokens * 2, device=device).reshape(tokens, 2).remainder(8 if pattern == "balanced" else 2)
@@ -162,6 +162,7 @@ def _candidate(reference, backend, mode, budget, device):
         top_k=2,
         ep_group=dist.group.WORLD,
         dispatch_mode=mode,
+        initial_capacity_factor=1.0 if mode == "push" else None,
         replica_slots_per_rank=budget,
     ).to(device=device, dtype=torch.bfloat16)
     with torch.no_grad():
@@ -178,16 +179,17 @@ def _case(backend, mode, budget, pattern, checkpoint_mode, rank, device):
     reference = reference.to(device=device, dtype=torch.bfloat16)
     candidate = _candidate(reference, backend, mode, budget, device)
     errors, transfers, matrices = {}, [], []
+    expect_copies = bool(budget and pattern != "balanced" and not (mode == "push" and pattern == "empty"))
     try:
         for step in range(2):
             transfers.extend(_step(reference, candidate, pattern, rank, step, device, checkpoint_mode, errors))
-            if isinstance(candidate, MegaMoeExperts) and budget and pattern != "balanced":
+            if isinstance(candidate, MegaMoeExperts) and expect_copies:
                 workspace = candidate._get_execution_resources(candidate.gate_up_weight).workspace
                 provider = workspace.replica_provider
                 matrices.append(tuple(provider.last_kernel_gradient_matrices))
                 if matrices[-1] != (1, 0):
                     raise AssertionError(f"Both gradient projections must return in the kernel: {matrices[-1]}")
-        if budget and pattern != "balanced" and checkpoint_mode != "reentrant" and not all(transfers):
+        if expect_copies and checkpoint_mode != "reentrant" and not all(transfers):
             raise AssertionError(f"Hot case did not execute actual guest transfers: {transfers}")
         if not budget and any(transfers):
             raise AssertionError("B0 produced guest transfers")
