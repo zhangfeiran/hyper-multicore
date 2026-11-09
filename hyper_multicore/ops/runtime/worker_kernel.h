@@ -150,18 +150,18 @@ class KernelWorkerBase {
 
  protected:
   __aicore__ inline void InitReplicaReady(__gm__ uint64_t *extension) {
-        const uint64_t epoch = extension[8];
-        if (epoch == 0 || epoch > INT32_MAX) {
-          AscendC::Trap();
-        }
-        for (uint32_t index = 0; index < 2; ++index) {
-          const uint64_t address = extension[6 + index];
-          if (address == 0 || address % DATA_CACHE_LINE_SIZE != 0) {
-            AscendC::Trap();
-          }
-          replica_ready_[index] = reinterpret_cast<GM_ADDR>(address);
-        }
-        replica_epoch_ = static_cast<int32_t>(epoch);
+    const uint64_t epoch = extension[8];
+    if (epoch == 0 || epoch > INT32_MAX) {
+      AscendC::Trap();
+    }
+    for (uint32_t index = 0; index < 2; ++index) {
+      const uint64_t address = extension[6 + index];
+      if (address == 0 || address % DATA_CACHE_LINE_SIZE != 0) {
+        AscendC::Trap();
+      }
+      replica_ready_[index] = reinterpret_cast<GM_ADDR>(address);
+    }
+    replica_epoch_ = static_cast<int32_t>(epoch);
   }
 
   __aicore__ inline void InitReplicaExtension(uint64_t runtime_bytes, uint32_t local_experts) {

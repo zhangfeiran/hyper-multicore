@@ -357,6 +357,21 @@ void get_on_stream(uintptr_t local_dst, uintptr_t remote_src, uint64_t bytes, in
                              reinterpret_cast<aclrtStream>(stream.native_handle));
 }
 
+runtime::Status copy_peer_on_stream(uintptr_t symmetric, uintptr_t local, uint64_t bytes, int32_t peer,
+                                    bool is_put, const runtime::StreamView &stream) {
+  void *remote = aclshmem_ptr(reinterpret_cast<void *>(symmetric), peer);
+  if (remote == nullptr) {
+    return InvalidArgument("SDMA requires a directly mapped SHMEM peer");
+  }
+  void *local_ptr = reinterpret_cast<void *>(local);
+  void *destination = is_put ? remote : local_ptr;
+  const void *source = is_put ? local_ptr : remote;
+  const aclError result = aclrtMemcpyAsync(destination, bytes, source, bytes, ACL_MEMCPY_DEVICE_TO_DEVICE,
+                                         reinterpret_cast<aclrtStream>(stream.native_handle));
+  return result == ACL_SUCCESS ? Success() : AclFailure("aclrtMemcpyAsync", result);
+}
+
+
 void signal_on_stream(uintptr_t remote_signal, int32_t value, SignalOp operation, int32_t target_pe,
                       const runtime::StreamView &stream) {
   aclshmemx_signal_op_on_stream(reinterpret_cast<int32_t *>(remote_signal), value, CannSignalOp(operation), target_pe,

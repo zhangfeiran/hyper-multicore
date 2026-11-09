@@ -629,14 +629,10 @@ class _HeapManager:
             ) from error
 
         try:
-            runtime_options = {}
-            if os.environ.get("HYPER_MULTICORE_SHMEM_FIXED_HEAP_REPACK") == "1":
-                runtime_options["allow_existing_runtime"] = self.heap_limit is not None
             result = shmem._restart(
                 heap_size_bytes=heap_bytes,
                 replacements=replacements,
                 preflight_hook=lambda: self._restart_preflight(layouts, replacements, bindings, agreement),
-                **runtime_options,
             )
         except Exception:
             if not _lifecycle._runtime_is_healthy():

@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import gc
 import json
 import os
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -172,6 +174,11 @@ def _candidate(reference, backend, mode, budget, device):
     return candidate
 
 
+def _expects_copies(budget: int, mode: str, pattern: str) -> bool:
+    """Distinguish admitted test inputs from an allowed owner-only empty-source Push route."""
+    return bool(budget and pattern != "balanced" and not (mode == "push" and pattern == "empty"))
+
+
 def _case(backend, mode, budget, pattern, checkpoint_mode, rank, device):
     """Compare a complete trainable replica case with an independent owner-sharded reference."""
     torch.manual_seed(20261109)
@@ -179,7 +186,7 @@ def _case(backend, mode, budget, pattern, checkpoint_mode, rank, device):
     reference = reference.to(device=device, dtype=torch.bfloat16)
     candidate = _candidate(reference, backend, mode, budget, device)
     errors, transfers, matrices = {}, [], []
-    expect_copies = bool(budget and pattern != "balanced" and not (mode == "push" and pattern == "empty"))
+    expect_copies = _expects_copies(budget, mode, pattern)
     try:
         for step in range(2):
             transfers.extend(_step(reference, candidate, pattern, rank, step, device, checkpoint_mode, errors))
@@ -205,6 +212,9 @@ def _case(backend, mode, budget, pattern, checkpoint_mode, rank, device):
             "kernel_gradient_matrices": matrices,
             "status": "passed",
         }
+    except Exception:
+        traceback.print_exc()
+        raise
     finally:
         candidate.close()
         del candidate, reference
@@ -219,6 +229,8 @@ def test_replica_training() -> None:
     rank, device = dist.get_rank(), torch.device("npu", local_rank)
     if dist.get_world_size() != 2:
         raise ValueError("Replica acceptance requires two explicit EP ranks")
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(90, repeat=True)
     backend = os.environ.get("HP_REPLICA_BACKEND", "mega")
     mode = os.environ.get("HP_REPLICA_MODE", "push")
     result = {
@@ -254,6 +266,7 @@ def test_replica_training() -> None:
         directory.mkdir(parents=True, exist_ok=True)
         (directory / f"{backend}-{mode}-rank-{rank}.json").write_text(json.dumps(result, indent=2) + "\n")
         dist.destroy_process_group()
+        faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":

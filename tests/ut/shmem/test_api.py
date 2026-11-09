@@ -48,9 +48,7 @@ class TestShmemApiDiagnostics(unittest.TestCase):
 
     def test_debug_state_reports_reference_count_after_runtime_state(self) -> None:
         """Expose the local lifecycle count next to the Native Runtime state."""
-        native = SimpleNamespace(
-            _debug_state=Mock(return_value={"state": "Ready", "root_rank": 0})
-        )
+        native = SimpleNamespace(_debug_state=Mock(return_value={"state": "Ready", "root_rank": 0}))
         with (
             patch.object(_debug, "_load_native", return_value=native),
             patch.object(_debug, "_reference_count", return_value=2),
@@ -65,8 +63,9 @@ class TestShmemApiDiagnostics(unittest.TestCase):
     def test_allocation_log_records_only_direct_callsite(self) -> None:
         """Render the first SHMEM-external caller without a complete stack chain."""
         native = SimpleNamespace(_log_debug=Mock())
-        with patch.dict("os.environ", {"SHMEM_LOG_LEVEL": "DEBUG"}), \
-             patch.object(_debug, "_load_native", return_value=native):
+        with patch.dict("os.environ", {"SHMEM_LOG_LEVEL": "DEBUG"}), patch.object(
+            _debug, "_load_native", return_value=native
+        ):
             _debug._log_allocation_site(_Tensor())  # pylint: disable=protected-access
 
         native._log_debug.assert_called_once()
@@ -79,9 +78,9 @@ class TestShmemApiDiagnostics(unittest.TestCase):
     def test_allocation_log_is_disabled_without_native_debug_level(self) -> None:
         """Stack extraction and Native logging require SHMEM DEBUG."""
         native = SimpleNamespace(_log_debug=Mock())
-        with patch.dict("os.environ", {}, clear=True), \
-             patch.object(_debug, "_load_native", return_value=native), \
-             patch.object(_debug.traceback, "extract_stack") as extract_stack:
+        with patch.dict("os.environ", {}, clear=True), patch.object(
+            _debug, "_load_native", return_value=native
+        ), patch.object(_debug.traceback, "extract_stack") as extract_stack:
             _debug._log_allocation_site(_Tensor())  # pylint: disable=protected-access
 
         extract_stack.assert_not_called()
@@ -92,10 +91,11 @@ class TestShmemApiDiagnostics(unittest.TestCase):
         tensor = _Tensor()
         torch = SimpleNamespace(get_default_dtype=Mock(return_value="torch.float32"))
         native = SimpleNamespace(_empty=Mock(return_value=tensor))
-        with patch.dict("os.environ", {"SHMEM_LOG_LEVEL": "DEBUG"}), \
-             patch.object(_api, "_torch_modules", return_value=(torch, object())), \
-             patch.object(_api, "_load_native", return_value=native), \
-             patch.object(_debug.traceback, "extract_stack", side_effect=RuntimeError("diagnostic failure")):
+        with patch.dict("os.environ", {"SHMEM_LOG_LEVEL": "DEBUG"}), patch.object(
+            _api, "_torch_modules", return_value=(torch, object())
+        ), patch.object(_api, "_load_native", return_value=native), patch.object(
+            _debug.traceback, "extract_stack", side_effect=RuntimeError("diagnostic failure")
+        ):
             result = _api.empty(8, dtype="torch.uint8")
 
         self.assertIs(result, tensor)
@@ -104,3 +104,21 @@ class TestShmemApiDiagnostics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestShmemStreamCopies(unittest.TestCase):
+    """Keep the public Python RMA boundary compatible with optional mapped-peer copies."""
+
+    def test_sdma_is_explicit_and_default_calls_keep_the_existing_signature(self) -> None:
+        """Forward SDMA intent to both compiled endpoints without changing default RMA calls."""
+        native = SimpleNamespace(_put=Mock(), _get=Mock())
+        first, second = object(), object()
+        with patch.object(_api, "_load_native", return_value=native):
+            _api.put(first, second, 1)
+            _api.get(first, second, 1)
+            native._put.assert_called_once_with(first, second, 1)
+            native._get.assert_called_once_with(first, second, 1)
+            _api.put(first, second, 1, use_sdma=True)
+            _api.get(first, second, 1, use_sdma=True)
+            native._put.assert_called_with(first, second, 1, use_sdma=True)
+            native._get.assert_called_with(first, second, 1, use_sdma=True)

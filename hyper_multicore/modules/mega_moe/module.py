@@ -468,8 +468,6 @@ class MegaMoeExperts(MulticoreModule):
         ep_size = _resolve_ep_size(ep_size, ep_group)
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         self.replica_min_rows = 1024
-        self.replica_target_load = None
-        self.replica_minimum_load_reduction = None
         self.replica_transport = "shmem_signal_kernel_gradient_bands"
         self._summary_home_admission = (
             reduction_basis_points(resolve_replica_admission(None)[0]) if replica_slots_per_rank else 0

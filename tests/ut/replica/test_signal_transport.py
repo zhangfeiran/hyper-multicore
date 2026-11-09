@@ -25,6 +25,7 @@ import torch
 from hyper_multicore.replica import build_expert_replica_plan
 from hyper_multicore.replica.residency import mark_replica_weights_materialized
 from hyper_multicore.replica.signal_transport import SignalReplicaTransport, gradient_band_layout, signal_storage_bytes
+from hyper_multicore.shmem import _api
 from tests.common.mark_utils import arg_mark
 
 
@@ -37,6 +38,31 @@ def _materialized(weights):
 @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 class TestSignalReplicaTransport(unittest.TestCase):
     """Keep host boundary checks alongside real-stream NPU protocol acceptance."""
+
+    def test_prefetch_uses_the_actual_shmem_python_api(self) -> None:
+        """A generic runtime mock must not hide missing SDMA keyword support."""
+        weights = _materialized((torch.ones(1, 2, 2, dtype=torch.bfloat16), torch.ones(1, 2, 1, dtype=torch.bfloat16)))
+        native = SimpleNamespace(_put=MagicMock(), _get=MagicMock(), _signal=MagicMock(), _wait_signal=MagicMock())
+        storage = torch.empty(signal_storage_bytes(((2, 2), (2, 1)), 1, 2, 2), dtype=torch.uint8)
+        provider = SignalReplicaTransport(_api, storage, 1, 2)
+        transfer = SimpleNamespace(owner_rank=0, owner_slot=0, target_rank=1, target_slot=1)
+        route = SimpleNamespace(
+            rank=0,
+            plan=SimpleNamespace(
+                config=SimpleNamespace(replica_slots_per_rank=1, ep_size=2, home_experts=1), transfers=(transfer,)
+            ),
+        )
+        with (
+            patch.object(_api, "_load_native", return_value=native),
+            patch.object(_api, "_host_barrier"),
+            patch.object(torch, "cpu", MagicMock()),
+            patch.object(torch.Tensor, "record_stream"),
+        ):
+            with provider.lease(weights, route, overlap=True):
+                pass
+        self.assertEqual(native._put.call_count, 4)
+        self.assertTrue(all(call.kwargs == {"use_sdma": True} for call in native._put.call_args_list))
+        self.assertEqual(native._wait_signal.call_count, 2)
 
     def test_resident_payload_hit_still_publishes_fresh_projection_ready(self) -> None:
         """Owners skip matrices across microbatches without reusing a readiness epoch."""

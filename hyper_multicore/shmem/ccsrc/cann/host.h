@@ -75,6 +75,10 @@ void put_on_stream(uintptr_t remote_dst, uintptr_t local_src, uint64_t bytes, in
 void get_on_stream(uintptr_t local_dst, uintptr_t remote_src, uint64_t bytes, int32_t source_pe,
                    const runtime::StreamView &stream);
 
+/** @brief Enqueue SDMA against a directly mapped peer; reject unavailable peer mappings. */
+runtime::Status copy_peer_on_stream(uintptr_t symmetric, uintptr_t local, uint64_t bytes, int32_t peer,
+                                    bool is_put, const runtime::StreamView &stream);
+
 /**
  * @brief Enqueue one Set or Add update to a symmetric Signal on a target Root PE.
  *

@@ -180,51 +180,49 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     GlobalTensor<int64_t> grouped_list_tensor_real;
     grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
 
-        for (uint32_t i = 0; i < expert_num_single_rank; i++) {
-          if (i > data_index) {
-            grouped_list_tensor_real.SetValue(i, value);
-          } else if (i == data_index) {
-            grouped_list_tensor_real.SetValue(i, value);
-          } else {
-            grouped_list_tensor_real.SetValue(i, 0);
-          }
-        }
-        cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
+    for (uint32_t i = 0; i < expert_num_single_rank; i++) {
+      if (i > data_index) {
+        grouped_list_tensor_real.SetValue(i, value);
+      } else if (i == data_index) {
+        grouped_list_tensor_real.SetValue(i, value);
+      } else {
+        grouped_list_tensor_real.SetValue(i, 0);
+      }
+    }
+    cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
 
-        __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
-        if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
-          tilingdata_data->mmTilingData.Ka = value;
-          tilingdata_data->mmTilingData.Kb = value;
-          tilingdata_data->mmTilingData.singleCoreK = value;
-          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
-        } else {
-          tilingdata_data->gmmBaseParams.m = value;
-          tilingdata_data->mmTilingData.M = value;
-          tilingdata_data->mmTilingData.singleCoreM = value;
-          cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
-          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
-        }
-        PipeBarrier<PIPE_ALL>();
-
-
+    __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
+    if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
+      tilingdata_data->mmTilingData.Ka = value;
+      tilingdata_data->mmTilingData.Kb = value;
+      tilingdata_data->mmTilingData.singleCoreK = value;
+      cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
+    } else {
+      tilingdata_data->gmmBaseParams.m = value;
+      tilingdata_data->mmTilingData.M = value;
+      tilingdata_data->mmTilingData.singleCoreM = value;
+      cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
+      cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
+    }
+    PipeBarrier<PIPE_ALL>();
   }
 
   __aicore__ inline void ResolveReplicaMatrices(const TaskDesc &task_desc, uint32_t data_index,
       GM_ADDR &weight_base, GM_ADDR &output_base, int64_t &output_0_offset) {
-        if (this->home_experts_ > 0) {
-          if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
-            const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[0].dim[1]) *
-                                         task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
-            const uint32_t position = task_desc.outputs[0].input_position;
-            output_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 18 ? 2 : 3);
-            output_0_offset = 0;
-          } else {
-            const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
-                                         task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
-            const uint32_t position = task_desc.inputs[1].input_position;
-            weight_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 11 ? 0 : 1);
-          }
-        }
+    if (this->home_experts_ > 0) {
+      if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
+        const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[0].dim[1]) *
+                                     task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
+        const uint32_t position = task_desc.outputs[0].input_position;
+        output_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 18 ? 2 : 3);
+        output_0_offset = 0;
+      } else {
+        const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
+                                     task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+        const uint32_t position = task_desc.inputs[1].input_position;
+        weight_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 11 ? 0 : 1);
+      }
+    }
   }
 
   __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {

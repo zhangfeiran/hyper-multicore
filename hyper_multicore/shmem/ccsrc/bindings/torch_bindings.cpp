@@ -567,7 +567,7 @@ void ResolveSymmetricTensor(const at::Tensor &tensor, std::string_view operation
   static_cast<void>(UnwrapRuntime(Runtime::Instance().ResolveAllocation(TensorView(tensor)), operation));
 }
 
-void Put(const at::Tensor &remote_dst, const at::Tensor &local_src, int64_t target_pe) {
+void Put(const at::Tensor &remote_dst, const at::Tensor &local_src, int64_t target_pe, bool use_sdma) {
   constexpr std::string_view kOperation = "put";
   ValidateContiguousNpuTensor(remote_dst, "remote_dst");
   ValidateContiguousNpuTensor(local_src, "local_src");
@@ -587,11 +587,19 @@ void Put(const at::Tensor &remote_dst, const at::Tensor &local_src, int64_t targ
   HP_SM_LOG_DEBUG(UnwrapRuntime(Runtime::Instance().RootRank(), kOperation), "Put", "Enqueue",
                   "target_pe=%d bytes=%" PRIu64 " remote_addr=%p local_addr=%p", root_pe, bytes, remote_dst.data_ptr(),
                   local_src.data_ptr());
+  if (use_sdma) {
+    RequireRuntimeOk(
+        cann::host::copy_peer_on_stream(reinterpret_cast<uintptr_t>(remote_dst.data_ptr()),
+                                       reinterpret_cast<uintptr_t>(local_src.data_ptr()), bytes, root_pe,
+                                       true, stream),
+        kOperation);
+    return;
+  }
   cann::host::put_on_stream(reinterpret_cast<uintptr_t>(remote_dst.data_ptr()),
                             reinterpret_cast<uintptr_t>(local_src.data_ptr()), bytes, root_pe, stream);
 }
 
-void Get(const at::Tensor &local_dst, const at::Tensor &remote_src, int64_t source_pe) {
+void Get(const at::Tensor &local_dst, const at::Tensor &remote_src, int64_t source_pe, bool use_sdma) {
   constexpr std::string_view kOperation = "get";
   ValidateContiguousNpuTensor(local_dst, "local_dst");
   ValidateContiguousNpuTensor(remote_src, "remote_src");
@@ -611,6 +619,14 @@ void Get(const at::Tensor &local_dst, const at::Tensor &remote_src, int64_t sour
   HP_SM_LOG_DEBUG(UnwrapRuntime(Runtime::Instance().RootRank(), kOperation), "Get", "Enqueue",
                   "source_pe=%d bytes=%" PRIu64 " local_addr=%p remote_addr=%p", root_pe, bytes, local_dst.data_ptr(),
                   remote_src.data_ptr());
+  if (use_sdma) {
+    RequireRuntimeOk(
+        cann::host::copy_peer_on_stream(reinterpret_cast<uintptr_t>(remote_src.data_ptr()),
+                                       reinterpret_cast<uintptr_t>(local_dst.data_ptr()), bytes, root_pe,
+                                       false, stream),
+        kOperation);
+    return;
+  }
   cann::host::get_on_stream(reinterpret_cast<uintptr_t>(local_dst.data_ptr()),
                             reinterpret_cast<uintptr_t>(remote_src.data_ptr()), bytes, root_pe, stream);
 }
@@ -805,8 +821,10 @@ PYBIND11_MODULE(hyper_multicore_shmem_torch, module) {
   module.def("_empty", &bindings::Empty, py::arg("shape"), py::arg("dtype"), py::arg("alignment") = std::nullopt);
   module.def("_free", &bindings::Free, py::arg("tensor"));
   module.def("_barrier", &bindings::Barrier, py::kw_only(), py::arg("blocking") = true);
-  module.def("_put", &bindings::Put, py::arg("remote_dst"), py::arg("local_src"), py::arg("target_pe"));
-  module.def("_get", &bindings::Get, py::arg("local_dst"), py::arg("remote_src"), py::arg("source_pe"));
+  module.def("_put", &bindings::Put, py::arg("remote_dst"), py::arg("local_src"), py::arg("target_pe"),
+             py::kw_only(), py::arg("use_sdma") = false);
+  module.def("_get", &bindings::Get, py::arg("local_dst"), py::arg("remote_src"), py::arg("source_pe"),
+             py::kw_only(), py::arg("use_sdma") = false);
   module.def("_signal", &bindings::Signal, py::arg("remote_signal"), py::arg("value"), py::arg("target_pe"),
              py::kw_only(), py::arg("operation") = "set");
   module.def("_wait_signal", &bindings::WaitSignal, py::arg("signal"), py::arg("value"), py::kw_only(),
