@@ -96,7 +96,9 @@ CPU诊断不包含真实D2H、NPU kernel或通信；不能把上述差值机械�
 可选融合count库在受测旧包中未安装，所以不是本轮差异来源。
 完整样本、可达函数、ABI/构图证据及解释见交付目录
 `ep32-regression-diagnosis/REPORT-EP32-regression-diagnosis.md`。
-迁移范围应恢复这些与成本模型无关的默认加速；当前完成归因和清单更正，运行时代码尚未修复。
+本轮已恢复这些与成本模型无关的默认加速，见
+[默认路径及研究变体 RFC](expert_replica_default_paths.zh-CN.md)。CPU 回归和6000组差分通过；
+新 native 和 NPU 扫描结果另记，以上旧性能数据仍仅对应第一版精简实现。
 
 这项跨分支测试回答迁移损失，不承担B0收益、成本模型收益、完整Trainer、FSDP大形状或峰值HBM验收。
 allocator包含相同的初始权重快照，外部SHMEM Heap另记，physical HBM仅为采样值。

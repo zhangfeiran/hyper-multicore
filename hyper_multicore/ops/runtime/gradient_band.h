@@ -17,6 +17,7 @@
 #define HYPER_MULTICORE_MULTICORE_GRADIENT_BAND_H
 
 #include "kernel_operator.h"
+#include "replica_trace.h"
 
 namespace MulticoreRuntime {
 
@@ -51,7 +52,13 @@ class GradientBandProducer {
 
   __aicore__ inline bool Enabled() const { return flags_ != nullptr; }
 
-
+  __aicore__ inline void SetProfile(CycleTraceRecorder *trace, uint32_t projection, uint32_t rank,
+                                   uint32_t expert) {
+    trace_ = trace;
+    projection_ = projection;
+    rank_ = rank;
+    expert_ = expert;
+  }
 
   __aicore__ inline void Begin(uint32_t rows, uint32_t core, uint32_t cores) {
     if (band_rows_ == 0) {
@@ -77,7 +84,7 @@ class GradientBandProducer {
   __aicore__ inline void PublishEmpty() {
     for (uint32_t band = 0; band < bands_; ++band) {
       if (pending_[band] == 0) {
-        Publish(band);
+        Publish(band, true);
       }
     }
   }
@@ -101,22 +108,28 @@ class GradientBandProducer {
     AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>(event);
     AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>(event);
     AscendC::PipeBarrier<PIPE_ALL>();
+    const uint64_t readable = trace_ == nullptr ? 0 : trace_->Now();
     for (uint32_t band = first; band <= last; ++band) {
       if (pending_[band] == 0) {
-        Publish(band);
+        Publish(band, false, readable);
       }
     }
   }
 
  private:
-  __aicore__ inline void Publish(uint32_t band) {
+  __aicore__ inline void Publish(uint32_t band, bool empty, uint64_t readable = 0) {
     AscendC::GlobalTensor<int32_t> flag;
     flag.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(flags_ + (band * cores_ + core_) * 64), 1);
     AscendC::PipeBarrier<PIPE_ALL>();
+    const uint64_t start = trace_ == nullptr ? 0 : (readable ? readable : trace_->Now());
     flag.SetValue(0, epoch_);
     AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                       AscendC::DcciDst::CACHELINE_OUT>(flag);
     AscendC::PipeBarrier<PIPE_ALL>();
+    if (trace_ != nullptr) {
+      RecordReplica(*trace_, empty ? ReplicaTraceEvent::EMPTY_READY : ReplicaTraceEvent::PRODUCER_READY,
+                    projection_, band, rank_, epoch_, rank_, expert_, start, trace_->Now(), core_);
+    }
   }
 
   GM_ADDR flags_ = nullptr;
@@ -126,6 +139,8 @@ class GradientBandProducer {
   uint32_t core_ = 0;
   uint32_t cores_ = 0;
   uint32_t pending_[kMaxBands];
+  CycleTraceRecorder *trace_ = nullptr;
+  uint32_t projection_ = 0, rank_ = 0, expert_ = 0;
 };
 
 }  // namespace MulticoreRuntime

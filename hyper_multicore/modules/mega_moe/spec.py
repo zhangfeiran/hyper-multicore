@@ -58,6 +58,12 @@ class MegaMoeSpec:
     replica_transport: str = "shmem_signal_kernel_gradient_bands"
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    _gradient_queue_order: str = "original"
+    _cube_event_refresh_us: int = 0
+    _vector_event_refresh_us: int = 0
+    _batch_empty_dispatch: bool = False
+    _batch_empty_combine: bool = False
+    _selective_owner_gradient_init: bool = False
     _host_replica_metadata: bool = True
     _replica_inbox_slots: int | None = None
 
@@ -94,11 +100,7 @@ class MegaMoeSpec:
 
 def _align_capacity(capacity: int) -> int:
     """Align receive capacity to the baseline compute tile, independent of communication tiles."""
-    return (
-        (capacity + _COMMUNICATION_SPLIT - 1)
-        // _COMMUNICATION_SPLIT
-        * _COMMUNICATION_SPLIT
-    )
+    return (capacity + _COMMUNICATION_SPLIT - 1) // _COMMUNICATION_SPLIT * _COMMUNICATION_SPLIT
 
 
 def _resolve_receive_capacity(
@@ -145,9 +147,11 @@ def _resolve_capacity_factors(
         return None, None
     factors = {
         "initial_capacity_factor": (
-            _DEFAULT_CAPACITY_FACTOR if initial_capacity_factor is None else initial_capacity_factor),
+            _DEFAULT_CAPACITY_FACTOR if initial_capacity_factor is None else initial_capacity_factor
+        ),
         "capacity_growth_factor": (
-            _DEFAULT_CAPACITY_FACTOR if capacity_growth_factor is None else capacity_growth_factor),
+            _DEFAULT_CAPACITY_FACTOR if capacity_growth_factor is None else capacity_growth_factor
+        ),
     }
     for name, value in factors.items():
         valid_type = isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -230,6 +234,12 @@ def bind_mega_moe_spec(specification: Mapping[str, Any], tensor: torch.Tensor) -
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
+        _gradient_queue_order=specification.get("_gradient_queue_order", "original"),
+        _cube_event_refresh_us=specification.get("_cube_event_refresh_us", 0),
+        _vector_event_refresh_us=specification.get("_vector_event_refresh_us", 0),
+        _batch_empty_dispatch=specification.get("_batch_empty_dispatch", False),
+        _batch_empty_combine=specification.get("_batch_empty_combine", False),
+        _selective_owner_gradient_init=specification.get("_selective_owner_gradient_init", False),
         _replica_inbox_slots=specification.get("_replica_inbox_slots"),
         _host_replica_metadata=specification.get("_host_replica_metadata", True),
     )

@@ -19,6 +19,7 @@
 #include "swi_glu/swi_glu.cpp"
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
+#include "runtime/empty_dispatch.h"
 #include "runtime/worker_kernel.h"
 
 using namespace AscendC;
@@ -260,8 +261,12 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     int32_t start = value * task_desc.task_split_value * hidden_size;
     int32_t end = (value + 1) * task_desc.task_split_value * hidden_size;
     if (start >= size_) {
-      aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, 1,
-                          ACLSHMEM_SIGNAL_ADD, target_pe);
+      const int32_t credit = EmptyDispatchCredit(task_desc.extra_value_0, value, single_expert_task_num,
+                                                 start, size_, send_data_size_);
+      if (credit != 0) {
+        aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, credit,
+                           ACLSHMEM_SIGNAL_ADD, target_pe);
+      }
       return;
     } else {
       if (end > size_) {

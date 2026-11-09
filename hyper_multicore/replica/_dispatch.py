@@ -18,10 +18,17 @@ from __future__ import annotations
 
 from .capacity import ExpertReplicaConfig
 from .plan import ExpertExecutionPlan
+from .host import _column_totals, _materialize_dispatch
 
 
-def _fill_node_quotas(quotas: list[list[int]], pending: list[int], dispatch: list[list[int]],
-                      width: int, rank_nodes: tuple[int, ...], sources: dict[int, list[int]]) -> None:
+def _fill_node_quotas(
+    quotas: list[list[int]],
+    pending: list[int],
+    dispatch: list[list[int]],
+    width: int,
+    rank_nodes: tuple[int, ...],
+    sources: dict[int, list[int]],
+) -> None:
     """Saturate node-local intersections after preserving all rank-local rows.
 
     For fixed expert quotas, each node must export at least its positive source
@@ -45,13 +52,16 @@ def _fill_node_quotas(quotas: list[list[int]], pending: list[int], dispatch: lis
                     index += 1
 
 
-def _capacity_checked_plan(plan: ExpertExecutionPlan, capacity_limit: int | None, *,
-                           copies: list[dict[int, int]]) -> ExpertExecutionPlan:
+def _capacity_checked_plan(
+    plan: ExpertExecutionPlan, capacity_limit: int | None, *, copies: list[dict[int, int]]
+) -> ExpertExecutionPlan:
     """Expose selected quotas and enforce the hard receive allowance."""
     # Materialization consumes these final quotas without changing them. Keep
     # their immutable slot totals instead of reducing the full source matrix.
-    destination = tuple(tuple(row.get(expert, 0) if expert >= 0 else 0 for expert in slots)
-                        for row, slots in zip(copies, plan.slot_to_logical))
+    destination = tuple(
+        tuple(row.get(expert, 0) if expert >= 0 else 0 for expert in slots)
+        for row, slots in zip(copies, plan.slot_to_logical)
+    )
     object.__setattr__(plan, "destination_counts", destination)
     if capacity_limit is not None and max(plan.destination_loads) > capacity_limit:
         raise ValueError("replica plan exceeds capacity_limit; use a feasible receive bound")
@@ -102,9 +112,15 @@ def _fill_remaining(quotas: list[list[int]], pending: list[int], dispatch: list[
             remaining -= rows
 
 
-def _assign_expert(counts: tuple[tuple[int, ...], ...], expert: int, quotas: list[list[int]],
-                   dispatch: list[list[int]], width: int, nodes: tuple[int, ...],
-                   node_sources: dict[int, list[int]]) -> None:
+def _assign_expert(
+    counts: tuple[tuple[int, ...], ...],
+    expert: int,
+    quotas: list[list[int]],
+    dispatch: list[list[int]],
+    width: int,
+    nodes: tuple[int, ...],
+    node_sources: dict[int, list[int]],
+) -> None:
     """Prefer rank-local rows, then node-local rows, then ordered remote work."""
     if len(quotas) == 1:
         for output, source in zip(dispatch, counts):
@@ -123,19 +139,32 @@ def _assign_expert(counts: tuple[tuple[int, ...], ...], expert: int, quotas: lis
     _fill_remaining(quotas, pending, dispatch)
 
 
-def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int]],
-                 config: ExpertReplicaConfig, capacity_limit: int | None = None,
-                 *, rank_nodes: tuple[int, ...] = ()) -> ExpertExecutionPlan:
+def _materialize(
+    counts: tuple[tuple[int, ...], ...],
+    copies: list[dict[int, int]],
+    config: ExpertReplicaConfig,
+    capacity_limit: int | None = None,
+    *,
+    rank_nodes: tuple[int, ...] = (),
+) -> ExpertExecutionPlan:
     """Materialize only the selected layout, preserving exact source locality."""
     home, width = config.home_experts, config.slots_per_rank
-    has_guests = any(expert // home != rank and count for rank, row in enumerate(copies)
-                     for expert, count in row.items())
+    has_guests = any(
+        expert // home != rank and count for rank, row in enumerate(copies) for expert, count in row.items()
+    )
     if not has_guests:
-        slots = tuple(tuple(range(rank * home, (rank + 1) * home)) + (-1,) * config.replica_slots_per_rank
-                      for rank in range(config.ep_size))
+        slots = tuple(
+            tuple(range(rank * home, (rank + 1) * home)) + (-1,) * config.replica_slots_per_rank
+            for rank in range(config.ep_size)
+        )
         dispatch = tuple(map(tuple, _pad_owner_rows(counts, config))) if config.replica_slots_per_rank else counts
         plan = ExpertExecutionPlan(config, counts, slots, dispatch)
         return _capacity_checked_plan(plan, capacity_limit, copies=copies)
+    native = _materialize_dispatch(counts, copies, home, config.replica_slots_per_rank, rank_nodes)
+    if native is not None:
+        return _capacity_checked_plan(
+            ExpertExecutionPlan(config, counts, native[0], native[1]), capacity_limit, copies=copies
+        )
     node_sources = {}
     if 1 < len(set(rank_nodes)) < config.ep_size:
         for rank, node in enumerate(rank_nodes):
@@ -155,12 +184,17 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
     return _capacity_checked_plan(plan, capacity_limit, copies=copies)
 
 
-def _home_layout(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaConfig,
-                 ) -> tuple[list[int], list[int], list[dict[int, int]]]:
+def _home_layout(
+    counts: tuple[tuple[int, ...], ...],
+    config: ExpertReplicaConfig,
+) -> tuple[list[int], list[int], list[dict[int, int]]]:
     """Create original owner quotas and rank loads from exact integer counts."""
-    totals = list(map(sum, zip(*counts)))
+    totals = _column_totals(counts)
+    if totals is None:
+        totals = list(map(sum, zip(*counts)))
     home = config.home_experts
-    copies = [{expert: totals[expert] for expert in range(rank * home, (rank + 1) * home)}
-              for rank in range(config.ep_size)]
+    copies = [
+        {expert: totals[expert] for expert in range(rank * home, (rank + 1) * home)} for rank in range(config.ep_size)
+    ]
     loads = [sum(row.values()) for row in copies]
     return totals, loads, copies

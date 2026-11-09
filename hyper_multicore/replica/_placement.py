@@ -20,11 +20,15 @@ from itertools import chain
 
 from ._balance import _index_positive_guests, _replacement_rows
 from .capacity import ExpertReplicaConfig
+from .host import _locality_moves
 
 
 def _within_transfer_budget(
-    copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
-    changes: dict[tuple[int, int], int], rank_nodes: tuple[int, ...], node_ranks: dict[int, list[int]],
+    copies: list[dict[int, int]],
+    counts: tuple[tuple[int, ...], ...],
+    changes: dict[tuple[int, int], int],
+    rank_nodes: tuple[int, ...],
+    node_ranks: dict[int, list[int]],
     credits: tuple[int, int],
 ) -> bool:
     """Bound changed token traffic by the deleted matrix edge's conservative row credits."""
@@ -47,8 +51,9 @@ def _within_transfer_budget(
     return cross_delta <= credits[1]
 
 
-def _deletion_changes(owner: int, target: int, expert: int, rows: int,
-                      replacements: list[tuple[int, int, int]]) -> dict[tuple[int, int], int]:
+def _deletion_changes(
+    owner: int, target: int, expert: int, rows: int, replacements: list[tuple[int, int, int]]
+) -> dict[tuple[int, int], int]:
     """Represent a matrix deletion as exact quota deltas before mutating any layout."""
     changes = {(owner, expert): rows, (target, expert): -rows}
     for rank, logical, moved in replacements:
@@ -59,8 +64,9 @@ def _deletion_changes(owner: int, target: int, expert: int, rows: int,
     return changes
 
 
-def _apply_changes(copies: list[dict[int, int]], loads: list[int], home: int,
-                   changes: dict[tuple[int, int], int]) -> None:
+def _apply_changes(
+    copies: list[dict[int, int]], loads: list[int], home: int, changes: dict[tuple[int, int], int]
+) -> None:
     """Commit admitted integer deltas while retaining zero-valued home slots."""
     for (rank, expert), change in changes.items():
         count = copies[rank].get(expert, 0) + change
@@ -71,17 +77,29 @@ def _apply_changes(copies: list[dict[int, int]], loads: list[int], home: int,
         loads[rank] += change
 
 
-def _recoverable_rows(copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
-                      owner: int, home: int, guests: list[tuple[int, int]]) -> int:
+def _recoverable_rows(
+    copies: list[dict[int, int]],
+    counts: tuple[tuple[int, ...], ...],
+    owner: int,
+    home: int,
+    guests: list[tuple[int, int]],
+) -> int:
     """Bound source-local rows that the owner's existing matrices could recover."""
     retained = [(owner, expert) for expert in copies[owner]] + guests
-    return sum(max(counts[rank][expert] - copies[rank].get(expert, 0), 0)
-               for rank, expert in retained if expert // home == owner)
+    return sum(
+        max(counts[rank][expert] - copies[rank].get(expert, 0), 0)
+        for rank, expert in retained
+        if expert // home == owner
+    )
 
 
-def _consolidate_copies(copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
-                        config: ExpertReplicaConfig, rank_nodes: tuple[int, ...],
-                        transfer_row_credit: int = 0) -> None:
+def _consolidate_copies(
+    copies: list[dict[int, int]],
+    counts: tuple[tuple[int, ...], ...],
+    config: ExpertReplicaConfig,
+    rank_nodes: tuple[int, ...],
+    transfer_row_credit: int = 0,
+) -> None:
     """Delete redundant matrices within receive and source/node traffic limits."""
     home = config.home_experts
     loads = [sum(row.values()) for row in copies]
@@ -89,9 +107,15 @@ def _consolidate_copies(copies: list[dict[int, int]], counts: tuple[tuple[int, .
     by_owner = []
     _index_positive_guests(copies, home, by_owner)
     candidates = sorted(
-        (-int(bool(rank_nodes) and rank_nodes[expert // home] != rank_nodes[rank]),
-         -len(by_owner[expert // home]), copies[rank][expert], rank, expert)
-        for rank, expert in chain.from_iterable(by_owner))
+        (
+            -int(bool(rank_nodes) and rank_nodes[expert // home] != rank_nodes[rank]),
+            -len(by_owner[expert // home]),
+            copies[rank][expert],
+            rank,
+            expert,
+        )
+        for rank, expert in chain.from_iterable(by_owner)
+    )
     node_ranks = {}
     if 1 < len(set(rank_nodes)) < config.ep_size:
         for rank, node in enumerate(rank_nodes):
@@ -116,15 +140,16 @@ def _consolidate_copies(copies: list[dict[int, int]], counts: tuple[tuple[int, .
 class _LocalityPlacement:
     """Own mutable whole-guest moves for one deterministic locality proposal."""
 
-    def __init__(self, selected: list[dict[int, int]], config: ExpertReplicaConfig,
-                 nodes: tuple[int, ...]) -> None:
+    def __init__(self, selected: list[dict[int, int]], config: ExpertReplicaConfig, nodes: tuple[int, ...]) -> None:
         """Build immutable node membership and invocation-local placement indexes."""
         self.copies = [dict(row) for row in selected]
         self.home, self.budget, self.nodes = config.home_experts, config.replica_slots_per_rank, nodes
         self.loads = [sum(row.values()) for row in selected]
         self.ceiling = max(self.loads)
-        self.guest_rows = [{expert: rows for expert, rows in row.items() if rows and expert // self.home != rank}
-                           for rank, row in enumerate(selected)]
+        self.guest_rows = [
+            {expert: rows for expert, rows in row.items() if rows and expert // self.home != rank}
+            for rank, row in enumerate(selected)
+        ]
         self.guests = list(map(len, self.guest_rows))
         self.node_ranks: dict[int, list[int]] = {}
         for rank, node in enumerate(nodes):
@@ -164,8 +189,11 @@ class _LocalityPlacement:
         upper = self.ceiling - self.loads[source] + rows
         if amount < lower or amount > upper or other in self.copies[source]:
             return None
-        saved = (1 + int(self.nodes[other // self.home] != self.nodes[target])
-                 - int(self.nodes[other // self.home] != self.nodes[source]))
+        saved = (
+            1
+            + int(self.nodes[other // self.home] != self.nodes[target])
+            - int(self.nodes[other // self.home] != self.nodes[source])
+        )
         peak = max(self.loads[source] - rows + amount, self.loads[target] - amount + rows)
         return (saved, -peak, -target, -other) if saved > 0 and peak <= self.ceiling else None
 
@@ -211,14 +239,32 @@ class _LocalityPlacement:
                 self._apply_swap(source, expert, rows, swap)
 
 
-def _locality_copies(selected: list[dict[int, int]], config: ExpertReplicaConfig,
-                     rank_nodes: tuple[int, ...]) -> list[dict[int, int]]:
+def _locality_copies(
+    selected: list[dict[int, int]], config: ExpertReplicaConfig, rank_nodes: tuple[int, ...]
+) -> list[dict[int, int]]:
     """Move, merge or swap whole guests without adding edges or receive peak."""
     home = config.home_experts
-    edges = sorted((-rows, rank, expert) for rank, row in enumerate(selected) for expert, rows in row.items()
-                   if rows and expert // home != rank and rank_nodes[expert // home] != rank_nodes[rank])
+    edges = sorted(
+        (-rows, rank, expert)
+        for rank, row in enumerate(selected)
+        for expert, rows in row.items()
+        if rows and expert // home != rank and rank_nodes[expert // home] != rank_nodes[rank]
+    )
     if not edges:
         return selected
+    operations = _locality_moves(selected, config.home_experts, config.replica_slots_per_rank, rank_nodes)
+    if operations is not None:
+        if not operations:
+            return selected
+        copies = [dict(row) for row in selected]
+        for source, target, expert, other in operations:
+            rows = copies[source].pop(expert)
+            if other < 0:
+                copies[target][expert] = copies[target].get(expert, 0) + rows
+            else:
+                amount = copies[target].pop(other)
+                copies[source][other], copies[target][expert] = amount, rows
+        return selected if copies == selected else copies
     placement = _LocalityPlacement(selected, config, rank_nodes)
     placement.improve(edges)
     return selected if placement.copies == selected else placement.copies

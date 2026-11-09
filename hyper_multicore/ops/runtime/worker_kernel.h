@@ -35,6 +35,7 @@
 #include "get_mem.h"
 #include "replica_gradient.h"
 #include "gradient_band.h"
+#include "gradient_band_observer.h"
 
 using namespace AscendC;  // NOLINT(build/namespaces)
 
@@ -136,7 +137,7 @@ class KernelWorkerBase {
     switch (getDiagnosticMode(this->runtimeConfigPtr)) {
       case DiagnosticMode::PROFILE:
         ProcessProfiled();
-        break;
+        return;
       case DiagnosticMode::TENSOR_DUMP_L1:
         ProcessL1Dump();
         break;
@@ -227,13 +228,13 @@ class KernelWorkerBase {
       ProcessReplicaGradient(config + config[1], 0x10008, trace, profiling);
       ProcessReplicaGradient(config + config[2], 0x10009, trace, profiling);
       if (worker_id_ == 0) {
-        WaitBandIncomingAcks(config + config[1]);
-        WaitBandIncomingAcks(config + config[2]);
+        WaitBandIncomingAcks(config + config[1], profiling ? &trace : nullptr, 0);
+        WaitBandIncomingAcks(config + config[2], profiling ? &trace : nullptr, 1);
       }
     } else {
       ProcessReplicaGradient(config, 0x10008, trace, profiling);
       if (worker_id_ == 0) {
-        WaitBandIncomingAcks(config);
+        WaitBandIncomingAcks(config, profiling ? &trace : nullptr, 0);
       }
     }
     if (profiling) {
@@ -297,12 +298,13 @@ class KernelWorkerBase {
       }
     }
     }
-    CompleteReplicaGradient(config, owned, incoming, worker);
+    CompleteReplicaGradient(config, owned, incoming, worker, trace, profiling, profile_desc);
 #endif
   }
 
   __aicore__ inline void CompleteReplicaGradient(__gm__ uint64_t *config, __gm__ uint64_t *owned,
-                                                __gm__ uint64_t *incoming, int32_t worker) {
+                                                __gm__ uint64_t *incoming, int32_t worker,
+                                                CycleTraceRecorder &trace, bool profiling, uint32_t profile_desc) {
 #ifndef __DAV_C220_CUBE__
     const int32_t rank = config[1], slots = config[2], epoch = config[3];
     const int32_t owned_count = config[11], incoming_count = config[10];
@@ -313,11 +315,21 @@ class KernelWorkerBase {
       for (int32_t index = 0; index < core_num; ++index) {
         WaitReplicaCompletion(done + index * DATA_CACHE_LINE_SIZE, epoch);
       }
+      if (profiling) {
+        const uint64_t now = trace.Now();
+        RecordReplica(trace, ReplicaTraceEvent::OWNER_MERGED, profile_desc == 0x10009, 255, rank, epoch,
+                      rank, 65535, now, now);
+      }
       for (int32_t index = 0; index < owned_count; ++index) {
         const int32_t peer = owned[index * 4];
         const int32_t slot = owned[index * 4 + 1];
         aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(ack +
             (rank * slots + slot) * DATA_CACHE_LINE_SIZE), epoch, ACLSHMEM_SIGNAL_SET, peer);
+        if (profiling) {
+          const uint64_t now = trace.Now();
+          RecordReplica(trace, ReplicaTraceEvent::ACK_ISSUED, profile_desc == 0x10009, 255, peer, epoch,
+                        rank, owned[index * 4 + 2], now, now);
+        }
       }
       if (config[0] != 7) {
         for (int32_t index = 0; index < incoming_count; ++index) {
@@ -329,7 +341,8 @@ class KernelWorkerBase {
 #endif
   }
 
-  __aicore__ inline void WaitBandIncomingAcks(__gm__ uint64_t *config) {
+  __aicore__ inline void WaitBandIncomingAcks(__gm__ uint64_t *config, CycleTraceRecorder *trace,
+                                               uint32_t projection) {
 #ifndef __DAV_C220_CUBE__
     if (config[0] != 7) {
       return;
@@ -337,8 +350,13 @@ class KernelWorkerBase {
     __gm__ uint64_t *incoming = config + 18;
     GM_ADDR ack = reinterpret_cast<GM_ADDR>(config[8]);
     for (int32_t index = 0; index < config[10]; ++index) {
+      const uint64_t start = trace == nullptr ? 0 : trace->Now();
       WaitReplicaCompletion(ack + (incoming[index * 3] * config[2] + incoming[index * 3 + 1]) *
                                   DATA_CACHE_LINE_SIZE, config[3]);
+      if (trace != nullptr) {
+        RecordReplica(*trace, ReplicaTraceEvent::ACK_OBSERVED, projection, 255, incoming[index * 3], config[3],
+                      config[1], home_experts_ + incoming[index * 3 + 1], start, trace->Now());
+      }
     }
 #endif
   }
@@ -388,20 +406,29 @@ class KernelWorkerBase {
     return reinterpret_cast<GM_ADDR>(config[12]) + expert * expert_stride;
   }
 
+  __aicore__ inline void ValidateGradientBandShape(__gm__ uint64_t *config, int64_t rows, int64_t columns,
+                                                    int64_t elements, int32_t band_rows, int32_t bands) {
+    if (band_rows <= 0 || rows <= 0 || columns <= 0 || rows * columns != elements ||
+        bands != (rows + band_rows - 1) / band_rows || bands > GradientBandProducer::kMaxBands ||
+        config[12] == 0 || config[13] == 0) {
+      AscendC::Trap();
+    }
+  }
+
   __aicore__ inline void ProcessGradientBands(__gm__ uint64_t *config, __gm__ uint64_t *owned,
                                                uint32_t profile_desc, CycleTraceRecorder &trace, bool profiling) {
 #ifndef __DAV_C220_CUBE__
+    if (profiling) {
+      ProcessGradientBandsProfiled(config, owned, profile_desc, trace);
+      return;
+    }
     const int32_t epoch = config[3];
     const int64_t elements = config[4];
     const int64_t rows = config[15];
     const int64_t columns = config[16];
     const int32_t band_rows = config[14];
     const int32_t bands = config[17];
-    if (band_rows <= 0 || rows <= 0 || columns <= 0 || rows * columns != elements ||
-        bands != (rows + band_rows - 1) / band_rows || bands > GradientBandProducer::kMaxBands ||
-        config[12] == 0 || config[13] == 0) {
-      AscendC::Trap();
-    }
+    ValidateGradientBandShape(config, rows, columns, elements, band_rows, bands);
     const int32_t worker = worker_id_ / VECTOR_WORKER_STRIDE;
     const uint64_t expert_stride = bands * core_num * DATA_CACHE_LINE_SIZE;
     const auto partition = PartitionGradientBands(worker, core_num, bands);
@@ -435,7 +462,46 @@ class KernelWorkerBase {
 #endif
   }
 
-
+  __aicore__ inline void ProcessGradientBandsProfiled(__gm__ uint64_t *config, __gm__ uint64_t *owned,
+                                                     uint32_t profile_desc, CycleTraceRecorder &trace) {
+#ifndef __DAV_C220_CUBE__
+    const int32_t bands = config[17], band_rows = config[14];
+    const int64_t elements = config[4], columns = config[16];
+    if (band_rows <= 0 || config[15] <= 0 || columns <= 0 || config[15] * columns != elements ||
+        bands != (config[15] + band_rows - 1) / band_rows || bands > GradientBandProducer::kMaxBands ||
+        config[12] == 0 || config[13] == 0) {
+      AscendC::Trap();
+    }
+    const int32_t worker = worker_id_ / VECTOR_WORKER_STRIDE;
+    const auto partition = PartitionGradientBands(worker, core_num, bands);
+    GradientBandObserver observer;
+    observer.Init(config, owned, core_num, profile_desc == 0x10009, &trace, partition.worker == 0);
+    // Match the frozen static executor: finish every edge of a band before the next band.
+    for (int32_t band = partition.group; band < bands; band += partition.groups) {
+      const int64_t offset = band * static_cast<int64_t>(band_rows) * columns;
+      const int64_t count = elements - offset < band_rows * columns ? elements - offset : band_rows * columns;
+      for (uint32_t index = 0; index < config[11]; ++index) {
+        uint32_t prefix = 0;
+        uint64_t refreshed = 0;
+        while (true) {
+          const uint64_t now = AscendC::GetSystemCycle();
+          if (now - refreshed >= 50) {
+            refreshed = now;
+            if (observer.Poll(index, band, prefix)) {
+              break;
+            }
+          }
+        }
+        const uint64_t start = trace.Now();
+        AddReplicaGradient(
+            reinterpret_cast<GM_ADDR>(config[5]) + (owned[index * 4 + 2] * elements + offset) * sizeof(float),
+            reinterpret_cast<GM_ADDR>(config[6]) + (owned[index * 4 + 1] * elements + offset) * sizeof(float),
+            count, owned[index * 4], partition.worker, partition.workers);
+        observer.Record(index, band, ReplicaTraceEvent::RETURN_WORK, start, trace.Now());
+      }
+    }
+#endif
+  }
 
   __aicore__ inline void WaitForReplicaWeights(int64_t slot, uint32_t projection) const {
     uint64_t start = replica_trace_ == nullptr ? 0 : replica_trace_->Now();
@@ -509,10 +575,22 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void ProcessProfiled() {
-    CycleTraceRecorder cycle_trace_recorder;
-    cycle_trace_recorder.Init(this->worker_id_, this->input_list[Derived::DIAGNOSTIC_IDX],
-                              getAicProfileRecordCapacity(this->runtimeConfigPtr),
-                              getAivProfileRecordCapacity(this->runtimeConfigPtr));
+    CycleTraceRecorder recorder;
+    recorder.Init(worker_id_, input_list[Derived::DIAGNOSTIC_IDX], getAicProfileRecordCapacity(runtimeConfigPtr),
+                  getAivProfileRecordCapacity(runtimeConfigPtr));
+    ProcessProfiledQueue(recorder);
+    const uint64_t done = recorder.Now();
+    recorder.Record(0x1001E, 0, 0, 0xFFFFFFFF, done, done);
+    ReadyHandshakeMeta meta;
+    LoadReadyHandshakeMeta(&meta);
+    if (meta.completion_event != 0) {
+      CompleteDeviceReads(meta);
+    }
+    const uint64_t complete = recorder.Now();
+    recorder.Record(0x1001F, 0, 0, 0xFFFFFFFF, complete, complete);
+  }
+
+  __aicore__ inline void ProcessProfiledQueue(CycleTraceRecorder &cycle_trace_recorder) {
 #ifdef __DAV_C220_CUBE__
     uint32_t block_idx = this->worker_id_;
     do {
@@ -538,8 +616,6 @@ class KernelWorkerBase {
     } while (1);
 #endif
   }
-
-
 
   __aicore__ inline bool LoadReadyHandshakeMeta(ReadyHandshakeMeta *meta) {
     getReadyHandshakeMeta(this->runtimeConfigPtr, meta);
@@ -687,6 +763,7 @@ class KernelWorkerBase {
     eventPipe.Destroy();
   }
 
+  __aicore__ inline void ResolveTaskDescriptor(TaskId &, TaskDesc &) {}
 
   __aicore__ inline void ExecuteTaskFast(TaskId task_id) {
     if (task_id >= runtime_task_capacity) {
@@ -694,6 +771,7 @@ class KernelWorkerBase {
     }
     TaskDesc task_desc;
     getTaskDesc(this->runtimeConfigPtr, &(task_desc), task_id);
+    static_cast<Derived *>(this)->ResolveTaskDescriptor(task_id, task_desc);
     if ((task_desc.dependent_event != EVENT_INVALID_ID && task_desc.dependent_event >= runtime_event_capacity) ||
         static_cast<uint64_t>(task_desc.trigger_event) + ATOMIC_ADD_VALUE_LEN > runtime_event_capacity) {
       AscendC::Trap();
@@ -714,6 +792,7 @@ class KernelWorkerBase {
     }
     TaskDesc task_desc;
     getTaskDesc(this->runtimeConfigPtr, &(task_desc), task_id);
+    static_cast<Derived *>(this)->ResolveTaskDescriptor(task_id, task_desc);
     if ((task_desc.dependent_event != EVENT_INVALID_ID && task_desc.dependent_event >= runtime_event_capacity) ||
         static_cast<uint64_t>(task_desc.trigger_event) + ATOMIC_ADD_VALUE_LEN > runtime_event_capacity) {
       AscendC::Trap();
@@ -740,6 +819,7 @@ class KernelWorkerBase {
     }
     TaskDesc task_desc;
     getTaskDesc(this->runtimeConfigPtr, &(task_desc), task_id);
+    static_cast<Derived *>(this)->ResolveTaskDescriptor(task_id, task_desc);
     if ((task_desc.dependent_event != EVENT_INVALID_ID && task_desc.dependent_event >= runtime_event_capacity) ||
         static_cast<uint64_t>(task_desc.trigger_event) + ATOMIC_ADD_VALUE_LEN > runtime_event_capacity) {
       AscendC::Trap();

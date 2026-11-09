@@ -2,7 +2,9 @@
 
 ## 当前交付与源码边界
 
-本方案先移除成本模型及校准体系，保留生产无表启发式的实际决策。
+本方案移除默认不执行的成本模型及校准体系，保留生产无表启发式的实际决策。
+2026-11-09 扩大迁移范围，恢复默认可达的控制和设备加速，并纳入同链路研究变体，详见
+[默认执行路径及研究变体 RFC](expert_replica_default_paths.zh-CN.md)。
 迁移目标是完整可训练的有界专家副本；规划内核及精确差分之后，已继续接入路由、Native P2P、MegaMoE、对称池和 native 梯度协议。
 执行与 DFX 见[独立无表专家副本执行闭环](expert_replica_runtime.zh-CN.md)；设备验收状态以交付 REPORT 为准。
 
@@ -22,7 +24,8 @@
 
 ## 最小完整版本必须保留什么
 
-“完整”以训练语义和资源安全为边界；成本预测、校准工具和默认关闭的研究变体不属于必需执行链。
+“完整”同时覆盖训练语义、资源安全和来源默认执行路径。成本预测与校准不进入运行依赖；
+同链路的研究变体保留显式控制，不因默认关闭而一概移除。
 
 | 能力 | 首个完整无表版本的要求 |
 | --- | --- |
@@ -54,24 +57,20 @@
 这只是来源包内的实际计数，不是整个迁移 diff 的缩减比例。
 只设置成本开关为0仍会留下 imports、dataclass 字段、实验搜索分支和校准工具，因此不作为裁剪方案。
 
-### 独立延后，不混入首个完整执行闭环
+### 扩展迁移范围：默认执行及同链路研究变体
 
-| 项目 | 延后理由 / 保留的基础能力 |
-| --- | --- |
-| device planner 与其 ABI | CPU planner 已覆盖基本功能；未来单独迁移并验收策略差异 |
-| 可选融合 count kernel | 先保留精确 Torch 整数计数；表外回退本来就是合法路径，另测控制开销 |
-| host C++ extension | 初版未迁移；EP32诊断证实无表整数原语有加速作用，应恢复其窄边界，成本专用评分函数继续移除 |
-| D2 metadata descriptor cache | 默认关闭，额外生命周期和资格证书不适合与基础迁移混合 |
-| hot replay readback、local-count upload、packed replay | 独立实验；基础 exact plan replay 与当前 token remap 必须保留 |
-| complete/projected guest search 等实验开关 | 保留默认无表生产策略；不为研究变体引入额外 API 和环境变量 |
-| 研究梯度队列、lookahead、双缓冲、详细因果 observer | 默认关闭的研究变体继续延后；来源默认auto active lanes属于执行加速，初版未保留，应独立恢复并验收 |
-| 非副本的独立流水调优 | 可以另行评审；不从特性分支批量覆盖目标仓的 B0 实现 |
+第一版把若干非成本加速一并删掉，EP32 对照已观察到时延损失。后续诊断确认
+compact-home 准入失败短路、Python 整数快校验、无表 host 整数原语和默认设备梯度调度
+均不属于成本模型，owner 梯度免清零也需要接回完整覆盖证明。
 
-首阶段移除的是可选加速入口和研究变体，不声称兼容这些旧隐藏开关。
-迁移基线以成本关闭、实验搜索关闭的旧默认无表策略为差分参考；后续验收不套用带表结果。
-EP32归因修正了此前“可选加速均延后”的裁剪边界：compact-home准入失败短路、Python整数快校验、
-无表host整数原语，以及原默认设备梯度调度都不属于成本模型。还需接回有完整覆盖证明的owner梯度免清零。
-CPU单变量已确认前三项开销，设备调度和清零的独立耗时仍需NPU对照；本轮诊断尚未修改运行时代码。
+本轮恢复以上路径，并迁移融合 count kernel、metadata/replay、研究梯度队列、事件刷新、
+空 dispatch/combine 合并、精确任务前缀和可选按需 inbox。所有成本专用浮点评分仍删除。
+实现清单、默认值、资格证书及独立验收边界见
+[默认执行路径及研究变体 RFC](expert_replica_default_paths.zh-CN.md)。
+
+独立 device planner 和 complete/projected guest search 没有默认入口，尚未迁移；
+它们不是本轮默认等价声明的一部分，也不暴露接受后无效的旧开关。
+非副本业务调优继续保留独立仓的既有实现，尤其 EOI、B0 缓存及 Pull 暂存限制。
 
 ## 模块拆分与依赖方向
 
@@ -114,8 +113,8 @@ flowchart TD
 
 | 来源能力 | 目标位置 / 操作 | 必须一起完成的闭环 |
 | --- | --- | --- |
-| `routing.py` 无表部分 | `replica/routing.py` | 共用计数、collective 错误、compact home、当前 IDs、source quotas；删除成本/device/cache实验分支 |
-| `_metadata.py` 基础上传 | `replica/_metadata.py` 小型 owned upload helper | pinned source 生存期、nonblocking 上传、consumer stream；不带实验 cache |
+| `routing.py` 无表部分 | `replica/routing.py` | 共用计数、collective 错误、compact home、当前 IDs、source quotas；删除成本分支；保留非成本默认与同链路实验入口 |
+| `_metadata.py` 基础上传 | `replica/_metadata.py` owned upload 与可选 replay | pinned source 生存期、nonblocking 上传、consumer stream；复用需精确匹配及 owned 生命周期 |
 | checkpoint resource registry | `replica/recompute.py` | F/R ordinal、exact counts/policy/group、原容量重检、异常和 early-stop 清理 |
 | `pool.py`、`transport.py` | `replica/pool.py`、`replica/transport.py` | 共享 B 池、lease/event、P2P wait、有限接收与 consume 所有权 |
 | `signal_transport.py`、`residency.py` | `replica/signal_transport.py`、`replica/residency.py` | 投影 ready、当前 ACK、generation、物化 token、按需 storage；去 observer 和旧 env 前缀 |
@@ -124,12 +123,12 @@ flowchart TD
 | MegaMoE route/function | 修改既有 `route.py`、`function.py` | 保存独占 backward 输入、FP32 dW、逆变换、guest prefetch 和归还 |
 | workspace/heap | 修改既有 `workspace.py`、`heap_manager.py` | 对称 inbox、实际预算、活动 lease 禁止增长、按需矩阵 storage 与 provider 重建 |
 | plan/graph/storage | 修改 `plan.py`、`backward/graph.py`、`backward/storage.py`，接入小型 `kernel_gradients.py` | home 与 guest 地址、dW fence、空专家初始化和安全回退 |
-| 物理 guest 任务裁剪 | 从 `inactive_tasks.py` 只抽必需部分 | 不执行空 guest、不破坏 event 配额；不带成本匹配与实验队列分支 |
+| 物理 guest 任务裁剪 | 迁移 `inactive_tasks.py` 的非成本前缀编译 | 不执行空 guest、不破坏 event 配额；保留精确事件配额及研究调度资格证书 |
 | native 梯度与发布 | runtime 的 `replica_gradient.h`、`gradient_band.h`；worker 和 GMM band patch 的必要增量 | W2/W13 生产 fence、空 producer、静态 return worker、投影 quorum、ACK |
 | 构建与封装 | 当前 dependency lock、source assembly 和 native manifest 的最小增量 | patch SHA、双向算子一起构建、同包 ABI；不覆盖现有工具链与缓存机制 |
 | SHMEM SDMA | 在既有 Python API、Torch binding 和 CANN host 层补齐映射 peer copy | 权重投影和 ready 的当前 stream 顺序；低层 `put/get` 默认参数保持兼容 |
 
-`gradient_band_observer.h`、完整 profiler decoder、模型 examples、集群报告和历史采集脚本不随 runtime 迁移。
+`gradient_band_observer.h` 随默认梯度链路迁移；完整 profiler decoder、模型 examples、集群报告和历史采集脚本不随 runtime 迁移。
 SHMEM 数据面已经属于独立仓，不重复导入另一份 runtime。
 来源 `.cpp/.h` 中除功能外还有 namespace、缓存、队列等变化，必须按协议片段挑选并编译验证，
 不能把“归一化路径后还能 apply”当作 native 等价。
@@ -211,7 +210,8 @@ plan.validate()
 refactor前后结果摘要均为 `a2fa515c2b3b4a8ab7ebd0e1802158408afad43d35ea57e8a62da8519b24b6a4`。
 参考扩展与实验搜索关闭，不把不同策略的计划混入等价声明。
 
-完整 CPU 回归为374项、2098个子例；下游桥接回归为105项。既有CANN安装归属和pytest marker
+第一版 CPU 回归为374项、2098个子例；下游桥接回归为105项。
+本轮恢复默认执行路径后，全量 CPU 回归为412项、2399个子例，6000组规划差分摘要保持不变。既有CANN安装归属和pytest marker
 warning单列，不当作功能失败。Pylint、Lizard、Markdownlint及独立仓检查分别保存日志。
 新增和修改的native patch已更新dependency lock并真正重编译；SHMEM的7项host测试通过。
 下游AutoGit全文件门存在未改动HSDP代码的基线失败，详见REPORT，不将局部UT通过等同于整门通过。
@@ -225,7 +225,7 @@ warning单列，不当作功能失败。Pylint、Lizard、Markdownlint及独立�
 
 ## 仍需实测的风险
 
-纯 Python 阶段去掉可选 host 扩展，意味着计划一致不等于 CPU 延迟一致；
+第一版纯 Python 阶段去掉 host 扩展，计划一致并未带来 CPU 延迟一致；
 指定EP32的跨分支对照已观察到回退，因果定位仍需分别测量计数、readback、规划与执行开销。
 减少成本体系和实验代码可以缩小维护面，不能自动消除 near-balance 开销。
 后续CPU诊断已确认compact-home短路和整数快路径的缺失，见[性能RFC中的归因进展](expert_replica_performance.zh-CN.md#回退归因进展)。

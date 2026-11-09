@@ -21,7 +21,7 @@ from pathlib import Path
 import shutil
 import sys
 
-from setuptools import Distribution, find_packages, setup
+from setuptools import Distribution, Extension, find_packages, setup
 from setuptools.command.build_py import build_py
 
 ROOT = Path(__file__).resolve().parent
@@ -93,6 +93,14 @@ setup(
     python_requires=">=3.10",
     packages=find_packages(include=["hyper_multicore", "hyper_multicore.*"]),
     install_requires=get_install_requires(),
+    ext_modules=[
+        Extension(
+            "hyper_multicore.replica._host_kernel._replica_host",
+            sources=[f"hyper_multicore/replica/_host_kernel/{name}.cpp" for name in ("host", "dispatch", "locality")],
+            language="c++",
+            extra_compile_args=["-std=c++17", "-O3", "-fno-fast-math", "-ffp-contract=off"],
+        )
+    ],
     scripts=["scripts/hyper_multicore_set_env.bash", "scripts/hyper_multicore_build_info"],
     include_package_data=False,
     package_data={"hyper_multicore": ["ops/runtime/*.h", "ops/runtime/*.hpp"]},

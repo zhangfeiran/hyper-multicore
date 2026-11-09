@@ -1,6 +1,7 @@
 # RFC：独立无表专家副本执行闭环
 
-状态：组件实现、CPU、设备数值及EP32跨分支性能扫描已完成，精简实现仍有时延回退；
+状态：第一版组件及 EP32 扫描已完成并观察到时延回退；本轮恢复非成本默认路径，
+CPU 412 项及2399个子例通过，新 native 和 NPU 验收独立记录；
 按 HyperParallel `003-RFC.yml` 的必填字段组织。本文对应独立仓
 `feat/expert-replica-heuristic`，与[迁移方案](expert_replica_migration.zh-CN.md)共同评审。
 
@@ -94,9 +95,12 @@ SHMEM 的低层 `put/get(..., use_sdma=True)` 在当前 NPU stream 上复制到�
 | 全部改成普通 P2P | 保留为 Native 基线，不能覆盖 MegaMoE 的投影重叠和 native bands |
 | 当前选择 | CPU 精确无表 planner + Native P2P + MegaMoE 默认 bands；共用 route 和生命周期合同 |
 
-不引入成本表、自动校准、device planner、D2 descriptor cache、动态梯度队列或因果 observer。
+不引入成本表、自动校准或独立 device planner。恢复非成本 host/count 加速、默认 auto
+调度、可选 D2 descriptor cache、研究梯度队列及必要 observer，详见
+[默认路径 RFC](expert_replica_default_paths.zh-CN.md)。
 首版默认矩阵存储为共享的 B 上限；按需 prefix 的存储布局和增长接口保留边界测试，
-尚不把按需分配打开为业务默认。后续若启用，需另验预算重规划及全组增长事务。
+默认仍共享 B 上限存储；B>1 且未显式设置 Heap 时，可用研究开关启用按需 inbox。
+该控制需独立验证预算重规划、全组增长事务和活动 lease 拒绝增长。
 
 ### 性能影响和验收边界
 

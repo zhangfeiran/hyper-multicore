@@ -23,6 +23,40 @@ from .admission import optional_peak_gain_is_sufficient
 from .capacity import ExpertReplicaConfig
 
 
+@dataclass(frozen=True)
+class _UncalibratedCandidate:
+    """Own admitted quotas until full source materialization consumes them."""
+
+    config: ExpertReplicaConfig
+    totals: tuple[int, ...]
+    copies: list[dict[int, int]]
+    limit: int
+    resident: int
+    target: int
+    minimum_rows: int = 0
+    admission: int = 0
+    saved_rows: int = 0
+
+    def matches(
+        self,
+        totals: list[int],
+        config: ExpertReplicaConfig,
+        limit: int,
+        resident: int,
+        target: int,
+        minimum_rows: int = 0,
+        admission: int = 0,
+        saved_rows: int = 0,
+    ) -> bool:
+        """Reject reuse if the source totals or agreed allocation policy changed."""
+        return (
+            self.config == config
+            and self.totals == tuple(totals)
+            and (self.limit, self.resident, self.target, self.minimum_rows, self.admission, self.saved_rows)
+            == (limit, resident, target, minimum_rows, admission, saved_rows)
+        )
+
+
 @dataclass
 class _QuotaSearchPrefix:
     """Keep one balancing skeleton and its unmodified single-guest seed."""
@@ -31,8 +65,9 @@ class _QuotaSearchPrefix:
     single_seed: list[dict[int, int]] | None = None
 
 
-def _complete_fallback(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
-                       edges: list, cutoff: int, limit: int) -> list[dict[int, int]]:
+def _complete_fallback(
+    totals: list[int], loads: list[int], config: ExpertReplicaConfig, edges: list, cutoff: int, limit: int
+) -> list[dict[int, int]]:
     """Complete a capacity-overflowing thin seed before rejecting its final layout."""
     copies = _bounded_copies(loads, totals, config, edges=edges)
     _improve_copies(copies, config, cutoff)
@@ -41,9 +76,16 @@ def _complete_fallback(totals: list[int], loads: list[int], config: ExpertReplic
     return copies
 
 
-def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
-                         limit: int, resident: int, target: int, *,
-                         prefix: _QuotaSearchPrefix | None = None) -> list[dict[int, int]] | None:
+def _uncalibrated_copies(
+    totals: list[int],
+    loads: list[int],
+    config: ExpertReplicaConfig,
+    limit: int,
+    resident: int,
+    target: int,
+    *,
+    prefix: _QuotaSearchPrefix | None = None,
+) -> list[dict[int, int]] | None:
     """Select finite guest budgets in the original deterministic order."""
     cutoff = min(target, resident)
     if max(loads) <= cutoff:
@@ -81,10 +123,19 @@ def _quota_fanout(copies: list[dict[int, int]], home: int) -> tuple[int, int]:
     return sum(outgoing), max(outgoing)
 
 
-def _sparse_completed_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
-                             current: list[dict[int, int]] | None, limit: int, resident: int,
-                             target: int, minimum_rows: int, admission: int, saved_rows: int,
-                             prefix: _QuotaSearchPrefix) -> list[dict[int, int]] | None:
+def _sparse_completed_copies(
+    totals: list[int],
+    loads: list[int],
+    config: ExpertReplicaConfig,
+    current: list[dict[int, int]] | None,
+    limit: int,
+    resident: int,
+    target: int,
+    minimum_rows: int,
+    admission: int,
+    saved_rows: int,
+    prefix: _QuotaSearchPrefix,
+) -> list[dict[int, int]] | None:
     """Compare one completed single-guest seed without latency coefficients."""
     single = replace(config, replica_slots_per_rank=1)
     proposal = prefix.single_seed
@@ -96,8 +147,7 @@ def _sparse_completed_copies(totals: list[int], loads: list[int], config: Expert
     ceiling = min(limit, max(resident, peak))
     _prune_small_copies(proposal, loads, config, minimum_rows, ceiling)
     peak = max(sum(row.values()) for row in proposal)
-    if (peak > min(limit, resident)
-            or not _optional_peak_is_useful(peak, loads, ceiling, admission, saved_rows)):
+    if peak > min(limit, resident) or not _optional_peak_is_useful(peak, loads, ceiling, admission, saved_rows):
         return current
     edges, fanout = _quota_fanout(proposal, config.home_experts)
     if not edges:
@@ -106,8 +156,7 @@ def _sparse_completed_copies(totals: list[int], loads: list[int], config: Expert
     # Spend receive headroom only for a large reduction in fixed matrix work.
     # Bound each individual expert by one balanced receiver's work, and the
     # combined receiver by two, even when the owner has much more work.
-    if (peak > 2 * average
-            or max(max(row.values()) for row in proposal) > average):
+    if peak > 2 * average or max(max(row.values()) for row in proposal) > average:
         return current
     if current is None:
         return proposal
@@ -117,13 +166,25 @@ def _sparse_completed_copies(totals: list[int], loads: list[int], config: Expert
     return proposal
 
 
-def _admitted_uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
-                                  limit: int, resident: int, target: int, minimum_rows: int,
-                                  admission: int, saved_rows: int) -> list[dict[int, int]] | None:
+def _admitted_uncalibrated_copies(
+    totals: list[int],
+    loads: list[int],
+    config: ExpertReplicaConfig,
+    limit: int,
+    resident: int,
+    target: int,
+    minimum_rows: int,
+    admission: int,
+    saved_rows: int,
+) -> list[dict[int, int]] | None:
     """Apply load admission and the production sparse completed-guest rescue."""
-    sparse = (config.replica_slots_per_rank >= 2 and minimum_rows > 0 and admission > 0
-              and max(loads) * config.ep_size >= 3 * sum(loads)
-              and min(target, resident) < max(loads) <= resident)
+    sparse = (
+        config.replica_slots_per_rank >= 2
+        and minimum_rows > 0
+        and admission > 0
+        and max(loads) * config.ep_size >= 3 * sum(loads)
+        and min(target, resident) < max(loads) <= resident
+    )
     prefix = _QuotaSearchPrefix() if sparse else None
     copies = _uncalibrated_copies(totals, loads, config, limit, resident, target, prefix=prefix)
     if copies is not None:
@@ -134,8 +195,9 @@ def _admitted_uncalibrated_copies(totals: list[int], loads: list[int], config: E
         if not _optional_peak_is_useful(peak, loads, ceiling, admission, saved_rows):
             copies = None
     if sparse:
-        return _sparse_completed_copies(totals, loads, config, copies, limit, resident, target,
-                                        minimum_rows, admission, saved_rows, prefix)
+        return _sparse_completed_copies(
+            totals, loads, config, copies, limit, resident, target, minimum_rows, admission, saved_rows, prefix
+        )
     return copies
 
 

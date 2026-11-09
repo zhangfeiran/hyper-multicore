@@ -556,6 +556,13 @@ CURRENT_REASON_CODE="CANN_VENDOR_VALIDATION_FAILED"
 validate_multicore_vendor "${VENDOR_ROOT}" "${CANN_SOC_LIST}"
 cp "${PROJECT_ROOT}/hyper_multicore/set_env.bash" "${OUTPUT_ROOT}/set_env.bash"
 
+CURRENT_REASON_CODE="REPLICA_COUNTS_BUILD_FAILED"
+cmake -S "${PROJECT_ROOT}/hyper_multicore/replica/_device_kernel" \
+    -B "${WORK_ROOT}/replica-counts" -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="${OUTPUT_ROOT}/replica"
+cmake --build "${WORK_ROOT}/replica-counts" --parallel "${NATIVE_JOBS}"
+cmake --install "${WORK_ROOT}/replica-counts"
+
 while IFS= read -r packaged_library; do
     validate_shared_library_security "${packaged_library}"
 done < <(find "${COMPONENT_ROOT}" -type f -name '*.so' -print)

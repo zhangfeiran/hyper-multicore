@@ -17,7 +17,14 @@
 from collections import defaultdict
 from typing import Optional
 
-from hyper_multicore.scheduler.config import ATOMIC_ADD_VALUE_LEN, RuntimeConfigC, TaskDescC, TaskType
+from hyper_multicore.scheduler.config import (
+    ATOMIC_ADD_VALUE_LEN,
+    EVENT_INVALID_ID,
+    RuntimeConfigC,
+    TaskDescC,
+    TaskType,
+)
+
 
 _DISPATCH = 0
 _WEIGHT2_GRAD = 6
@@ -27,7 +34,13 @@ _INPUT_GRAD = 12
 _WEIGHT13_GRAD = 18
 
 
-def _worker_read_order(tasks: list[TaskDescC], num_experts: int, num_cores: int, *, act_first: bool = False) -> bool:
+def _worker_read_order(
+    tasks: list[TaskDescC],
+    num_experts: int,
+    num_cores: int,
+    *,
+    act_first: bool = False,
+) -> bool:
     """Require every Cube to finish both receive readers before writing dX."""
     readers = (_ACTIVATION_GRAD, _WEIGHT2_GRAD) if act_first else (_WEIGHT2_GRAD, _ACTIVATION_GRAD)
     for worker in range(num_cores):
@@ -56,7 +69,7 @@ def _expert_events_join_readers(
     num_experts: int,
     num_cores: int,
     *,
-    act_first: bool = False
+    act_first: bool = False,
 ) -> bool:
     """Require the existing event chain to join all readers of each expert."""
     acts = defaultdict(list)
@@ -84,21 +97,21 @@ def _expert_events_join_readers(
         if task.task_type == TaskType.TASK_GROUPED_MATMUL and task.extra_value_1:
             producers[task.extra_value_1].append(task)
     return all(
-        (
-            _expert_dependency_chain(
-                cfg, acts[expert], gates[expert], swiglu[expert], num_cores, producers, late_reads[expert]
-            )
-            for expert in range(num_experts)
+        _expert_dependency_chain(
+            cfg, acts[expert], gates[expert], swiglu[expert], num_cores, producers, late_reads[expert]
         )
+        for expert in range(num_experts)
     )
 
 
 def _event_joins_tasks(cfg: RuntimeConfigC, tasks: list[TaskDescC], producers: dict) -> bool:
     """Require a completion event to include exactly these nonempty tasks."""
     event = tasks[0].trigger_event
-    return (len(producers[event]) == len(tasks)
-            and cfg.all_event_num_triggers[event] == len(tasks)
-            and all(task.trigger_event == event for task in tasks))
+    return (
+        len(producers[event]) == len(tasks)
+        and cfg.all_event_num_triggers[event] == len(tasks)
+        and all(task.trigger_event == event for task in tasks)
+    )
 
 
 def _expert_dependency_chain(
@@ -111,19 +124,23 @@ def _expert_dependency_chain(
     late_reads: list[TaskDescC],
 ) -> bool:
     """Join every expert reader before any task overwrites its receive rows."""
-    if len(acts) != num_cores or len(gates) != num_cores or (not swiglu):
+    if len(acts) != num_cores or len(gates) != num_cores or not swiglu:
         return False
     if not _event_joins_tasks(cfg, acts, producers) or not _event_joins_tasks(cfg, swiglu + late_reads, producers):
         return False
     act_event = acts[0].trigger_event
     swiglu_event = swiglu[0].trigger_event
     return all(
-        (task.dependent_event == act_event and task.outputs[0].input_position == _SWIGLU_GRAD for task in swiglu)
-    ) and all((task.dependent_event == swiglu_event for task in gates))
+        task.dependent_event == act_event and task.outputs[0].input_position == _SWIGLU_GRAD for task in swiglu
+    ) and all(task.dependent_event == swiglu_event for task in gates)
 
 
 def can_reuse_backward_dispatch(
-    cfg: RuntimeConfigC, num_experts: int, num_cores: int, *, act_first: bool = False
+    cfg: RuntimeConfigC,
+    num_experts: int,
+    num_cores: int,
+    *,
+    act_first: bool = False,
 ) -> bool:
     """Check a validated runtime before reusing received dY storage for dX.
 
@@ -143,7 +160,7 @@ def can_reuse_backward_dispatch(
     cube_tasks = [cfg.all_tasks[index] for index in cfg.cube_task_indices[: cfg.task_index_num[0]]]
     vector_tasks = [cfg.all_tasks[index] for index in cfg.vector_task_indices[: cfg.task_index_num[1]]]
     for task in cube_tasks + vector_tasks:
-        reads_dispatch = any((task.inputs[index].input_position == _DISPATCH for index in range(task.num_inputs)))
+        reads_dispatch = any(task.inputs[index].input_position == _DISPATCH for index in range(task.num_inputs))
         if reads_dispatch and (
             task.task_type != TaskType.TASK_GROUPED_MATMUL
             or task.outputs[0].input_position not in (_WEIGHT2_GRAD, _ACTIVATION_GRAD)
@@ -224,6 +241,75 @@ def _w13_producers(cfg: RuntimeConfigC, num_experts: int, num_cores: int) -> lis
     return weights
 
 
+def _act_first_completion_is_exact(cfg, cube, vector, w13_groups, final):
+    """Prove that only the expected producers reach termination."""
+    return not (
+        final == EVENT_INVALID_ID
+        or any((task.dependent_event == final and task.task_type != TaskType.TASK_TERMINATE for task in cube + vector))
+        or sum((task.trigger_event == final for task in cube + vector)) != cfg.all_event_num_triggers[final]
+        or any((task.trigger_event != final for group in w13_groups for task in group))
+    )
+
+
+def _act_first_wave_is_exact(gate, w2, act, expert, num_cores, final):
+    """Keep each W2 and ActGrad lane on its original expert and receive dependency."""
+    return not (
+        gate.outputs[0].input_position != _INPUT_GRAD
+        or gate.task_index != expert * num_cores
+        or any(
+            (
+                w.outputs[0].input_position != _WEIGHT2_GRAD
+                or a.outputs[0].input_position != _ACTIVATION_GRAD
+                or w.task_index != expert * num_cores + worker
+                or (a.task_index != w.task_index)
+                or (w.dependent_event != a.dependent_event)
+                or (w.trigger_event != final)
+                for worker, (w, a) in enumerate(zip(w2, act))
+            )
+        )
+    )
+
+
+def prioritize_activation_gradient(cfg: RuntimeConfigC, num_experts: int, num_cores: int) -> bool:
+    """Start SwiGLU earlier without additional counters, atomics or receive storage.
+
+    W2 and ActGrad depend on the same dispatch event. GateGrad must join
+    W2 as well as SwiGLU before it can reuse the receive buffer. Every W2
+    then reaches termination through GateGrad and W13, so its original
+    termination increment can move to the existing per-expert GateGrad join.
+    """
+    w13_groups = _w13_producers(cfg, num_experts, num_cores)
+    count = cfg.task_index_num[0]
+    if not w13_groups or count != 4 * num_experts * num_cores:
+        return False
+    ids = list(cfg.cube_task_indices[:count])
+    cube = [cfg.all_tasks[index] for index in ids]
+    vector = [cfg.all_tasks[index] for index in cfg.vector_task_indices[: cfg.task_index_num[1]]]
+    terms = [task for task in vector if task.task_type == TaskType.TASK_TERMINATE]
+    if len(terms) != 1 or any((task.extra_value_1 for task in cube)):
+        return False
+    final = terms[0].dependent_event
+    if not _act_first_completion_is_exact(cfg, cube, vector, w13_groups, final):
+        return False
+    joins = []
+    for expert in range(num_experts):
+        start = 2 * expert * num_cores
+        middle, stop = (start + num_cores, start + 2 * num_cores)
+        w2, act = (cube[start:middle], cube[middle:stop])
+        gate = cube[(2 * num_experts + expert) * num_cores]
+        if not _act_first_wave_is_exact(gate, w2, act, expert, num_cores, final):
+            return False
+        joins.append((gate.dependent_event, w2))
+        ids[start:stop] = ids[middle:stop] + ids[start:middle]
+    for event, tasks in joins:
+        cfg.all_event_num_triggers[event] += num_cores
+        for task in tasks:
+            task.trigger_event = event
+    cfg.all_event_num_triggers[final] -= num_experts * num_cores
+    cfg.cube_task_indices[:count] = ids
+    return True
+
+
 def _guest_w13_indices(
     cfg: RuntimeConfigC, num_experts: int, num_cores: int, replica_slots: int
 ) -> Optional[list[int]]:
@@ -239,11 +325,57 @@ def _guest_w13_indices(
             groups[task.task_index // num_cores].append(index)
     home = num_experts - replica_slots
     reordered = [index for expert in (*range(home, num_experts), *range(home)) for index in groups[expert]]
-    if any(
-        (cfg.all_tasks[index].task_index % num_cores != offset % num_cores for offset, index in enumerate(reordered))
-    ):
+    if any(cfg.all_tasks[index].task_index % num_cores != offset % num_cores for offset, index in enumerate(reordered)):
         return None
     return reordered
+
+
+def _w1_join_producers_are_exact(cube, producers, num_experts, num_cores, join):
+    """Require every join contribution to be the final complete GateGrad wave."""
+    return not (
+        len(producers) != num_cores
+        or any(
+            (
+                task.outputs[0].input_position != _INPUT_GRAD or task.task_index // num_cores != num_experts - 1
+                for task in producers
+            )
+        )
+        or any((task.task_type == TaskType.TASK_GROUPED_MATMUL and task.extra_value_1 == join for task in cube))
+    )
+
+
+def _apply_w1_join(weights, join):
+    """Retain one complete expert join on each worker before subsequent W13 tasks."""
+    for expert, tasks in enumerate(weights):
+        for task in tasks:
+            task.dependent_event = join if expert == 0 else EVENT_INVALID_ID
+
+
+def join_w1_phase_once(cfg: RuntimeConfigC, num_experts: int, num_cores: int, *, apply: bool = True) -> bool:
+    """Use one full GateGrad completion fence per ordinary W1 Cube queue.
+
+    The last GateGrad event joins the preceding GateGrad work by per-worker
+    program order. A worker's subsequent W1 tasks inherit that first wait.
+    Unrecognized schedules are left unchanged.
+    Pass apply=False to prove the join without changing the fallback queue.
+    """
+    weights = _w13_producers(cfg, num_experts, num_cores)
+    if not weights:
+        return False
+    cube = [cfg.all_tasks[i] for i in cfg.cube_task_indices[: cfg.task_index_num[0]]]
+    ordered = [task for task in cube if task.outputs[0].input_position == _WEIGHT13_GRAD]
+    if any((task.task_index != ordinal for ordinal, task in enumerate(ordered))):
+        return False
+    join = weights[-1][0].dependent_event
+    if join == EVENT_INVALID_ID or cfg.all_event_num_triggers[join] != num_cores:
+        return False
+    vector = [cfg.all_tasks[i] for i in cfg.vector_task_indices[: cfg.task_index_num[1]]]
+    producers = [task for task in cube + vector if task.trigger_event == join]
+    if not _w1_join_producers_are_exact(cube, producers, num_experts, num_cores, join):
+        return False
+    if apply:
+        _apply_w1_join(weights, join)
+    return True
 
 
 def prepare_w13_overlap_schedule(
@@ -270,10 +402,10 @@ def prepare_w13_overlap_schedule(
         return False
     weights = _w13_producers(cfg, num_experts, num_cores)
     if not weights or any(
-        (cfg.all_tasks[index].extra_value_1 for index in cfg.cube_task_indices[: cfg.task_index_num[0]])
+        cfg.all_tasks[index].extra_value_1 for index in cfg.cube_task_indices[: cfg.task_index_num[0]]
     ):
         return False
-    highest = max((index for index, count in enumerate(cfg.all_event_num_triggers) if count))
+    highest = max(index for index, count in enumerate(cfg.all_event_num_triggers) if count)
     first = highest + ATOMIC_ADD_VALUE_LEN
     if first + num_experts - 1 + ATOMIC_ADD_VALUE_LEN > cfg.event_capacity:
         return False
@@ -315,8 +447,8 @@ def replica_w13_ready_events(cfg: RuntimeConfigC, num_experts: int, num_cores: i
             not event
             or event + ATOMIC_ADD_VALUE_LEN > cfg.event_capacity
             or cfg.all_event_num_triggers[event] != num_cores
-            or (len(producers[event]) != num_cores)
-            or any((task.extra_value_1 != event for task in group))
+            or len(producers[event]) != num_cores
+            or any(task.extra_value_1 != event for task in group)
         ):
             return ()
         events.append(event)

@@ -79,8 +79,8 @@
               },
               {
                 "path": "hyper_multicore/ops/patches/grouped_matmul_replica.patch",
-                "sha256": "f207723e257e722e48a405d6ef788f244f0694bcbbb003b9b3f2e53407630357",
-                "purpose": "add FP32 guest matrix bands and private single-expert row descriptors while preserving default grouped-matmul execution"
+                "sha256": "b5d2edf4905d7aced1dad56b4c06fd01512328c17fb3f04a113bafce5355c244",
+                "purpose": "retain FP32 replica bands, explicit expert rows and default active gradient lane rotation"
               }
             ],
             "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"

@@ -94,5 +94,27 @@ __aicore__ inline void WaitBandProducer(GM_ADDR address, int32_t epoch) {
   } while (*value < epoch);
 }
 
+__aicore__ inline bool IsBandProducerReady(GM_ADDR address, int32_t epoch) {
+  AscendC::GlobalTensor<int32_t> flag;
+  flag.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(address), 1);
+  __gm__ volatile int32_t *value = reinterpret_cast<__gm__ volatile int32_t *>(address);
+  AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                  AscendC::DcciDst::CACHELINE_OUT>(flag);
+  return *value >= epoch;
+}
+
+__aicore__ inline bool AreBandProducersReady(GM_ADDR owner_flags, GM_ADDR guest_flags, int32_t band,
+                                           int32_t cores, int32_t epoch, uint32_t &prefix) {
+  while (prefix < 2 * cores) {
+    const uint64_t offset = (band * cores + prefix / 2) * DATA_CACHE_LINE_SIZE;
+    GM_ADDR address = (prefix % 2 ? guest_flags : owner_flags) + offset;
+    if (!IsBandProducerReady(address, epoch)) {
+      return false;
+    }
+    ++prefix;
+  }
+  return prefix == 2 * cores;
+}
+
 }  // namespace MulticoreRuntime
 #endif  // HYPER_MULTICORE_MULTICORE_REPLICA_GRADIENT_H

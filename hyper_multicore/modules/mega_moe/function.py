@@ -161,7 +161,7 @@ def _dispatch_and_source(spec: Any, workspace: Any, rows: Any, capacity: int) ->
     """Select transport storage while retaining a source-ready stream dependency."""
     if getattr(spec, "dispatch_mode", "push") == "push":
         return _workspace_tensor(workspace.expert_buffer, "expert_buffer"), rows
-    source = _workspace_tensor(workspace.source_buffer, "source_buffer")[:rows.shape[0]]
+    source = _workspace_tensor(workspace.source_buffer, "source_buffer")[: rows.shape[0]]
     if source.data_ptr() != rows.data_ptr():
         source.copy_(rows)
     dispatch = torch.empty((capacity, spec.hidden_size), dtype=rows.dtype, device=rows.device)
@@ -172,7 +172,7 @@ def _stage_backward_source(ctx: Any, grad_output: Any, permutation_inputs: tuple
     """Write pull dY into SHMEM before expert scratch allocation."""
     if getattr(ctx.plan.spec, "dispatch_mode", "push") == "push":
         return grad_output, None
-    source = _workspace_tensor(ctx.workspace.source_buffer, "source_buffer")[:ctx.source_rows]
+    source = _workspace_tensor(ctx.workspace.source_buffer, "source_buffer")[: ctx.source_rows]
     if not ctx.has_unpermute:
         source.copy_(grad_output)
         return source, None
@@ -314,7 +314,7 @@ def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any
     """Return an owned input gradient while the workspace lease is held."""
     if not ctx.needs_input_grad[0]:
         return None
-    grad_x = grad_x[:ctx.source_rows]
+    grad_x = grad_x[: ctx.source_rows]
     if not ctx.has_permutation:
         return grad_x.clone()
     (unpermute_mapping,) = permutation_inputs
@@ -323,9 +323,7 @@ def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any
         return grad_x[:0].clone()
     # Consume the shared gradient before release records completion.
     # The permutation gradient owns its reduced [T, H] output.
-    return multicore_ops.moe_token_permute_grad(
-        grad_x, unpermute_mapping, ctx.token_rows, spec.top_k
-    )
+    return multicore_ops.moe_token_permute_grad(grad_x, unpermute_mapping, ctx.token_rows, spec.top_k)
 
 
 def _save_forward_state(
@@ -365,7 +363,9 @@ def _save_forward_state(
 def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
     """Keep retained graphs alive; older engines conservatively wait for context GC."""
     # The engine's retention flag avoids unpacking saved tensors or guessing from output references.
-    keep_graph = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", None)  # pylint: disable=protected-access
+    keep_graph = getattr(
+        torch._C._autograd, "_get_current_graph_task_keep_graph", None
+    )  # pylint: disable=protected-access
     if keep_graph is not None and not keep_graph():
         workspace.release_graph(ctx)
 

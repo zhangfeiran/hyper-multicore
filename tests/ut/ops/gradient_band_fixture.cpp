@@ -15,6 +15,8 @@ using event_t = int;
 constexpr int PIPE_ALL = 0;
 uint64_t cycle = 0, fence = 0, published = 0;
 namespace AscendC {
+inline uint64_t GetSystemCycle() { return 0; }
+
 enum class HardEvent { FIX_MTE2 };
 enum class CacheLine { SINGLE_CACHE_LINE };
 enum class DcciDst { CACHELINE_OUT };

@@ -29,7 +29,6 @@ import torch.distributed as dist
 from hyper_multicore import _collective, shmem
 from hyper_multicore.replica.admission import (
     optional_peak_gain_is_sufficient,
-    reduction_basis_points,
     resolve_replica_admission,
 )
 from hyper_multicore.replica.capacity import ExpertReplicaConfig
@@ -50,6 +49,9 @@ from .function import execute_mega_moe_with_permutation
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
+from .configuration import execution_options as _execution_options
+from .configuration import summary_admission
+from .inactive_tasks import replica_runtime_schedule
 from .spec import (
     _COMMUNICATION_SPLIT,
     MegaMoeSpec,
@@ -67,27 +69,15 @@ def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
     """Validate a positive clamp value that survives float32 serialization."""
     if swiglu_limit is None:
         return
-    valid_type = isinstance(swiglu_limit, (int, float)) and not isinstance(
-        swiglu_limit, bool
-    )
+    valid_type = isinstance(swiglu_limit, (int, float)) and not isinstance(swiglu_limit, bool)
     try:
-        encoded_limit = (
-            struct.unpack("<f", struct.pack("<f", float(swiglu_limit)))[0]
-            if valid_type
-            else 0.0
-        )
-        valid_value = (
-            valid_type
-            and math.isfinite(swiglu_limit)
-            and math.isfinite(encoded_limit)
-            and encoded_limit > 0
-        )
+        encoded_limit = struct.unpack("<f", struct.pack("<f", float(swiglu_limit)))[0] if valid_type else 0.0
+        valid_value = valid_type and math.isfinite(swiglu_limit) and math.isfinite(encoded_limit) and encoded_limit > 0
     except (OverflowError, TypeError, ValueError, struct.error):
         valid_value = False
     if not valid_value:
         raise ValueError(
-            "swiglu_limit must be None or a finite positive float32-representable number, "
-            f"got {swiglu_limit!r}."
+            "swiglu_limit must be None or a finite positive float32-representable number, " f"got {swiglu_limit!r}."
         )
 
 
@@ -219,12 +209,22 @@ class _MegaMoeExecutionResources:
     def lifecycle_signature(self) -> tuple[Any, ...]:
         """Identify allocations independently of process-local group addresses."""
         return (
-            "mega_moe", self.spec.local_num_tokens, self.spec.hidden_size,
-            self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
-            self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
+            "mega_moe",
+            self.spec.local_num_tokens,
+            self.spec.hidden_size,
+            self.spec.intermediate_size,
+            self.spec.num_experts,
+            self.spec.top_k,
+            self.spec.receive_capacity,
+            self.spec.ep_size,
+            self.spec.dispatch_mode,
             self.spec.expert_weight_layout,
-            self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
-            self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens, self.spec.auto_tokens,
+            self.spec.initial_capacity_factor,
+            self.spec.capacity_growth_factor,
+            self.spec.dispatch_split,
+            self.spec.combine_split,
+            self.spec.max_local_num_tokens,
+            self.spec.auto_tokens,
         )
 
     def prepare_auto_workspace(
@@ -276,6 +276,13 @@ class _MegaMoeExecutionResources:
             "auto_tokens",
             "_host_replica_metadata",
             "_replica_inbox_slots",
+            "_gradient_queue_order",
+            "_cube_event_refresh_us",
+            "_vector_event_refresh_us",
+            "_batch_empty_dispatch",
+            "_batch_empty_combine",
+            "_selective_owner_gradient_init",
+            "_summary_home_admission",
             "replica_slots_per_rank",
             "replica_transport",
         )
@@ -285,7 +292,7 @@ class _MegaMoeExecutionResources:
             tuple((tuple((spec.get(key) for key in fields)) for spec in specifications)),
             getattr(self, "soc_name", ""),
         )
-        manifest += (_local_node_identity(),)
+        manifest += (replica_runtime_schedule(), _local_node_identity())
         manifests = [None] * self.spec.ep_size
         dist.all_gather_object(manifests, manifest, group=self.spec.ep_group)
         if any((value[:-1] != manifests[0][:-1] for value in manifests)):
@@ -400,10 +407,10 @@ class MegaMoeExperts(MulticoreModule):
 
     def _resource_signature(self, tensor: Any) -> Any:
         """Compare static configuration without process-local group identities."""
-        configuration = tuple(sorted((name, value) for name, value in self._resource_group.specification.items()
-                                     if name != "ep_group"))
-        return (super()._resource_signature(tensor), configuration,
-                self._resource_group.shared)
+        configuration = tuple(
+            sorted((name, value) for name, value in self._resource_group.specification.items() if name != "ep_group")
+        )
+        return (super()._resource_signature(tensor), configuration, self._resource_group.shared)
 
     def _register_runtime_release(self, manager: Any, resources: Any) -> None:
         """Register the Heap Manager's sole Runtime reference for final cleanup."""
@@ -469,9 +476,7 @@ class MegaMoeExperts(MulticoreModule):
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         self.replica_min_rows = 1024
         self.replica_transport = "shmem_signal_kernel_gradient_bands"
-        self._summary_home_admission = (
-            reduction_basis_points(resolve_replica_admission(None)[0]) if replica_slots_per_rank else 0
-        )
+        self._summary_home_admission = summary_admission(replica_slots_per_rank)
         self._summary_home_bypasses = 0
         specification = {
             "local_num_tokens": _COMMUNICATION_SPLIT,
@@ -492,7 +497,9 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
             "_host_replica_metadata": True,
+            "_summary_home_admission": self._summary_home_admission,
         }
+        specification.update(_execution_options(dispatch_mode, replica_slots_per_rank))
         specification["auto_tokens"] = True
         specification = self._resolve_specification(specification)
         compatibility_key = tuple((id(value) if name == "ep_group" else value for name, value in specification.items()))
@@ -592,19 +599,15 @@ class MegaMoeExperts(MulticoreModule):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}.")
         if top_k > num_experts:
-            raise ValueError(
-                f"top_k ({top_k}) cannot exceed num_experts ({num_experts})."
-            )
+            raise ValueError(f"top_k ({top_k}) cannot exceed num_experts ({num_experts}).")
         if num_experts % ep_size:
-            raise ValueError(
-                f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})."
-            )
+            raise ValueError(f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size}).")
         _validate_swiglu_limit(swiglu_limit)
         for name, split in (("dispatch_split", dispatch_split), ("combine_split", combine_split)):
-            if (not isinstance(split, int) or isinstance(split, bool)
-                    or split <= 0 or split % _COMMUNICATION_SPLIT):
+            if not isinstance(split, int) or isinstance(split, bool) or split <= 0 or split % _COMMUNICATION_SPLIT:
                 raise ValueError(
-                    f"{name} must be a positive integer multiple of {_COMMUNICATION_SPLIT}, got {split!r}.")
+                    f"{name} must be a positive integer multiple of {_COMMUNICATION_SPLIT}, got {split!r}."
+                )
             if not auto_tokens and local_num_tokens % split:
                 raise ValueError(f"local_num_tokens ({local_num_tokens}) must be divisible by {name} ({split}).")
 
@@ -653,20 +656,12 @@ class MegaMoeExperts(MulticoreModule):
         hidden_flat = hidden_states.reshape(-1, self.hidden_size)
         route_shape = (hidden_flat.shape[0], self.top_k)
         if tuple(topk_ids.shape) != route_shape:
-            raise ValueError(
-                f"topk_ids must have shape {route_shape}, got {tuple(topk_ids.shape)}."
-            )
+            raise ValueError(f"topk_ids must have shape {route_shape}, got {tuple(topk_ids.shape)}.")
         if tuple(topk_weights.shape) != route_shape:
+            raise ValueError(f"topk_weights must have shape {route_shape}, " f"got {tuple(topk_weights.shape)}.")
+        if tokens_per_expert is not None and tuple(tokens_per_expert.shape) != (self.num_experts,):
             raise ValueError(
-                f"topk_weights must have shape {route_shape}, "
-                f"got {tuple(topk_weights.shape)}."
-            )
-        if tokens_per_expert is not None and tuple(tokens_per_expert.shape) != (
-            self.num_experts,
-        ):
-            raise ValueError(
-                f"tokens_per_expert must have shape ({self.num_experts},), "
-                f"got {tuple(tokens_per_expert.shape)}."
+                f"tokens_per_expert must have shape ({self.num_experts},), " f"got {tuple(tokens_per_expert.shape)}."
             )
         self._validate_tensors(hidden_flat, expert_weights)
         return hidden_flat
