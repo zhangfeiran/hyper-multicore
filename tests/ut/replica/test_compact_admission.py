@@ -86,3 +86,24 @@ class TestCompactAdmission(unittest.TestCase):
                 with self.assertRaises((RuntimeError, ValueError)):
                     self._prepare(minimum_replica_rows=1024, minimum_load_reduction=0.4)
                 admit.assert_not_called()
+
+    def test_severe_multi_guest_route_reuses_one_host_table(self) -> None:
+        """Both admission and dispatch consume the same exact severe-skew counts."""
+        self.config = ExpertReplicaConfig(8, 4, 2)
+        self.counts = ((1024, 1024, 0, 0, 0, 0, 0, 0),) * 4
+        self.ids = torch.tensor([[0, 1]] * 1024)
+        self.loads = [8192, 0, 0, 0]
+        self.summary = [[0, 1024, 15, 2048, 0, 1024, load] for load in self.loads]
+        self.gathered = routing._GatheredReplicaCounts(torch.tensor(self.counts, dtype=torch.int32), self.summary)
+        with (
+            patch.object(routing, "_read_gathered_host_counts", wraps=routing._read_gathered_host_counts) as read,
+            patch.object(routing, "_host_column_totals", wraps=routing._host_column_totals) as columns,
+        ):
+            result = self._prepare(minimum_replica_rows=0, minimum_load_reduction=0.4)
+        read.assert_called_once()
+        columns.assert_called_once()
+        self.assertFalse(result.home_only)
+        result.plan.validate()
+        self.assertEqual(result.plan.logical_counts, self.counts)
+        physical_counts = torch.bincount(result.physical_ids.flatten(), minlength=self.config.physical_experts)
+        torch.testing.assert_close(physical_counts, result.counts_by_source[0].long())

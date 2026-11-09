@@ -15,10 +15,15 @@
 """Validate source/node locality independently from planning objectives."""
 
 import unittest
+from unittest.mock import patch
 
 from hyper_multicore.replica import ExpertExecutionPlan, ExpertReplicaConfig
 from hyper_multicore.replica._dispatch import _materialize
-from hyper_multicore.replica._retained import _accept_retained_proposal, _rebalance_retained_copies
+from hyper_multicore.replica._retained import (
+    _accept_retained_proposal,
+    _node_quota_traffic,
+    _rebalance_retained_copies,
+)
 
 
 def _traffic(plan: ExpertExecutionPlan, nodes: tuple[int, ...]) -> tuple[int, int]:
@@ -33,6 +38,26 @@ def _traffic(plan: ExpertExecutionPlan, nodes: tuple[int, ...]) -> tuple[int, in
 
 class TestReplicaLocality(unittest.TestCase):
     """Preserve exact traffic and critical-fragment guards from the source implementation."""
+
+    def test_node_traffic_uses_exact_interleaved_source_totals(self) -> None:
+        """Native and fallback reductions preserve the node send and receive bounds."""
+        counts = ((2, 3, 9), (5, 4, 8), (4, 6, 7))
+        copies = [{0: 3, 1: 2}, {1: 6}, {0: 1, 1: 5, 2: 1}]
+        for totals in ([6, 9, 16], None):
+            with self.subTest(totals=totals), patch(
+                "hyper_multicore.replica._retained._column_totals", return_value=totals
+            ) as reduce_columns:
+                traffic = _node_quota_traffic(copies, counts, [0, 2], {0: 3, 1: -2, 2: 1})
+                self.assertEqual(traffic, ((19, 0), (18, 1)))
+                reduce_columns.assert_called_once_with((counts[0], counts[2]))
+
+    def test_node_traffic_fallback_keeps_arbitrary_precision_counts(self) -> None:
+        """The Python fallback keeps exact row totals beyond the native integer range."""
+        large = 2**63
+        counts = ((large, 1), (large, 4))
+        copies = [{0: large, 1: 1}, {0: large, 1: 2}]
+        with patch("hyper_multicore.replica._retained._column_totals", return_value=None):
+            self.assertEqual(_node_quota_traffic(copies, counts, [0, 1], {1: 1}), ((2, 0), (1, 0)))
 
     def test_interleaved_nodes_preserve_local_source_intersections(self) -> None:
         """Actual membership, rather than contiguous rank assumptions, removes node traffic."""

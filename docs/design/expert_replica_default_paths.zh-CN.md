@@ -96,6 +96,18 @@ CPU 用例覆盖整数溢出、子类、精确配额、compact 拒绝/接受、�
 
 NPU 组件已验证数值、重算、空源、逆序 backward 和研究组合；
 另用四个均匀热点专家强制触发 B2 inbox 从1增长至2，两个guest和两投影归还均通过。
+
+后续代码复核发现，当时 `HYPER_MULTICORE_MOE_HOT_REPLAY_READBACK=1` 的解析及辅助函数虽已迁入，
+却没有接入上述实际路由，不能用当时的研究组合运行证明该实验可达。本次补齐调用和 checkpoint
+ordinal 记录：只对此前实际使用副本的同一 spec 重算选择该回读；本次计数仍需精确比较，
+当前 token ID 仍独立映射。CPU 测试覆盖 home/hot 混合顺序、spec 变更、来源行变更和回退；
+单机 EP8/E384/H128/I128/TopK2/BF16/T1024、B2 的独立 NPU 功能检查中，Push 和 Pull 的
+8个rank均实际触发强热点 host 回读、重算 hot readback 及精确计划复用；对照非 checkpoint
+的 output、dx、Router 和两投影 dW，逐元素误差为0。该检查不代表大形状或整网性能验收。
+
+同次复核还恢复 B≥2、严重所有者倾斜时复用单份 host 计数表的路径，不改变副本准入或容量约束。
+EP32 B2 的49点、Push/Pull 共98个 CPU 路由计划及各点全部32 rank 的 token 映射与冻结基线一致；
+上述 EP8 检查证明该入口可达和单层数值正确，不是 B2 设备性能结论。
 性能已按 EP32/E192/H5120/I1792/TopK8/BF16/T4096 per-rank、B1，
 从均衡到热点的49点分别扫描 Push/Pull。输入、权重、路由、fresh process、rank-max、
 ABBA/BAAB、慢样本及所有rank终态均保留。默认计数能力的基线差异单独记录。

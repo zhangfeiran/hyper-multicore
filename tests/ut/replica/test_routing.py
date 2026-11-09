@@ -99,3 +99,21 @@ class TestReplicaRouting(unittest.TestCase):
 
         target, allowance = routing._automatic_capacity_options(256, 2, None, None, 2.0, budget)
         self.assertEqual((target, allowance, calls), (1024, 512, [256]))
+
+    def test_source_token_maximum_with_and_without_dynamic_controls(self) -> None:
+        """Capacity uses the largest source, whether controls or counts provide it."""
+        config = ExpertReplicaConfig(4, 2, 0)
+        ids = torch.tensor([[0], [0]], dtype=torch.int32)
+        counts = torch.tensor([[2, 0, 0, 0], [0, 3, 0, 0]], dtype=torch.int32)
+        summary = [[0, 2, 15, 2, 0, 2, 2], [0, 3, 15, 3, 0, 3, 3]]
+        for controls in (summary, []):
+            gathered = routing._GatheredReplicaCounts(counts, controls)
+            with self.subTest(controls=bool(controls)), patch.object(routing, "dist") as collective, patch.object(
+                routing, "_automatic_capacity_options", wraps=routing._automatic_capacity_options
+            ) as options:
+                collective.is_initialized.return_value = True
+                collective.get_rank.return_value = 0
+                collective.get_world_size.return_value = 2
+                result = routing.prepare_replica_route(ids, config, compact_home=True, _gathered_counts=gathered)
+                self.assertEqual(options.call_args.args[0], 3)
+                self.assertEqual(result.plan.logical_counts, ((2, 0, 0, 0), (0, 3, 0, 0)))

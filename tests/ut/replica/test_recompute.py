@@ -17,6 +17,7 @@
 import unittest
 from unittest.mock import patch
 
+import numpy as np
 import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
@@ -79,6 +80,40 @@ class TestReplicaRecompute(unittest.TestCase):
             routing._plan_replica_route(self.counts, self.config, None, 0, capacity_limit=60)
         with recompute, self.assertRaises(ValueError):
             routing._plan_replica_route(self.counts, self.config, None, 0, capacity_limit=29)
+
+    def test_binary_counts_replay_rejects_changed_source_rows(self) -> None:
+        """Equal expert totals do not permit a replay when source assignments change."""
+        original = np.asarray(self.counts, dtype=np.int32)
+        changed = np.asarray(((21, 9, 0, 0), (19, 11, 0, 0)), dtype=np.int32)
+        variants = ((original, original.copy(), True), (original, changed, False),
+                    (original.tolist(), original.copy(), True), (original, original.tolist(), True))
+        for first_counts, current, expected_reuse in variants:
+            with self.subTest(
+                expected_reuse=expected_reuse, forward_type=type(first_counts), replay_type=type(current)
+            ):
+                forward, recompute = create_recompute_contexts()
+                with forward:
+                    first, _ = routing._plan_replica_route(first_counts, self.config, None, 0, capacity_limit=60)
+                with recompute:
+                    second, reused = routing._plan_replica_route(current, self.config, None, 0, capacity_limit=60)
+                self.assertEqual(reused, expected_reuse)
+                expected = current.tolist() if isinstance(current, np.ndarray) else current
+                self.assertEqual(second.logical_counts, tuple(map(tuple, expected)))
+                self.assertEqual(second is first, expected_reuse)
+
+    def test_optional_checkpoint_readback_reaches_gathered_counts(self) -> None:
+        """Ordinary calls keep lists; enabled checkpoint calls retain exact integer bytes."""
+        counts = torch.tensor(self.counts, dtype=torch.int32)
+        gathered = routing._GatheredReplicaCounts(counts, [[0, 30, 15, 30, 0, 20, 60]] * 2)
+        ids = torch.empty((30, 1), dtype=torch.int64)
+        with patch.object(routing, "_hot_replay_readback_enabled", return_value=True):
+            _, outside, _ = routing._route_counts(ids, self.config, None, None, None, gathered)
+            forward, _ = create_recompute_contexts()
+            with forward:
+                _, inside, _ = routing._route_counts(ids, self.config, None, None, None, gathered)
+        self.assertIsInstance(outside, list)
+        self.assertIsInstance(inside, np.ndarray)
+        np.testing.assert_array_equal(inside, counts.numpy())
 
     def test_nested_exception_restores_outer_scope_and_clears_partial_entries(self) -> None:
         """A failed inner invocation cannot poison the next consumer's ordinal."""

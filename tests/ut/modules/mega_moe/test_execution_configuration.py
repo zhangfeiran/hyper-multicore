@@ -17,14 +17,19 @@
 import os
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from hyper_multicore.modules.mega_moe.configuration import execution_options, qualify_topology_schedule
 from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
+from hyper_multicore.modules.mega_moe import route
 from hyper_multicore.modules.mega_moe.route import _owner_empty_experts, _read_replica_dynamic_route
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_multicore.replica.recompute import create_recompute_contexts
+from hyper_multicore.replica.routing import _hot_replay_readback_enabled
 
 
 class TestExecutionConfiguration(unittest.TestCase):
@@ -91,3 +96,81 @@ class TestExecutionConfiguration(unittest.TestCase):
         payload = torch.tensor([[0, 2, 15, 1, 1, 1, 1]], dtype=torch.int32)
         _, _, controls = _read_replica_dynamic_route(payload, spec)
         self.assertEqual(_owner_empty_experts(spec, controls, None), ())
+
+    def test_hot_readback_replays_only_an_active_checkpoint_ordinal(self) -> None:
+        """Home calls keep their place and a hot replay reads the current source counts."""
+        spec = replace(self._spec(), num_experts=192, ep_size=32)
+        payload = torch.zeros(32, 195, dtype=torch.int32)
+        payload[:, :3] = torch.tensor([0, 2, 15])
+        payload[:, 3:7] = 1
+        changed = payload.clone()
+        changed[:, 3:] = changed[:, 3:].roll(1, dims=1)
+        observed = []
+
+        def select(
+            _counts: torch.Tensor, _summary: list[list[int]], host_counts: np.ndarray | list[list[int]] | None
+        ) -> tuple[MegaMoeSpec, SimpleNamespace] | None:
+            """First invocation stays home, while the second executes a replica."""
+            observed.append(host_counts)
+            return None if len(observed) % 2 else (spec, SimpleNamespace(home_only=False))
+
+        self.addCleanup(_hot_replay_readback_enabled.cache_clear)
+        with patch.dict(os.environ, {"HYPER_MULTICORE_MOE_HOT_REPLAY_READBACK": "1"}):
+            _hot_replay_readback_enabled.cache_clear()
+            forward, recompute = create_recompute_contexts()
+            with patch.object(route, "_read_hot_replay_route", wraps=route._read_hot_replay_route) as read_hot:
+                with forward:
+                    route._agree_replica_dynamic_route(payload, spec, select)
+                    route._agree_replica_dynamic_route(payload, spec, select)
+                with recompute:
+                    route._agree_replica_dynamic_route(changed, spec, select)
+                    route._agree_replica_dynamic_route(changed, spec, select)
+                read_hot.assert_called_once()
+        self.assertEqual(observed[:3], [None, None, None])
+        self.assertIsInstance(observed[3], np.ndarray)
+        np.testing.assert_array_equal(observed[3], changed[:, 3:].numpy())
+
+    def test_hot_readback_requires_matching_forward_spec(self) -> None:
+        """A different runtime spec falls back to current validated device summary."""
+        spec = replace(self._spec(), num_experts=192, ep_size=32)
+        payload = torch.zeros(32, 195, dtype=torch.int32)
+        payload[:, :3] = torch.tensor([0, 2, 15])
+        payload[:, 3:7] = 1
+        self.addCleanup(_hot_replay_readback_enabled.cache_clear)
+        with patch.dict(os.environ, {"HYPER_MULTICORE_MOE_HOT_REPLAY_READBACK": "1"}):
+            _hot_replay_readback_enabled.cache_clear()
+            forward, recompute = create_recompute_contexts()
+
+            def select(
+                _counts: torch.Tensor, _summary: list[list[int]], _host: np.ndarray | list[list[int]] | None
+            ) -> tuple[MegaMoeSpec, SimpleNamespace]:
+                """Represent an active route for this invocation's forward spec."""
+                return spec, SimpleNamespace(home_only=False)
+
+            with patch.object(route, "_read_hot_replay_route") as read_hot:
+                with forward:
+                    route._agree_replica_dynamic_route(payload, spec, select)
+                with recompute:
+                    route._agree_replica_dynamic_route(payload, replace(spec), select)
+                read_hot.assert_not_called()
+
+    def test_hot_readback_validates_the_same_current_controls(self) -> None:
+        """Fresh host counts agree with device summaries, including remote errors."""
+        spec = replace(self._spec(), num_experts=192, ep_size=32)
+        payload = torch.zeros(32, 195, dtype=torch.int32)
+        payload[:, :3] = torch.tensor([0, 2, 15])
+        payload[:, 3:7] = 1
+        summary, raw, rows = _read_replica_dynamic_route(payload, spec, defer_receive_limit=True)
+        replay_summary, host_counts, replay_rows = route._read_hot_replay_route(payload, spec)
+        self.assertIsNone(raw)
+        self.assertEqual((replay_summary, replay_rows), (summary, rows))
+        np.testing.assert_array_equal(host_counts, payload[:, 3:].numpy())
+        for column, value in ((0, 1), (2, 0), (3, -1)):
+            invalid = payload.clone()
+            invalid[1, column] = value
+            with self.subTest(column=column):
+                with self.assertRaises((ValueError, RuntimeError)) as original:
+                    _read_replica_dynamic_route(invalid, spec, defer_receive_limit=True)
+                with self.assertRaises(type(original.exception)) as replay:
+                    route._read_hot_replay_route(invalid, spec)
+                self.assertEqual(str(replay.exception), str(original.exception))

@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 import struct
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property, lru_cache
 import os
 from typing import Any
@@ -40,6 +40,7 @@ from .topology import _validate_rank_nodes
 from .recompute import get_recompute_state
 
 _HostReplicaCounts = list[list[int]] | np.ndarray
+_SEVERE_OWNER_SKEW = 3
 
 
 @lru_cache(maxsize=1)
@@ -388,7 +389,7 @@ def _route_counts(
     if gathered is not None:
         if gathered.counts.shape != (config.ep_size, config.num_experts):
             raise ValueError("Gathered replica counts require a matching planner topology")
-        host = gathered.host_counts if gathered.host_counts is not None else gathered.counts.cpu().tolist()
+        host = gathered.host_counts if gathered.host_counts is not None else _read_gathered_host_counts(gathered.counts)
         return gathered.counts, host, [list(row[:6]) for row in gathered.source_summary]
     if matrix is None:
         payload = _source_count_payload(ids, config, trusted, header)
@@ -449,6 +450,8 @@ def _prepare_compact_candidate(
     capacity_budget,
 ):
     """Gather at most once and retain admitted quotas for full source materialization."""
+    if config.replica_slots_per_rank >= 2:
+        gathered = _prepare_severe_skew_counts(gathered, config, minimum_load_reduction, minimum_saved_rows)
     matrix = None
     if gathered is None:
         payload = _source_count_payload(topk_ids, config, trusted, dynamic_header)
@@ -469,7 +472,27 @@ def _prepare_compact_candidate(
         minimum_replica_rows=minimum_replica_rows,
         capacity_budget=capacity_budget,
     )
-    return matrix, ordinary
+    return matrix, ordinary, gathered
+
+
+def _prepare_severe_skew_counts(gathered, config, minimum_load_reduction, minimum_saved_rows):
+    """Read a severe multi-guest table once for both admission and materialization."""
+    if gathered is None or gathered.host_counts is not None or config.replica_slots_per_rank < 2:
+        return gathered
+    if not (minimum_load_reduction or minimum_saved_rows):
+        return gathered
+    if gathered.counts.shape != (config.ep_size, config.num_experts):
+        raise ValueError("Gathered replica counts require a matching planner topology")
+    loads = tuple(row[6] for row in gathered.source_summary)
+    total = sum(loads)
+    if not total or max(loads) * config.ep_size < _SEVERE_OWNER_SKEW * total:
+        return gathered
+    average = (total + config.ep_size - 1) // config.ep_size
+    if not _optional_peak_is_useful(
+        average, loads, max(loads), reduction_basis_points(minimum_load_reduction), minimum_saved_rows
+    ):
+        return gathered
+    return replace(gathered, host_counts=_read_gathered_host_counts(gathered.counts))
 
 
 def prepare_replica_route(
@@ -520,7 +543,7 @@ def prepare_replica_route(
     _integer(_replica_transfer_row_credit, "Replica transfer row credit", 0)
     matrix, candidate = (None, None)
     if compact_home and dynamic_header is not None and config.replica_slots_per_rank:
-        matrix, ordinary = _prepare_compact_candidate(
+        matrix, ordinary, _gathered_counts = _prepare_compact_candidate(
             topk_ids,
             config,
             group,
@@ -544,7 +567,7 @@ def prepare_replica_route(
         topk_ids, config, group, dynamic_header, _trusted_counts, _gathered_counts, matrix
     )
     _validate_source_controls(controls, topk_ids.shape[1])
-    maximum = max((row[1] for row in controls), default=max(map(sum, host)) // topk_ids.shape[1])
+    maximum = max(row[1] for row in controls) if controls else max(map(sum, host)) // topk_ids.shape[1]
     target, allowance = _automatic_capacity_options(
         maximum, topk_ids.shape[1], target_load, receive_capacity, _auto_capacity_factor, _capacity_budget
     )

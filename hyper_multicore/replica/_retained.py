@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from .host import _column_totals
+
 
 def _water_level(receivers: list[tuple[int, int]], participants: int, moved: int) -> tuple[int, int, int]:
     """Raise the lowest receivers together using stable integer remainders."""
@@ -121,7 +123,10 @@ def _node_quota_traffic(copies: list[dict[int, int]], counts: tuple[tuple[int, .
     for rank in ranks:
         for expert, rows in copies[rank].items():
             quotas[expert] = quotas.get(expert, 0) + rows
-    source = tuple(map(sum, zip(*(counts[rank] for rank in ranks))))
+    node_counts = tuple(counts[rank] for rank in ranks)
+    source = _column_totals(node_counts)
+    if source is None:
+        source = tuple(map(sum, zip(*node_counts)))
     local = sum(min(source[expert], rows) for expert, rows in quotas.items())
     old_out, old_in = sum(source) - local, sum(quotas.values()) - local
     local_delta = sum(min(source[expert], quotas[expert] + delta) - min(source[expert], quotas[expert])

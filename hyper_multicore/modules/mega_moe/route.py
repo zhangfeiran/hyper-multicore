@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from array import array
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from itertools import accumulate
@@ -27,7 +28,13 @@ import torch
 import torch.distributed as dist
 
 from hyper_multicore._loader import load_torch_npu
-from hyper_multicore.replica.routing import ReplicaRoute, _HostReplicaCounts, _replica_count_payload
+from hyper_multicore.replica.recompute import get_recompute_state
+from hyper_multicore.replica.routing import (
+    ReplicaRoute,
+    _HostReplicaCounts,
+    _hot_replay_readback_enabled,
+    _replica_count_payload,
+)
 from hyper_multicore.torch import ops as multicore_ops
 
 from .spec import MegaMoeSpec, _align_capacity
@@ -946,6 +953,50 @@ def _read_replica_dynamic_route(
     return (_summarize_dynamic_rows(rows, spec, defer_receive_limit=defer_receive_limit), raw, rows)
 
 
+def _read_hot_replay_route(
+    payload: torch.Tensor, spec: MegaMoeSpec
+) -> tuple[tuple[int, int, int], np.ndarray, list[list[int]]]:
+    """Read fresh counts once for both validation and the exact checkpoint guard."""
+    host = payload.cpu().numpy()
+    counts = host[:, 3:]
+    loads = counts.reshape(spec.ep_size, spec.ep_size, spec.local_experts).sum(axis=(0, 2), dtype=np.int64)
+    rows = np.column_stack(
+        (host[:, :3], counts.sum(axis=1, dtype=np.int64), counts.min(axis=1), counts.max(axis=1), loads)
+    ).tolist()
+    return _summarize_dynamic_rows(rows, spec, defer_receive_limit=True), counts, rows
+
+
+def _replica_readback_history(spec: MegaMoeSpec) -> tuple[deque | None, bool]:
+    """Record each checkpoint route, including home decisions, in invocation order."""
+    if spec.ep_size * spec.num_experts <= _HOST_ROUTE_MAX_COUNTS or not _hot_replay_readback_enabled():
+        return None, False
+    state = get_recompute_state()
+    if state is None:
+        return None, False
+    return state.get_resource(_replica_readback_history, deque), state.is_recomputing
+
+
+def _agree_replica_dynamic_route(
+    gathered: torch.Tensor, spec: MegaMoeSpec, select: ReplicaRouteSelector
+) -> tuple[tuple[int, int, int], list[list[int]] | None, list[list[int]], tuple[MegaMoeSpec, ReplicaRoute] | None]:
+    """Use the optional hot replay readback without changing current admission."""
+    history, replaying = _replica_readback_history(spec)
+    hot = False
+    if replaying and history:
+        saved_spec, used_replicas = history.popleft()
+        hot = saved_spec is spec and used_replicas
+    if hot:
+        summary, host_counts, agreement = _read_hot_replay_route(gathered, spec)
+        raw = None
+    else:
+        summary, raw, agreement = _read_replica_dynamic_route(gathered, spec, defer_receive_limit=True)
+        host_counts = None if raw is None else [row[3:] for row in raw]
+    proposal = select(gathered[:, 3:], agreement, host_counts)
+    if history is not None and not replaying:
+        history.append((spec, proposal is not None and not proposal[1].home_only))
+    return summary, raw, agreement, proposal
+
+
 @dataclass(frozen=True)
 class _ReplicaAgreement:
     """Validated source agreement and the selected current physical route."""
@@ -980,10 +1031,10 @@ def _replica_agreement(hidden_states, ids, spec, supplied_counts, workspace, mas
     gathered, work = _start_dynamic_gather(payload, spec)
     if work is not None:
         work.wait()
-    summary, raw, agreement = _read_replica_dynamic_route(gathered, spec, defer_receive_limit=True)
-    if select is not None:
-        host_counts = None if raw is None else [row[3:] for row in raw]
-        proposal = select(gathered[:, 3:], agreement, host_counts)
+    if select is None:
+        summary, raw, agreement = _read_replica_dynamic_route(gathered, spec, defer_receive_limit=True)
+    else:
+        summary, raw, agreement, proposal = _agree_replica_dynamic_route(gathered, spec, select)
         if proposal is not None and not proposal[1].home_only:
             selected, route = proposal
             return _physical_agreement(selected, route.physical_ids, route)
