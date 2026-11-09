@@ -171,8 +171,8 @@ SHMEM 数据面已经属于独立仓，不重复导入另一份 runtime。
 | 2 | CPU route + P2P + invocation + Native adapter | 当前 ID、empty/ragged、逆序 Bwd、P2P FP32 归还；mock 与独立 CPU 功能门 | CPU 与双卡 Native 数值门通过 |
 | 3 | MegaMoE Python 接入和对称 Heap 事务 | B0 回归、home-only、按需 inbox、图/lease/growth/close 的组合门 | CPU 及双卡 Push/Pull 数值门通过；默认共享 B 上限存储 |
 | 4 | native ready/bands/ACK 与最小构建增量 | 真正构建并加载当前 payload；CPU C++ harness 与 NPU 数值/生命周期门 | 构建、host harness、真实 kernel 两投影与设备释放通过 |
-| 5 | 下游 checkpoint/FSDP hooks | 相同权重/路由，GAS、重算、物化、两次更新及状态对齐 | 桥接合同 CPU 门通过；组件重算/两次更新设备通过；真实 FSDP 组合另验 |
-| 6 | 组件与 Trainer 对照 | profiler-off ABBA、同后端 B0、真实 bands、全 rank/node 终态和内存口径 | 待执行 |
+| 5 | 下游 checkpoint/FSDP hooks | 相同权重/路由，GAS、重算、物化、两次更新及状态对齐 | CPU合同及真实EP2/DP2 FSDP通过：单机四卡、双机各两卡、两种reshard策略 |
+| 6 | 组件与 Trainer 对照 | profiler-off ABBA、同后端 B0、真实 bands、全 rank/node 终态和内存口径 | 小形状FSDP训练步ABBA/BAAB完成且B1回退；完整Trainer及峰值HBM待验 |
 
 第2～5步必须共同完成才称为“功能完整的独立仓迁移”。第1步单独不能给模型传新参数，
 也不能把 planner 通过当成设备、SHMEM 或整网已可用。
@@ -226,5 +226,7 @@ warning单列，不当作功能失败。Pylint、Lizard、Markdownlint及独立�
 
 普通驻留与外部FSDP桥接、reentrant重算、按需inbox增长及native band发布，
 是需要持续验收的主要边界。首版默认共享B上限存储，旧payload不能执行新增协议。
-本轮独立构建并申请双卡执行数值ST；完整Trainer、FSDP多节点组合和性能ABBA尚未验收。
+独立构建和双卡组件ST已通过；后续EP2/DP2 FSDP单机/双机组合也已通过。
+完整Trainer、其他FSDP拓扑和峰值HBM尚未验收；
+具体训练步ABBA结果与限制见交付目录`fsdp-integration/REPORT-fsdp-integration.md`。
 分支保留本地，未push或发布PR。

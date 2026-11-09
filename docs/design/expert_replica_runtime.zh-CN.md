@@ -143,7 +143,13 @@ python scripts/check_repository.py
 `2.9802322387695312e-8`，两步更新后的权重一致。所有 rank 正常终止，节点退出0，任务进程和设备锁
 已释放，所选两卡健康且无进程。详细来源、失败修复和边界见交付目录 `implementation/REPORT-implementation.md`。
 reentrant 原始 no-grad forward 无法从外层图观察 route；其副本完成证据采用实际 kernel 两投影归还。
-这些结果不包含 Trainer、真实多节点 FSDP 组合、性能 ABBA 或峰值 HBM 验收。
+后续桥接组合验收已完成单机四卡及双机各两卡的 EP2/DP2 FSDP：
+两种 reshard 策略、GAS2、真实框架 checkpoint、跨两步同热专家、owner梯度与SGD动量对照均通过。
+每种拓扑16条rank/case记录通过，真实all-gather在Torch version保持0时更新物化标记。
+运行时代码和native沿用上述冻结版本，新增内容位于下游ST及基准入口。
+这些结果不包含完整Trainer、其他FSDP拓扑或峰值HBM验收；具体ABBA结果见`fsdp-integration/REPORT-fsdp-integration.md`。
+单机四卡H512/I512的受控FSDP训练步ABBA/BAAB中，B1的Push/Pull中位数分别增加43.15%/49.91%；
+这是已经执行真实副本的性能回退。保持当前准入规则和全部样本，不把功能通过等同于该形状具有端到端收益。
 
 ## 完整的反馈期限
 
