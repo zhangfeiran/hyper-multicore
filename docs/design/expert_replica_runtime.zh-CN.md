@@ -1,6 +1,7 @@
 # RFC：独立无表专家副本执行闭环
 
-状态：组件实现、CPU 门和单机双卡数值门已完成；按 HyperParallel `003-RFC.yml` 的必填字段组织。本文对应独立仓
+状态：组件实现、CPU、设备数值及EP32跨分支性能扫描已完成，精简实现仍有时延回退；
+按 HyperParallel `003-RFC.yml` 的必填字段组织。本文对应独立仓
 `feat/expert-replica-heuristic`，与[迁移方案](expert_replica_migration.zh-CN.md)共同评审。
 
 ## 动机（Motivation）
@@ -101,8 +102,10 @@ SHMEM 的低层 `put/get(..., use_sdma=True)` 在当前 NPU stream 上复制到�
 
 无表准入是负载启发式，不能保证任意形状或任意 B 都比 B0 快。
 CPU 精确差分验证策略保持；mock/host harness 验证控制流；当前 native payload 的两卡 ST 验证
-实际数值和完成协议。性能与 Trainer 结果需另用同输入、同后端 B0、profiler-off ABBA 和全 rank
-终态记录；初版数值 ST 不作性能验收。
+实际数值和完成协议。迁移性能对照固定为EP32、E192、H5120、I1792、TopK8、BF16、4096 token/rank，
+比较旧分支成本关闭的B1与精简B1，扫描均衡至热点。该矩阵已完成，见
+[EP32性能RFC](expert_replica_performance.zh-CN.md)：49点F+B相对变化中位数Push +1.23%、Pull +1.08%，
+所有计划一致，精简实现存在回退。完整Trainer及相同后端B0收益仍需各自验收，数值ST不代替性能结论。
 
 ## 相关的 RFCs 和 API
 
@@ -148,8 +151,9 @@ reentrant 原始 no-grad forward 无法从外层图观察 route；其副本完�
 每种拓扑16条rank/case记录通过，真实all-gather在Torch version保持0时更新物化标记。
 运行时代码和native沿用上述冻结版本，新增内容位于下游ST及基准入口。
 这些结果不包含完整Trainer、其他FSDP拓扑或峰值HBM验收；具体ABBA结果见`fsdp-integration/REPORT-fsdp-integration.md`。
-单机四卡H512/I512的受控FSDP训练步ABBA/BAAB中，B1的Push/Pull中位数分别增加43.15%/49.91%；
-这是已经执行真实副本的性能回退。保持当前准入规则和全部样本，不把功能通过等同于该形状具有端到端收益。
+此前单机四卡H512/I512的受控FSDP训练步ABBA/BAAB中，B1的Push/Pull中位数分别增加43.15%/49.91%；
+这是该小形状的组合测试记录，不作为当前指定EP32场景的迁移性能验收。
+当前采用[EP32跨分支对照](expert_replica_performance.zh-CN.md)，保持准入规则和全部样本，不把功能通过等同于性能无回退。
 
 ## 完整的反馈期限
 

@@ -13,7 +13,7 @@
 | 工作分支 | `feat/expert-replica-heuristic` |
 | 隔离工作树 | `/home/ma-user/zfr/hyper-multicore-expert-replica-heuristic` |
 | 当前实作 | 无表规划、路由/重算/P2P、驻留/信号、MegaMoE 接入、ready/bands/ACK 及隔离构建增量 |
-| 当前验收 | 6000 组冻结无表决策精确差分；374 项 CPU UT；105 项桥接 UT；匹配 native 构建及 7 项 host 测试；双卡32条 rank/case 记录全部通过 |
+| 当前验收 | 6000 组冻结无表决策精确差分；374 项 CPU UT；105 项桥接 UT；匹配 native 构建及 7 项 host 测试；双卡32条 rank/case 通过；EP32跨分支alpha扫描完成，精简实现有时延回退 |
 | 完整迁移状态 | 执行代码已接入；CPU、实际 payload 与下游桥接分开验收并记录 |
 
 来源冻结包包含原分支最新的按需副本矩阵存储改动。已有 RFC 基于更早的 `ae5256724`，
@@ -172,7 +172,7 @@ SHMEM 数据面已经属于独立仓，不重复导入另一份 runtime。
 | 3 | MegaMoE Python 接入和对称 Heap 事务 | B0 回归、home-only、按需 inbox、图/lease/growth/close 的组合门 | CPU 及双卡 Push/Pull 数值门通过；默认共享 B 上限存储 |
 | 4 | native ready/bands/ACK 与最小构建增量 | 真正构建并加载当前 payload；CPU C++ harness 与 NPU 数值/生命周期门 | 构建、host harness、真实 kernel 两投影与设备释放通过 |
 | 5 | 下游 checkpoint/FSDP hooks | 相同权重/路由，GAS、重算、物化、两次更新及状态对齐 | CPU合同及真实EP2/DP2 FSDP通过：单机四卡、双机各两卡、两种reshard策略 |
-| 6 | 组件与 Trainer 对照 | profiler-off ABBA、同后端 B0、真实 bands、全 rank/node 终态和内存口径 | 小形状FSDP训练步ABBA/BAAB完成且B1回退；完整Trainer及峰值HBM待验 |
+| 6 | 指定形状迁移性能与独立Trainer验收 | EP32/E192/H5120/I1792/TopK8/BF16/T4096；同输入跨分支alpha扫描；另验B0和Trainer | 跨分支ABBA/BAAB完成，Push/Pull变化中位数+1.23%/+1.08%；完整Trainer及峰值HBM待验 |
 
 第2～5步必须共同完成才称为“功能完整的独立仓迁移”。第1步单独不能给模型传新参数，
 也不能把 planner 通过当成设备、SHMEM 或整网已可用。
@@ -216,17 +216,20 @@ warning单列，不当作功能失败。Pylint、Lizard、Markdownlint及独立�
 本机冻结参考、复现脚本、环境、精确差分与清单保存在：
 `/home/ma-user/work/z00961864/expert-replica-minimal-migration-20261109/`。
 `migration-inventory.json`记录来源文件指纹和移除/延后分类；`compare_planners.py`可重建同种子输入。
-设备数值门使用本轮源码及匹配native payload；性能门仍需新输出，不复用旧资格证书。
+设备数值门使用本轮源码及匹配native payload；指定EP32性能对照已生成独立新结果，不复用旧资格证书。
+协议、逐点样本、图和资源终态见[EP32性能RFC](expert_replica_performance.zh-CN.md)，
+交付目录为`ep32-alpha-comparison/REPORT-EP32-alpha-comparison.md`。
 
 ## 仍需实测的风险
 
 纯 Python 阶段去掉可选 host 扩展，意味着计划一致不等于 CPU 延迟一致；
-框架计数、readback 和重新物化的额外成本需要在运行时接入后测量。
+指定EP32的跨分支对照已观察到回退，因果定位仍需分别测量计数、readback、规划与执行开销。
 减少成本体系和实验代码可以缩小维护面，不能自动消除 near-balance 开销。
 
 普通驻留与外部FSDP桥接、reentrant重算、按需inbox增长及native band发布，
 是需要持续验收的主要边界。首版默认共享B上限存储，旧payload不能执行新增协议。
 独立构建和双卡组件ST已通过；后续EP2/DP2 FSDP单机/双机组合也已通过。
 完整Trainer、其他FSDP拓扑和峰值HBM尚未验收；
-具体训练步ABBA结果与限制见交付目录`fsdp-integration/REPORT-fsdp-integration.md`。
+小形状FSDP组合记录见交付目录`fsdp-integration/REPORT-fsdp-integration.md`，不作为指定形状的迁移性能验收。
+当前性能结论见[EP32性能RFC](expert_replica_performance.zh-CN.md)：数值和计划保持一致，仍存在时延损失。
 分支保留本地，未push或发布PR。
