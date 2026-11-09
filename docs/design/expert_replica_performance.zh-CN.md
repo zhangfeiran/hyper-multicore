@@ -1,6 +1,8 @@
 # RFC：专家副本迁移的 EP32 性能对照
 
-状态：2026-11-09 完成指定形状的跨分支扫描；数值和计划一致，精简实现仍有时延回退。
+状态：2026-11-09 首版扫描发现回退；恢复默认非成本路径后完成全矩阵复测，
+Push/Pull变化中位数+0.034%/-0.167%，未再观察到首版的整体回退。
+下面先保留首版冻结结果，恢复后结果见[完整复测](#默认路径恢复后的完整复测)。
 本文按 HyperParallel `003-RFC.yml` 组织，与[执行闭环](expert_replica_runtime.zh-CN.md)和
 [迁移方案](expert_replica_migration.zh-CN.md)共同评审。
 
@@ -138,3 +140,39 @@ python3 summarize.py
 逐卡终态确认两机各16卡健康、无NPU进程、锁空闲，任务拥有的bootstrap转发已关闭。
 完整accuracy张量比较通过后删除，保留数值误差和指纹。全部native、协议和worker指纹结束后重新核对一致。
 原来源工作树及用户的已有文档修改保留，分支未push。
+
+## 默认路径恢复后的完整复测
+
+运行时`613b6c5`，参考来源仍为`22ad8d4`；两边匹配各自native包，成本关闭。
+恢复 compact-home、整数快校验、host原语、融合count、auto梯度及owner覆盖证明，
+并保留跨节点将auto限定为W1的来源规则。配置、可达入口及研究控制见
+[默认执行路径RFC](expert_replica_default_paths.zh-CN.md)。
+
+EP32/E192/H5120/I1792/TopK8/BF16/T4096 per-rank、B1；每模式49点，
+每点5 warmup/20 measured、ABBA+BAAB共8轮fresh process、每实现每点80样本。
+统计先取各点80个rank-max F+B样本的中位数，再求49点相对变化的分布；正值表示新版更慢。
+
+| 模式 | 变化中位数 | 变化均值 | 最快相对点 | 最慢相对点 | F+B+AdamW变化中位数 |
+| --- | --- | --- | --- | --- | --- |
+| Push | +0.034% | +0.045% | -0.94% | +1.03% | +0.012% |
+| Pull | -0.167% | -0.204% | -2.17% | +1.16% | -0.210% |
+
+98点计划指纹完全匹配。25,088条benchmark rank/case的实际梯度模式均为active W1，
+逐rank逐点old/new一致；每case均执行26次融合count。六个全形状数值锚点×32rank的
+output、dx、router及两投影dW逐元素误差0。初始操作数均核对完整字节SHA。
+AdamW在计时扫描实际执行并检查version更新，未将锚点声明为AdamW状态逐元素验收。
+
+首轮预扫描曾发现跨节点资格限制遗漏，主动终止、确认32卡释放后修正，并从头运行本表全矩阵。
+停止实验不计入性能；本轮两边均启用各自host ABI3和融合count ABI2，
+与首版两边没有融合count的包配置不同，不能把跨轮时延相减当作单变量归因。
+未预设等价容差，未剔除慢样本；结论仅为当前矩阵未再观察到首版整体回退。
+
+两节点31470、30468于20:32:21 +0800退出0，所属PID为空，post-inventory确认32卡健康、idle、
+lock可获取。全程物理监测均无外来NPU PID，所属UID SSH转发已按PID代次/argv核对并关闭。
+本矩阵的allocator allocated峰值及SHMEM heap字节逐点一致，未据此声称整网峰值HBM验收。
+
+本地证据目录：
+`/home/ma-user/work/z00961864/expert-replica-minimal-migration-20261109/default-path-migration/ep32-restored/`。
+其中`REPORT-EP32-restored.md`、`comparison.csv`、`summary.json`、`completion-audit.json`及
+`ep32-alpha-comparison.png/.svg`保留完整协议、98点、各rank终态和导出图。
+EOI B0累积检查在本轮前冻结包也失败，另记，未作为本矩阵EIO验收通过。

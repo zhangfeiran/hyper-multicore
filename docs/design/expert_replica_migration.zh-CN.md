@@ -15,7 +15,7 @@
 | 工作分支 | `feat/expert-replica-heuristic` |
 | 隔离工作树 | `/home/ma-user/zfr/hyper-multicore-expert-replica-heuristic` |
 | 当前实作 | 无表规划、路由/重算/P2P、驻留/信号、MegaMoE 接入、ready/bands/ACK 及隔离构建增量 |
-| 当前验收 | 6000 组冻结无表决策精确差分；374 项 CPU UT；105 项桥接 UT；匹配 native 构建及 7 项 host 测试；双卡32条 rank/case 通过；EP32跨分支alpha扫描完成，精简实现有时延回退 |
+| 当前验收 | 6000组精确差分；434项CPU及2433子例；native构建、7项host测试、72条EIO设备rank/case；EP32恢复后Push/Pull变化中位数+0.034%/-0.167% |
 | 完整迁移状态 | 执行代码已接入；CPU、实际 payload 与下游桥接分开验收并记录 |
 
 来源冻结包包含原分支最新的按需副本矩阵存储改动。已有 RFC 基于更早的 `ae5256724`，
@@ -105,7 +105,8 @@ flowchart TD
 | `planner.py`、`__init__.py` | 参数边界、明确阶段编排和 CPU 低层入口 |
 
 各函数通过目标仓 CCN≤15、有效行数≤100 的检查，不以整段复制后屏蔽复杂度检查收口。
-本层算法只使用标准库；导入仍沿用目标仓根包既有 Torch 诊断依赖，不把它描述成完整包无 Torch。
+Python 算法使用标准库，可选整数原语由CPython扩展提供；
+导入仍沿用目标仓根包既有Torch诊断依赖，不把它描述成完整包无Torch。
 
 ## 完整执行链的逐文件迁移清单
 
@@ -174,7 +175,7 @@ SHMEM 数据面已经属于独立仓，不重复导入另一份 runtime。
 | 3 | MegaMoE Python 接入和对称 Heap 事务 | B0 回归、home-only、按需 inbox、图/lease/growth/close 的组合门 | CPU 及双卡 Push/Pull 数值门通过；默认共享 B 上限存储 |
 | 4 | native ready/bands/ACK 与最小构建增量 | 真正构建并加载当前 payload；CPU C++ harness 与 NPU 数值/生命周期门 | 构建、host harness、真实 kernel 两投影与设备释放通过 |
 | 5 | 下游 checkpoint/FSDP hooks | 相同权重/路由，GAS、重算、物化、两次更新及状态对齐 | CPU合同及真实EP2/DP2 FSDP通过：单机四卡、双机各两卡、两种reshard策略 |
-| 6 | 指定形状迁移性能与独立Trainer验收 | EP32/E192/H5120/I1792/TopK8/BF16/T4096；同输入跨分支alpha扫描；另验B0和Trainer | 跨分支ABBA/BAAB完成，Push/Pull变化中位数+1.23%/+1.08%；完整Trainer及峰值HBM待验 |
+| 6 | 指定形状迁移性能与独立Trainer验收 | EP32/E192/H5120/I1792/TopK8/BF16/T4096；同输入跨分支alpha扫描；另验B0和Trainer | 恢复默认路径后ABBA/BAAB完成，Push/Pull变化中位数+0.034%/-0.167%；完整Trainer及峰值HBM待验 |
 
 第2～5步必须共同完成才称为“功能完整的独立仓迁移”。第1步单独不能给模型传新参数，
 也不能把 planner 通过当成设备、SHMEM 或整网已可用。
@@ -211,7 +212,8 @@ refactor前后结果摘要均为 `a2fa515c2b3b4a8ab7ebd0e1802158408afad43d35ea57
 参考扩展与实验搜索关闭，不把不同策略的计划混入等价声明。
 
 第一版 CPU 回归为374项、2098个子例；下游桥接回归为105项。
-本轮恢复默认执行路径后，全量 CPU 回归为412项、2399个子例，6000组规划差分摘要保持不变。既有CANN安装归属和pytest marker
+本轮恢复默认执行路径后，全量 CPU 回归为434项、2433个子例，6000组规划差分摘要保持不变。
+EIO 默认及研究控制共72条设备rank/case通过；跨节点auto_w1规则已恢复，指定EP32完整复测通过计划、数值及终态检查。既有CANN安装归属和pytest marker
 warning单列，不当作功能失败。Pylint、Lizard、Markdownlint及独立仓检查分别保存日志。
 新增和修改的native patch已更新dependency lock并真正重编译；SHMEM的7项host测试通过。
 下游AutoGit全文件门存在未改动HSDP代码的基线失败，详见REPORT，不将局部UT通过等同于整门通过。
@@ -236,5 +238,7 @@ warning单列，不当作功能失败。Pylint、Lizard、Markdownlint及独立�
 独立构建和双卡组件ST已通过；后续EP2/DP2 FSDP单机/双机组合也已通过。
 完整Trainer、其他FSDP拓扑和峰值HBM尚未验收；
 小形状FSDP组合记录见交付目录`fsdp-integration/REPORT-fsdp-integration.md`，不作为指定形状的迁移性能验收。
-当前性能结论见[EP32性能RFC](expert_replica_performance.zh-CN.md)：数值和计划保持一致，仍存在时延损失。
+恢复默认路径后的结论见[EP32性能RFC](expert_replica_performance.zh-CN.md#默认路径恢复后的完整复测)：
+数值、计划及实际执行模式一致，当前矩阵未再观察到首版的整体时延回退。
+首版损失及归因数据作为独立冻结结果继续保留；两轮融合count可用性不同，不作单变量时延相减。
 分支保留本地，未push或发布PR。

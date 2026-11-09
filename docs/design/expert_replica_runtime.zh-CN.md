@@ -1,7 +1,7 @@
 # RFC：独立无表专家副本执行闭环
 
 状态：第一版组件及 EP32 扫描已完成并观察到时延回退；本轮恢复非成本默认路径，
-CPU 412 项及2399个子例通过，新 native 和 NPU 验收独立记录；
+CPU434项及2433个子例、EIO设备72条rank/case及新EP32完整复测已完成；
 按 HyperParallel `003-RFC.yml` 的必填字段组织。本文对应独立仓
 `feat/expert-replica-heuristic`，与[迁移方案](expert_replica_migration.zh-CN.md)共同评审。
 
@@ -72,7 +72,9 @@ B 是上限，均衡或无足够收益的调用可执行 owner-only 计划。
 
 ### 兼容性与影响范围
 
-保留目标基线的 EIO/EOI 参数布局及 B0 调度；正预算 EOI 仍明确拒绝。
+保留目标基线的 EIO/EOI 参数布局及 B0 缓存；正预算 EOI 仍明确拒绝。
+恢复默认auto调度时，跨节点保持来源的auto_w1选择。EOI owner保留原native group-list路径；
+EOI累积检查在本轮前冻结包也失败，单独记录，不宣称本轮EOI设备验收通过。
 Pull 的暂存字节限制、B0 route/header cache、CPU 可导入及原独立构建/loader 边界继续保留。
 事件尾部统一增加完整 expert producer fence 的预留；较大 expert 配置的事件数组会增加少量槽位，
 测试需按新的容量计算，不能把序列化字节与旧版完全一致作为兼容条件。
@@ -109,7 +111,9 @@ CPU 精确差分验证策略保持；mock/host harness 验证控制流；当前 
 实际数值和完成协议。迁移性能对照固定为EP32、E192、H5120、I1792、TopK8、BF16、4096 token/rank，
 比较旧分支成本关闭的B1与精简B1，扫描均衡至热点。该矩阵已完成，见
 [EP32性能RFC](expert_replica_performance.zh-CN.md)：49点F+B相对变化中位数Push +1.23%、Pull +1.08%，
-所有计划一致，精简实现存在回退。完整Trainer及相同后端B0收益仍需各自验收，数值ST不代替性能结论。
+首版所有计划一致但存在回退；恢复默认路径后，Push/Pull逐点变化中位数为+0.034%/-0.167%，
+实际调度及98点计划一致，本矩阵未再观察到首版的整体回退。
+完整Trainer及相同后端B0收益仍需各自验收，数值ST不代替性能结论。
 
 ## 相关的 RFCs 和 API
 

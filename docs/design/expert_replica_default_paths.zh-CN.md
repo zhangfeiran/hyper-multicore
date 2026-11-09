@@ -1,7 +1,9 @@
 # RFC：专家副本默认执行路径与非成本研究变体
 
-状态：2026-11-09 已接入代码；CPU 回归412项、2399个子例通过；6000组规划差分保持一致。
-新 native 构建及 NPU 验收进行中，不以第一版设备结果代替本轮结果。
+状态：2026-11-09 已接入代码；CPU 回归434项、2433个子例通过；6000组规划差分保持一致。
+正式 native 已构建，EIO 副本72条rank/case与融合count每rank48项设备检查通过；
+指定EP32全矩阵复测完成，Push/Pull逐点变化中位数为+0.034%/-0.167%；
+98点计划及实际执行模式一致，未再观察到首版的整体回退。
 按来源 `.github/ISSUE_TEMPLATE/003-RFC.yml` 的必填字段组织。
 
 ## 动机（Motivation）
@@ -34,14 +36,18 @@ host 扩展只包含四类整数原语，不携带曲线插值、rank compute、
 ### 设备执行
 
 `MegaMoeExperts` 默认解析 `auto`。实际调度根据 ABI、图形状、owner/guest、通信和
-梯度 producer 证明选择 active lanes、ActGrad 优先或保守原序。直接构造低层 spec 的
+梯度 producer 证明选择 active lanes、ActGrad 优先或保守原序。
+跨节点 EP 会先将 auto 限定为 auto_w1，保留 W2 原分配，避免改变跨节点 combine 路径；
+显式研究模式保持显式选择。该规则在物理节点身份达成一致后应用，不能只看EP大小猜拓扑。直接构造低层 spec 的
 既有默认值保持 original。解析结果进入资源键和组内 manifest，避免 rank 间不一致。
 
 梯度 lanes、band 发布、observer、GMM local tiling 和 explicit split 必须同时构建。
 归还继续遵守 complete-K、投影 ready、固定 peer 顺序、quorum 和 ACK。
 不能证明生产者一一覆盖时不启用 join-once；有真实 band producer 时禁止破坏映射的 lane rotation。
 
-目标仓已有 EOI 的直接梯度输出、B0 路由缓存和 Pull 暂存上限继续使用原实现。
+目标仓已有 EOI 的直接梯度输出、B0 路由缓存和 Pull 暂存上限继续保留。
+EOI owner 梯度保留原 group-list/tiling 调用。独立 EOI 累积检查在本轮前的冻结包同样失败，
+目前未认定更早引入点，不将该用例写为通过。
 正预算 EOI 仍明确拒绝，不通过搬回来源旧 transpose 分配逻辑改变该合同。
 
 ### 显式研究控制
@@ -81,14 +87,21 @@ F/R 旁路同样记录 invocation ordinal；metadata 的 pinned source 和目标
 
 ### 验收
 
+运行时冻结为613b6c5，补回了跨节点 auto_w1 选择。单机EIO组件验证在b24fc99完成；
+两版native kernel输入相同，最终构建复用了内容校验通过的vendor缓存。
+
 CPU 用例覆盖整数溢出、子类、精确配额、compact 拒绝/接受、不重复搜索、producer 证明、
 队列 oracle 和控制字段。6000组冻结规划差分包含4363个计划、1637个一致拒绝，
 摘要仍为 `a2fa515c2b3b4a8ab7ebd0e1802158408afad43d35ea57e8a62da8519b24b6a4`。
 
-NPU 先验证当前源码和匹配 payload 的数值、重算、空源、逆序 backward 及研究控制；
-性能再按 EP32/E192/H5120/I1792/TopK8/BF16/T4096 per-rank、B1，
+NPU 组件已验证数值、重算、空源、逆序 backward 和研究组合；
+另用四个均匀热点专家强制触发 B2 inbox 从1增长至2，两个guest和两投影归还均通过。
+性能已按 EP32/E192/H5120/I1792/TopK8/BF16/T4096 per-rank、B1，
 从均衡到热点的49点分别扫描 Push/Pull。输入、权重、路由、fresh process、rank-max、
-ABBA/BAAB、慢样本及所有rank终态必须保留。默认计数能力的基线差异单独记录。
+ABBA/BAAB、慢样本及所有rank终态均保留。默认计数能力的基线差异单独记录。
+本轮两边均启用host与融合count；Push变化范围-0.94%～+1.03%，Pull为-2.17%～+1.16%。
+六个锚点各32rank的output/dx/router/dW误差0；两节点退出0、32卡及所属转发已释放。
+完整协议与结果见[指定形状性能RFC](expert_replica_performance.zh-CN.md#默认路径恢复后的完整复测)。
 
 本轮交付目录：
 `/home/ma-user/work/z00961864/expert-replica-minimal-migration-20261109/default-path-migration/`。
