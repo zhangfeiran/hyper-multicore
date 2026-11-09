@@ -241,6 +241,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             expert_weight_layout="EIO",
             auto_tokens=False,
             replica_slots_per_rank=0,
+            single_expert_tasks=False,
         )
         plan = SimpleNamespace(
             spec=spec,

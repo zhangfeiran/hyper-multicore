@@ -33,6 +33,7 @@ from .admission import reduction_basis_points
 from .capacity import ExpertReplicaConfig, _integer, align_capacity
 from .plan import ExpertExecutionPlan, ExpertReplicaTransfer
 from .planner import build_expert_replica_plan
+from .whole_experts import build_whole_expert_plan
 from ._selection import _UncalibratedCandidate, _admitted_uncalibrated_copies, _optional_peak_is_useful
 from .host import _column_totals
 from .count_kernel import try_count_payload
@@ -233,7 +234,7 @@ def _plan_replica_route(
     if state is None:
         if binary:
             counts = counts.tolist()
-        return (build_expert_replica_plan(counts, config.replica_slots_per_rank, **options), False)
+        return (_build_selected_plan(counts, config, options), False)
     logical = counts if binary else tuple((tuple(row) for row in counts))
     signature = _plan_signature(config, group, rank, options)
     cache = state.get_resource(_RecomputedReplicaPlans, _RecomputedReplicaPlans)
@@ -244,12 +245,27 @@ def _plan_replica_route(
             return (plan, True)
     if binary:
         logical = tuple(map(tuple, counts.tolist()))
-    plan = build_expert_replica_plan(logical, config.replica_slots_per_rank, **options)
+    plan = _build_selected_plan(logical, config, options)
     if not state.is_recomputing:
         cache.entries.append((signature, plan))
         if binary and counts.dtype == np.int32 and plan.transfers:
             cache.binary_counts[id(plan)] = counts.tobytes()
     return (plan, False)
+
+
+def _build_selected_plan(counts, config, options):
+    """Apply whole-expert placement after the current heuristic admits guest slots."""
+    planner_options = dict(options)
+    whole_experts = planner_options.pop("_whole_experts", False)
+    plan = build_expert_replica_plan(counts, config.replica_slots_per_rank, **planner_options)
+    if whole_experts:
+        plan = build_whole_expert_plan(
+            plan,
+            capacity_limit=planner_options.get("capacity_limit"),
+            minimum_load_reduction=planner_options.get("minimum_load_reduction", 0.0),
+            minimum_saved_rows=planner_options.get("minimum_saved_rows", 0),
+        )
+    return plan
 
 
 def stable_expert_order(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
@@ -495,6 +511,16 @@ def _prepare_severe_skew_counts(gathered, config, minimum_load_reduction, minimu
     return replace(gathered, host_counts=_read_gathered_host_counts(gathered.counts))
 
 
+def _route_upper_bound(config, maximum, top_k, allowance, capacity_budget):
+    """Keep the planned physical route within owner and heap limits."""
+    upper = config.maximum_receive_rows(max(1, maximum), top_k, alignment=1)
+    owner = ExpertReplicaConfig(config.num_experts, config.ep_size, 0).maximum_receive_rows(
+        max(1, maximum), top_k, alignment=1
+    )
+    upper = owner if allowance is None else min(owner, max(upper, allowance))
+    return min(upper, allowance) if capacity_budget is not None else upper
+
+
 def prepare_replica_route(
     topk_ids: torch.Tensor,
     config: ExpertReplicaConfig,
@@ -513,6 +539,7 @@ def prepare_replica_route(
     _trusted_counts: torch.Tensor | None = None,
     _gathered_counts: _GatheredReplicaCounts | None = None,
     _replica_transfer_row_credit: int = 0,
+    _whole_experts: bool = False,
 ) -> ReplicaRoute:
     """Gather exact counts, solve once and remap this invocation's current TopK IDs.
 
@@ -533,6 +560,7 @@ def prepare_replica_route(
         _trusted_counts: Router-owned exact histogram.
         _gathered_counts: Already validated native count agreement.
         _replica_transfer_row_credit: Runtime-derived mandatory-gradient row credit.
+        _whole_experts: Keep each logical expert's complete reduction on one rank.
 
     Returns:
         Owned plan, current mapping and integer execution metadata.
@@ -542,7 +570,7 @@ def prepare_replica_route(
     )
     _integer(_replica_transfer_row_credit, "Replica transfer row credit", 0)
     matrix, candidate = (None, None)
-    if compact_home and dynamic_header is not None and config.replica_slots_per_rank:
+    if compact_home and dynamic_header is not None and config.replica_slots_per_rank and not _whole_experts:
         matrix, ordinary, _gathered_counts = _prepare_compact_candidate(
             topk_ids,
             config,
@@ -571,13 +599,7 @@ def prepare_replica_route(
     target, allowance = _automatic_capacity_options(
         maximum, topk_ids.shape[1], target_load, receive_capacity, _auto_capacity_factor, _capacity_budget
     )
-    upper = config.maximum_receive_rows(max(1, maximum), topk_ids.shape[1], alignment=1)
-    owner = ExpertReplicaConfig(config.num_experts, config.ep_size, 0).maximum_receive_rows(
-        max(1, maximum), topk_ids.shape[1], alignment=1
-    )
-    upper = owner if allowance is None else min(owner, max(upper, allowance))
-    if _capacity_budget is not None:
-        upper = min(upper, allowance)
+    upper = _route_upper_bound(config, maximum, topk_ids.shape[1], allowance, _capacity_budget)
     plan, reused = _plan_replica_route(
         host,
         config,
@@ -592,6 +614,7 @@ def prepare_replica_route(
         rank_nodes=_rank_nodes,
         transfer_row_credit=_replica_transfer_row_credit,
         _uncalibrated_candidate=candidate,
+        _whole_experts=_whole_experts,
     )
     summary = tuple((tuple(row) + (load,) for row, load in zip(controls, plan.destination_loads))) if controls else None
     if compact_home and (not plan.transfers):

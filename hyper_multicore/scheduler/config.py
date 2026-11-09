@@ -20,6 +20,8 @@ Combines:
 - ctypes.Structure mirrors of runtime_head.hpp — passed as binary blobs to C++ kernels
 """
 
+from __future__ import annotations
+
 import ctypes
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -289,6 +291,8 @@ class TaskSplitValue:
     top_k:          int = 8
     dispatch_mode: str = "push"
     communication_rows: int | None = field(default=None, kw_only=True)
+    expert_rows_bound: int | None = None
+    source_expert_rows_bound: int | None = None
 
     def __post_init__(self) -> None:
         """Reject topology values that would invalidate runtime arithmetic."""
@@ -319,6 +323,13 @@ class TaskSplitValue:
             raise ValueError("communication_rows must be within the per-edge token capacity")
         if rows is not None and self.dispatch_mode != "push":
             raise ValueError("communication_rows is only supported for Push")
+        bounds = (("expert_rows_bound", self.expert_rows_bound, self.seq_all // self.top_k),
+                  ("source_expert_rows_bound", self.source_expert_rows_bound, self.seq_all // (self.ep * self.top_k)))
+        for name, bound, maximum in bounds:
+            if bound is not None and (
+                not isinstance(bound, int) or isinstance(bound, bool) or not 0 < bound <= maximum
+            ):
+                raise ValueError(f"{name} must be a positive integer no larger than {maximum}")
 
     # ── Derived properties ────────────────────────────────────────────────────
     @property
@@ -334,7 +345,7 @@ class TaskSplitValue:
     @property
     def per_expert_seq(self) -> int:
         """Sequence length per expert (across all EP ranks)."""
-        return self.seq_all // self.top_k
+        return self.expert_rows_bound if self.expert_rows_bound is not None else self.seq_all // self.top_k
 
     @property
     def per_rank_seq(self) -> int:
@@ -344,7 +355,8 @@ class TaskSplitValue:
     @property
     def per_expert_seq_to_other(self) -> int:
         """Sequence length per expert when sending to other ranks."""
-        return self.seq_all // (self.ep * self.top_k)
+        return (self.source_expert_rows_bound if self.source_expert_rows_bound is not None
+                else self.seq_all // (self.ep * self.top_k))
 
     def communication_tiles(self, split_rows: int) -> int:
         """Cover the agreed edge bound without changing the full-token schedule."""

@@ -78,6 +78,15 @@ def _workspace_allocation_specs(
     return allocations
 
 
+def _replica_matrix_shapes(hidden: int, intermediate: int, layout: str) -> tuple[tuple[int, int], ...]:
+    """Match guest buffers and gradient bands to the physical expert weight layout."""
+    if layout == "EOI":
+        return ((2 * intermediate, hidden), (hidden, intermediate))
+    if layout == "EIO":
+        return ((hidden, 2 * intermediate), (intermediate, hidden))
+    raise ValueError(f"Unsupported expert weight layout: {layout!r}")
+
+
 def _replica_inbox_bytes(specification: Mapping[str, Any]) -> int:
     """Return the replica payload tracked by SHMEM restart transactions."""
     budget = specification.get("replica_slots_per_rank", 0)
@@ -88,7 +97,7 @@ def _replica_inbox_bytes(specification: Mapping[str, Any]) -> int:
         raise ValueError("Unsupported replica_transport; expected p2p or a kernel-gradient transport")
     hidden, intermediate = (specification["hidden_size"], specification["intermediate_size"])
     return signal_storage_bytes(
-        ((hidden, 2 * intermediate), (intermediate, hidden)),
+        _replica_matrix_shapes(hidden, intermediate, specification.get("expert_weight_layout", "EIO")),
         budget,
         specification["ep_size"],
         2,
@@ -361,7 +370,7 @@ class MegaMoeWorkspace:
 
     def _allocate_replica_storage(self, spec: MegaMoeSpec) -> None:
         """Recreate provider state with the new symmetric heap generation."""
-        shapes = ((spec.hidden_size, 2 * spec.intermediate_size), (spec.intermediate_size, spec.hidden_size))
+        shapes = _replica_matrix_shapes(spec.hidden_size, spec.intermediate_size, spec.expert_weight_layout)
         bands = spec.replica_transport == GRADIENT_BAND_TRANSPORT
         slots = vars(spec).get("_replica_inbox_slots")
         storage_options = {} if slots is None else {"storage_slots": slots}

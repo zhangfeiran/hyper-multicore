@@ -215,7 +215,7 @@ def _allocate_backward_intermediates(
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
     gradient_dtype = torch.float32 if spec.replica_slots_per_rank else weight2.dtype
-    clear_all = empty_experts is None or len(empty_experts) == weight1.shape[0]
+    clear_all = empty_experts is None or len(empty_experts) == weight2.shape[0]
     allocate = torch.zeros_like if clear_all else torch.empty_like
     grad_weight1 = allocate(weight1, dtype=gradient_dtype)
     grad_weight2 = allocate(weight2, dtype=gradient_dtype)
@@ -223,6 +223,8 @@ def _allocate_backward_intermediates(
         for expert in empty_experts:
             grad_weight1[expert].zero_()
             grad_weight2[expert].zero_()
+        if weight1.shape[0] > weight2.shape[0]:
+            grad_weight1[weight2.shape[0]:].zero_()
     act_grad = torch.empty((capacity, spec.intermediate_size), dtype=grad_output.dtype, device=grad_output.device)
     swiglu_grad = torch.empty(
         (capacity, spec.intermediate_size * 2), dtype=grad_output.dtype, device=grad_output.device
@@ -473,8 +475,8 @@ def _launch_forward_kernel(
             _split_runtime(
                 plan.fwd_runtime_config,
                 pool,
-                weight1.shape[0],
-                home_only=pool is None and bool(spec.replica_slots_per_rank),
+                weight2.shape[0],
+                home_only=pool is None and (bool(spec.replica_slots_per_rank) or spec.single_expert_tasks),
                 cache=execution.runtime_cache,
                 task_prefix=execution.task_prefix,
                 prefix_cache=execution.prefix_cache,
@@ -500,8 +502,8 @@ def _launch_forward_kernel(
             _split_runtime(
                 diagnostic_call.runtime_config,
                 pool,
-                weight1.shape[0],
-                home_only=pool is None and bool(spec.replica_slots_per_rank),
+                weight2.shape[0],
+                home_only=pool is None and (bool(spec.replica_slots_per_rank) or spec.single_expert_tasks),
                 task_prefix=None if diagnostic_call.preserves_task_queues else execution.task_prefix,
             ),
             diagnostic_call.event_counters,
@@ -562,10 +564,10 @@ def _launch_backward_kernel(
             _split_runtime(
                 diagnostics.runtime_config,
                 pool,
-                saved.weight1.shape[0],
+                saved.weight2.shape[0],
                 backward=True,
                 gradient_return=gradient_return,
-                home_only=pool is None and bool(spec.replica_slots_per_rank),
+                home_only=pool is None and (bool(spec.replica_slots_per_rank) or spec.single_expert_tasks),
                 cache=execution.runtime_cache,
                 task_prefix=execution.task_prefix,
                 prefix_cache=execution.prefix_cache,
@@ -594,10 +596,10 @@ def _launch_backward_kernel(
             _split_runtime(
                 diagnostic_call.runtime_config,
                 pool,
-                saved.weight1.shape[0],
+                saved.weight2.shape[0],
                 backward=True,
                 gradient_return=gradient_return,
-                home_only=pool is None and bool(spec.replica_slots_per_rank),
+                home_only=pool is None and (bool(spec.replica_slots_per_rank) or spec.single_expert_tasks),
                 task_prefix=None if diagnostic_call.preserves_task_queues else execution.task_prefix,
             ),
             diagnostic_call.event_counters,

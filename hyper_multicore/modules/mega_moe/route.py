@@ -56,6 +56,15 @@ ReplicaRouteSelector = Callable[
 
 
 @dataclass(frozen=True)
+class RouteSchedule:
+    """Exact task extents and rank-local empty expert matrices."""
+
+    expert_rows: int
+    source_expert_rows: int
+    empty_experts: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class RouteMetadata:
     """Exact offsets and counts consumed by the low-level native ABI."""
 
@@ -72,6 +81,7 @@ class RouteMetadata:
     replica_route: ReplicaRoute | None = None
     empty_owner_experts: tuple[int, ...] | None = None
     maximum_edge_rows: int | None = None
+    schedule: RouteSchedule | None = None
 
 
 @dataclass(frozen=True)
@@ -265,6 +275,8 @@ def _compute_route_metadata(
     received_counts: torch.Tensor,
     spec: MegaMoeSpec,
     expert_capacity: int,
+    *,
+    route_counts: list[list[int]] | None = None,
 ) -> RouteMetadata:
     """Build exact element offsets without padding or route truncation."""
     counts_i32 = counts.to(dtype=torch.int32).contiguous()
@@ -303,7 +315,25 @@ def _compute_route_metadata(
         combine_size=received_counts.reshape(-1).to(torch.int32),
         group_list=(local_destination_prefix[:, -1] + local_destination_counts[:, -1]).to(torch.int64),
         expert_capacity=expert_capacity,
+        schedule=_route_schedule(counts_by_source, spec, route_counts),
     )
+
+
+def _route_schedule(counts: torch.Tensor | None, spec: MegaMoeSpec,
+                    host_counts: list[list[int]] | None = None) -> RouteSchedule | None:
+    """Bound task counts by the validated route without changing buffer strides."""
+    if not spec.auto_tokens or not spec.route_task_bounds or spec.replica_slots_per_rank:
+        return None
+    if host_counts is not None:
+        totals = [sum(values) for values in zip(*host_counts)]
+        source_maximum = max(max(row) for row in host_counts)
+    else:
+        totals_tensor = counts.sum(0, dtype=torch.int64)
+        values = torch.cat((totals_tensor, counts.amax().reshape(1).to(torch.int64))).tolist()
+        totals, source_maximum = values[:-1], values[-1]
+    start = spec.rank_id * spec.local_experts
+    empty = tuple(index for index, rows in enumerate(totals[start:start + spec.local_experts]) if not rows)
+    return RouteSchedule(max(totals), source_maximum, empty)
 
 
 def _upload_route_tensor(tensor: torch.Tensor, device: Any) -> torch.Tensor:
@@ -348,7 +378,8 @@ def _host_route_metadata(
         for expert in range(local)
     ]
     wide = (dispatch_source, dispatch_target, target_offsets, source_offsets, groups)
-    return _pack_host_route(wide, (dispatch_sizes, received), capacity, device)
+    metadata = _pack_host_route(wide, (dispatch_sizes, received), capacity, device)
+    return replace(metadata, schedule=_route_schedule(None, spec, counts))
 
 
 def _host_route_prefixes(
@@ -615,6 +646,7 @@ def _route_cache_signature(spec: MegaMoeSpec, device: Any) -> tuple[Any, ...]:
         spec.auto_tokens,
         spec.max_local_num_tokens,
         spec._compact_communication,
+        spec.route_task_bounds,
         torch.device(device),
     )
 
@@ -690,7 +722,9 @@ def _dynamic_route_metadata(
     received_counts = counts_by_source[:, start : start + spec.local_experts].contiguous()
     # Retained dispatch sizes must not alias a caller-owned Router count buffer.
     local_counts = counts_by_source[spec.rank_id] if spec.auto_tokens else counts
-    return _compute_route_metadata(local_counts, counts_by_source, received_counts, spec, capacity)
+    route_counts = None if host_rows is None else [row[3:] for row in host_rows]
+    return _compute_route_metadata(local_counts, counts_by_source, received_counts, spec, capacity,
+                                   route_counts=route_counts)
 
 
 def _permute_dynamic_pull(

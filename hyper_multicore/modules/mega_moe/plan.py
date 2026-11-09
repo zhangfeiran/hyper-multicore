@@ -161,6 +161,8 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
         top_k=spec.top_k,
         dispatch_mode=spec.dispatch_mode,
         communication_rows=spec._communication_rows,
+        expert_rows_bound=spec.schedule_expert_rows,
+        source_expert_rows_bound=spec.schedule_source_expert_rows,
     )
 
 
@@ -216,6 +218,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> 
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
+        swiglu_hf_bf16=spec.swiglu_hf_bf16,
         expert_weight_layout=spec.expert_weight_layout,
     )
     forward_graph.propagate_splits(task_values)
@@ -230,6 +233,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> 
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
+        swiglu_hf_bf16=spec.swiglu_hf_bf16,
         expert_weight_layout=spec.expert_weight_layout,
     )
     if spec.replica_slots_per_rank:

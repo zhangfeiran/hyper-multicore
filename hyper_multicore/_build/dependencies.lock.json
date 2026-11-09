@@ -49,6 +49,11 @@
             "purpose": "add task-configured DeepSeek clipped SwiGLU forward and backward semantics"
           },
           {
+            "path": "hyper_multicore/ops/patches/swi_glu_hf_bf16.patch",
+            "sha256": "3fbf8c4e47a43c1aa0cb65a2a1219a940a4a66add445c1488625cde097cdc0b9",
+            "purpose": "add optional BF16 intermediate rounding for separate SiLU and multiply semantics"
+          },
+          {
             "path": "hyper_multicore/ops/patches/rms_norm_worker_fusion.patch",
             "sha256": "e8e278434a4dc475477f1ee55d339c307f409e504cbf7dad6e29186d1121200f",
             "purpose": "add a logical token-block entry point while preserving the native RMSNorm entry behavior"

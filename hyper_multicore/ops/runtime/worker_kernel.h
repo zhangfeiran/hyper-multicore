@@ -177,7 +177,11 @@ class KernelWorkerBase {
       const bool projection_ready = runtime_bytes != base_bytes + 48;
       const uint64_t magic = kernel_gradients ? 0x0000000553505754ULL :
                              projection_ready ? 0x0000000453505754ULL : 0x0000000253505754ULL;
-      if (extension[0] != magic || extension[1] == 0 || extension[1] >= local_experts) {
+      if (extension[0] != magic || extension[1] == 0 || extension[1] > local_experts) {
+        AscendC::Trap();
+      }
+      if (extension[1] == local_experts &&
+          (projection_ready || extension[2] || extension[3] || extension[4] || extension[5])) {
         AscendC::Trap();
       }
       home_experts_ = extension[1];

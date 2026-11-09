@@ -21,9 +21,9 @@ from dataclasses import dataclass
 from hyper_multicore.scheduler.config import (
     TaskDescC, TensorDescC, RuntimeConfigC,
     TaskAiCoreType, TaskType,
-    MAX_TENSOR_DIMS,
+    MAX_TENSOR_DIMS, TaskSplitValue,
 )
-from hyper_multicore.scheduler.graph import OpType
+from hyper_multicore.scheduler.graph import OpType, OperatorNode
 from hyper_multicore.tasks.task_base import FillConfig
 from hyper_multicore.tasks.utils import advance_tsv_vector
 
@@ -61,12 +61,13 @@ class SwiGLUFillConfig(FillConfig):
     """
 
     clamp_limit: float | None = None
+    hf_bf16: bool = False
 
     def fill(
         self,
         cfg: RuntimeConfigC,
-        op,
-        tsv,
+        op: OperatorNode,
+        tsv: TaskSplitValue,
     ) -> None:
         """Serialize SwiGLU tasks into the runtime configuration.
 
@@ -78,6 +79,8 @@ class SwiGLUFillConfig(FillConfig):
         task_type = (TaskType.TASK_SWI_GLU if op.op_type == OpType.SWIGLU
                      else TaskType.TASK_SWI_GLU_GRAD)
         clamp_bits = _encode_clamp_limit(self.clamp_limit)
+        if not isinstance(self.hf_bf16, bool) or (self.hf_bf16 and clamp_bits):
+            raise ValueError("hf_bf16 must be boolean and cannot be combined with clamp_limit")
 
         num_triggers = tsv.per_expert_seq // op.split_value
         task_num     = op.task_num
@@ -121,6 +124,7 @@ class SwiGLUFillConfig(FillConfig):
             task.task_split_num       = task_num
             task.task_split_value     = op.split_value
             task.extra_value_0        = clamp_bits
+            task.extra_value_1        = int(self.hf_bf16)
             task.tiling_data_position = op.tiling_position
 
             cfg.all_tasks[tsv.pre_task_num + i]               = task

@@ -368,6 +368,20 @@ class TestMegaMoeExperts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "EOI expert weights must be contiguous"):
             experts._validate_tensors(hidden_states, (noncontiguous_gate_up, noncontiguous_down))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_eoi_replica_policy_is_recorded_and_checked(self) -> None:
+        """Preserve whole-expert EOI policy in the agreed execution specification."""
+        experts = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=32, top_k=1, ep_size=4,
+                                 expert_weight_layout="EOI", replica_slots_per_rank=2,
+                                 replica_granularity="expert", create_parameters=False)
+        self.addCleanup(experts.close)
+        self.assertEqual(experts.replica_granularity, "expert")
+        self.assertEqual(experts._resource_group.specification["replica_granularity"], "expert")
+        self.assertEqual(experts._resource_group.specification["expert_weight_layout"], "EOI")
+        with self.assertRaisesRegex(ValueError, "replica_granularity"):
+            MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=32, top_k=1, ep_size=4,
+                           replica_granularity="bad", create_parameters=False)
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_eio_is_the_default_native_graph_layout(self) -> None:
@@ -521,7 +535,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         route = SimpleNamespace(
             routed_tokens=object(),
             metadata=SimpleNamespace(
-                empty_owner_experts=None, replica_route=None, plan_tokens=128, maximum_edge_rows=None
+                empty_owner_experts=None, replica_route=None, plan_tokens=128, maximum_edge_rows=None, schedule=None
             ),
             unpermute_mapping=object(),
             maximum_received_slots=512,

@@ -39,17 +39,18 @@ def qualify_topology_schedule(spec: MegaMoeSpec, rank_nodes: tuple[int, ...]) ->
     return spec
 
 
-def summary_admission(budget: int) -> int:
+def summary_admission(budget: int, minimum_load_reduction: float | None = None) -> int:
     """Resolve the default summary shortcut independently of planner execution.
 
     Args:
         budget: Maximum guest slots per rank.
+        minimum_load_reduction: Optional fractional admission threshold.
 
     Returns:
         Integer admission basis points, or zero when explicitly disabled.
     """
     enabled = os.environ.get("HYPER_MULTICORE_MOE_SUMMARY_HOME_ADMISSION", "1") == "1"
-    return reduction_basis_points(resolve_replica_admission(None)[0]) if budget and enabled else 0
+    return reduction_basis_points(resolve_replica_admission(minimum_load_reduction)[0]) if budget and enabled else 0
 
 
 def execution_options(dispatch_mode: str, budget: int) -> dict:

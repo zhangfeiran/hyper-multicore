@@ -132,7 +132,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   uint32_t gradient_order_[GRADIENT_ORDER_MAX_EXPERTS];
 
   __aicore__ inline void ValidateGradientTask(const TaskDesc &task, uint32_t experts, uint32_t policy) {
-    if (this->home_experts_ != 0 || task.task_type != TaskType::TASK_GROUPED_MATMUL ||
+    if ((this->home_experts_ != 0 && this->home_experts_ != experts) ||
+        task.task_type != TaskType::TASK_GROUPED_MATMUL ||
         experts == 0 || experts > GRADIENT_ORDER_MAX_EXPERTS || policy < 1 || policy == 5 ||
         policy > GRADIENT_SHAPE_POLICY) AscendC::Trap();
     const uint32_t position = task.outputs[0].input_position;
@@ -158,7 +159,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       const uint32_t ordinal = position == 6 ? active_w2_++ : active_w1_++;
       return ordinal == 0 ? GRADIENT_LANE_DISABLED : ordinal;
     }
-    if (this->home_experts_ != 0) AscendC::Trap();
+    if (this->home_experts_ != 0 && this->home_experts_ != task.inputs[2].dim[0]) AscendC::Trap();
     return expert;
   }
 
@@ -251,7 +252,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                        input_list[task_desc.outputs[0].input_position] + output_0_offset,
                        input_list[SWIGLU_GRAD_WORKSPACE_IDX],
                        input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
-                       GetSwiGluClampLimit(task_desc));
+                       GetSwiGluClampLimit(task_desc), task_desc.extra_value_1 != 0);
           return;
         } else {
           GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 80 * (AscendC::GetBlockIdx() + 1);
@@ -269,7 +270,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                        input_list[task_desc.inputs[1].input_position] + input_1_offset,
                        input_list[task_desc.outputs[0].input_position] + output_0_offset,
                        input_list[SWIGLU_GRAD_WORKSPACE_IDX],
-                       tiling_data_addr, GetSwiGluClampLimit(task_desc));
+                       tiling_data_addr, GetSwiGluClampLimit(task_desc), task_desc.extra_value_1 != 0);
         }
       }
       return;

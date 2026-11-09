@@ -41,6 +41,42 @@ from tests.common.mark_utils import arg_mark
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     """Validate SHMEM planning without allocating accelerator memory."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_replica_storage_follows_eoi_and_eio_matrix_orientation(self) -> None:
+        """Bind each layout to its planned allocation and verify both band tables."""
+        for layout in ("EIO", "EOI"):
+            with self.subTest(layout=layout):
+                specification = {
+                    "hidden_size": 128,
+                    "intermediate_size": 6144,
+                    "ep_size": 2,
+                    "replica_slots_per_rank": 1,
+                    "expert_weight_layout": layout,
+                    "replica_transport": "shmem_signal_kernel_gradient_bands",
+                }
+                workspace = MegaMoeWorkspace(shared=False)
+                with (
+                    patch.object(workspace_module.shmem, "empty",
+                                 side_effect=lambda shape, **kw: torch.empty(shape, dtype=kw["dtype"])),
+                    patch.object(workspace_module.shmem, "host_barrier"),
+                ):
+                    workspace._allocate_replica_storage(SimpleNamespace(**specification))
+                    shapes = ((12288, 128), (128, 6144)) if layout == "EOI" else ((128, 12288), (6144, 128))
+                    weights = tuple(torch.empty((2, *shape), dtype=torch.bfloat16) for shape in shapes)
+                    provider = workspace.replica_provider
+                    provider._bind(weights)
+                    self.assertEqual(workspace.replica_inbox.numel(),
+                                     workspace_module._replica_inbox_bytes(specification))
+                    self.assertEqual(tuple(tuple(w.shape) for w in provider.pool.weights),
+                                     tuple((1, *shape) for shape in shapes))
+                    self.assertEqual(tuple(tuple(g.shape) for g in provider.pool.gradients),
+                                     tuple((1, *shape) for shape in shapes))
+                    with provider._lock:
+                        for matrix in (0, 1):
+                            flags, rows, bands = provider.kernel_gradient_band_signals(matrix, 24)
+                            self.assertEqual(flags.shape[1], bands)
+                            self.assertGreaterEqual(rows * bands, shapes[matrix][0])
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_pending_backward_prevents_close_without_changing_buffers(self) -> None:
