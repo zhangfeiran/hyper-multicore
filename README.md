@@ -113,3 +113,4 @@ Lizard、Markdownlint、Node 和 pre-commit 不固定版本；环境需满足所
 | [架构](docs/architecture.md) | 运行时、调度与算子扩展 |
 | [SHMEM](docs/shmem.md) | 通信资源与生命周期 |
 | [诊断工具](docs/profiling.md) | Profiling 与 tensor dump |
+| [专家副本无表迁移方案](docs/design/expert_replica_migration.zh-CN.md) | 最小完整范围、代码拆分、下游桥接和当前规划内核验证 |
