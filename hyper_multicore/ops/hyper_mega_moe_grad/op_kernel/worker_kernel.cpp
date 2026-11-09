@@ -175,6 +175,58 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     }
   }
 
+  __aicore__ inline void PrepareOwnerGroupedTiling(const TaskDesc &task_desc, GM_ADDR grouped_list_real,
+      uint32_t expert_num_single_rank, uint32_t data_index, int64_t value, GM_ADDR tiling_data_addr) {
+    GlobalTensor<int64_t> grouped_list_tensor_real;
+    grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
+
+        for (uint32_t i = 0; i < expert_num_single_rank; i++) {
+          if (i > data_index) {
+            grouped_list_tensor_real.SetValue(i, value);
+          } else if (i == data_index) {
+            grouped_list_tensor_real.SetValue(i, value);
+          } else {
+            grouped_list_tensor_real.SetValue(i, 0);
+          }
+        }
+        cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
+
+        __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
+        if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
+          tilingdata_data->mmTilingData.Ka = value;
+          tilingdata_data->mmTilingData.Kb = value;
+          tilingdata_data->mmTilingData.singleCoreK = value;
+          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
+        } else {
+          tilingdata_data->gmmBaseParams.m = value;
+          tilingdata_data->mmTilingData.M = value;
+          tilingdata_data->mmTilingData.singleCoreM = value;
+          cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
+          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
+        }
+        PipeBarrier<PIPE_ALL>();
+
+
+  }
+
+  __aicore__ inline void ResolveReplicaMatrices(const TaskDesc &task_desc, uint32_t data_index,
+      GM_ADDR &weight_base, GM_ADDR &output_base, int64_t &output_0_offset) {
+        if (this->home_experts_ > 0) {
+          if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
+            const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[0].dim[1]) *
+                                         task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
+            const uint32_t position = task_desc.outputs[0].input_position;
+            output_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 18 ? 2 : 3);
+            output_0_offset = 0;
+          } else {
+            const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
+                                         task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+            const uint32_t position = task_desc.inputs[1].input_position;
+            weight_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 11 ? 0 : 1);
+          }
+        }
+  }
+
   __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
       DynamicData dynamic_data;
@@ -198,36 +250,24 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           value = value - grouped_list_tensor.GetValue(data_index - 1);
           start = grouped_list_tensor.GetValue(data_index - 1);
         }
+        uint32_t band_output_rows = 0, band_rows = 0;
+        int32_t band_epoch = 0;
+        GM_ADDR band_flags = this->GetGradientBandProduction(
+            task_desc.outputs[0].input_position, data_index, &band_output_rows, &band_rows, &band_epoch);
         if (value == 0) {
+          if (band_flags != nullptr) {
+            MulticoreRuntime::GradientBandProducer producer;
+            producer.Set(band_flags, band_epoch, band_rows);
+            producer.Begin(band_output_rows, this->worker_id_, this->core_num);
+            producer.PublishEmpty();
+          }
           return;
         }
-        for (uint32_t i = 0; i < expert_num_single_rank; i++) {
-          if (i > data_index) {
-            grouped_list_tensor_real.SetValue(i, value);
-          } else if (i == data_index) {
-            grouped_list_tensor_real.SetValue(i, value);
-          } else {
-            grouped_list_tensor_real.SetValue(i, 0);
-          }
-        }
-        cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
-
         GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
-        __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
-        if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
-          tilingdata_data->mmTilingData.Ka = value;
-          tilingdata_data->mmTilingData.Kb = value;
-          tilingdata_data->mmTilingData.singleCoreK = value;
-          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
-        } else {
-          tilingdata_data->gmmBaseParams.m = value;
-          tilingdata_data->mmTilingData.M = value;
-          tilingdata_data->mmTilingData.singleCoreM = value;
-          cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
-          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
+        if (this->home_experts_ == 0) {
+          PrepareOwnerGroupedTiling(task_desc, grouped_list_real, expert_num_single_rank, data_index, value,
+                                    tiling_data_addr);
         }
-        PipeBarrier<PIPE_ALL>();
-
         int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
                                    ? start * task_desc.inputs[0].dim[1] * task_desc.inputs[0].data_type
                                    : task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type;
@@ -238,12 +278,18 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                                     ? start * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
                                     : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
 
+        GM_ADDR weight_base = input_list[task_desc.inputs[1].input_position];
+        GM_ADDR output_base = input_list[task_desc.outputs[0].input_position];
+        ResolveReplicaMatrices(task_desc, data_index, weight_base, output_base, output_0_offset);
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position] + input_1_offset, nullptr, nullptr, nullptr,
-                       nullptr, nullptr, grouped_list_real, nullptr,
-                       input_list[task_desc.outputs[0].input_position] + output_0_offset, input_list[WORKSPACE_IDX],
+                       weight_base + input_1_offset, nullptr, nullptr, nullptr,
+                       nullptr, nullptr, this->home_experts_ > 0 ? nullptr : grouped_list_real, nullptr,
+                       output_base + output_0_offset, input_list[WORKSPACE_IDX],
                        tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
-                       getTransposeData(task_desc.inputs[1].transpose_flag));
+                       getTransposeData(task_desc.inputs[1].transpose_flag),
+                       task_desc.outputs[0].data_type == sizeof(float), band_flags, band_epoch, band_rows,
+                       this->home_experts_ > 0 ? value : 0, this->home_experts_ > 0,
+                       this->home_experts_ > 0 ? 0 : UINT32_MAX);
       }
       return;
     }

@@ -1,0 +1,154 @@
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
+@@ -170,6 +170,23 @@
+         op.Process();                                                                                              \
+     } while (0)
+ 
++template <bool TransposeX>
++__aicore__ inline void ApplyDynamicRows(GMMBaseParams &base, TCubeTiling &tile, int64_t rows, bool singleGroup)
++{
++    // Each invocation already has a private tiling copy. Keep the shared image immutable.
++    if (rows == 0) return;
++    if constexpr (TransposeX) {
++        tile.Ka = rows;
++        tile.Kb = rows;
++        tile.singleCoreK = rows;
++    } else {
++        base.m = rows;
++        tile.M = rows;
++        tile.singleCoreM = rows;
++    }
++    if (singleGroup) base.groupNum = 1;
++}
++
+ #define GMM_CUBE_IMP(processClass, transA, transB, sync, cfg)                                                      \
+     do {                                                                                                           \
+         if ASCEND_IS_AIV {                                                                                         \
+@@ -180,6 +197,7 @@
+         GET_TILING_DATA_MEMBER(GMMTilingData, gmmBaseParams, gmmBaseParams_, tiling);                              \
+         GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, mmTilingData_, tiling);                                \
+         GET_TILING_DATA_MEMBER_ADDR(GMMTilingData, gmmArray, gmmArrayAddr_, tiling);                               \
++        ApplyDynamicRows<transA>(gmmBaseParams_, mmTilingData_, dynamic_rows, single_group);                      \
+         mm.SetSubBlockIdx(0);                                                                                      \
+         mm.Init(&mmTilingData_, &tPipe);                                                                           \
+         GMMCompute<matmulType, sync> computeOp(mm);                                                                \
+@@ -187,6 +205,8 @@
+                        y, user1,  &gmmBaseParams_, &mmTilingData_, &tPipe);                                        \
+         processClass<decltype(computeOp)> op(computeOp);                                                           \
+         op.Init(&gmmBaseParams_, &mmTilingData_, gmmArrayAddr_, groupList, tiling);                                \
++        op.SetBandPublication(band_flags, band_epoch, band_rows);                                                \
++        op.SetExplicitSplit(dynamic_rows, explicit_expert);                                                       \
+         op.Process();                                                                                              \
+     } while (0)
+ 
+@@ -383,7 +403,11 @@
+                                                      GM_ADDR offset, GM_ADDR antiquantScale, GM_ADDR antiquantOffset,
+                                                      GM_ADDR groupList, GM_ADDR perTokenScale, GM_ADDR y,
+                                                      GM_ADDR workspace, GM_ADDR tiling, bool transA, bool transB,
+-                                                     bool fp32Output = false)
++                                                     bool fp32Output = false, GM_ADDR band_flags = nullptr,
++                                                     int32_t band_epoch = 0, uint32_t band_rows = 0,
++                                                     int64_t dynamic_rows = 0,
++                                                     bool single_group = false,
++                                                     uint32_t explicit_expert = UINT32_MAX)
+ {
+     TPipe tPipe;
+     AscendCUtils::SetOverflow(1);
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.h
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.h
+@@ -17,6 +17,8 @@
+ 
+ #include "grouped_matmul_utils.h"
+ #include "kernel_operator.h"
++
++#include "../runtime/gradient_band.h"
+ 
+ namespace GROUPED_MATMUL {
+ 
+@@ -120,6 +122,8 @@
+ 
+     uint32_t blockIdx;
+     uint32_t coreIdx;
++    uint32_t explicitExpert = UINT32_MAX;
++    int64_t explicitRows = 0;
+     uint32_t groupNum;
+     int32_t preOffset = 0;
+     GM_ADDR groupListPtr;
+@@ -132,6 +136,17 @@
+ 
+  public:
+     /** @brief constructor */
++    MulticoreRuntime::GradientBandProducer bandProducer;
++
++    __aicore__ inline void SetExplicitSplit(int64_t rows, uint32_t expert) {
++        explicitRows = rows;
++        explicitExpert = expert;
++    }
++
++    __aicore__ inline void SetBandPublication(GM_ADDR flags, int32_t epoch, uint32_t rows) {
++        bandProducer.Set(flags, epoch, rows);
++    }
++
+     __aicore__ inline GMMProcess(ComputeType& computeOp_) : computeOp(computeOp_) {}
+ 
+     __aicore__ inline void Init(const GMMBaseParams* __restrict gmmBaseParamsIn,
+@@ -277,8 +292,15 @@
+ template <typename ComputeType>
+ __aicore__ inline void GMMProcess<ComputeType>::Process() {
+     MNConfig mnConfig;
++    const bool hasExplicitSplit = explicitExpert != UINT32_MAX;
++    if (hasExplicitSplit &&
++        (explicitRows <= 0 || explicitRows > INT32_MAX || explicitExpert >= groupNum ||
++         gmmBaseParams->groupListType != 0 ||
++         (gmmBaseParams->groupType != 0 && gmmBaseParams->groupType != 2))) {
++        AscendC::Trap();
++    }
+     if (gmmBaseParams->groupType != -1) {  // -1: no split
+-        if (unlikely(groupListPtr == nullptr)) {
++        if (unlikely(groupListPtr == nullptr && !hasExplicitSplit)) {
+             return;
+         }
+         preOffset = 0;
+@@ -287,10 +309,14 @@
+     // 2: groupList shape: [e, 2]; 1: groupList shape: [e]
+     uint32_t groupListType = gmmBaseParams->groupListType;
+     uint32_t groupListInnerShape = groupListType == GROUP_LIST_TYPE_SPARSE ? 2 : 1;
+-    uint32_t groupListShapeSize = groupNum * groupListInnerShape;
++    // A worker materializes one nonempty group. Keep prefix offset calculation
++    // unchanged but avoid the GM group-list scratch and trailing empty groups.
++    uint32_t groupListShapeSize = hasExplicitSplit ? explicitExpert + 1 : groupNum * groupListInnerShape;
+     for (uint32_t groupIdx = 0, count = 0; groupIdx < groupListShapeSize; groupIdx += groupListInnerShape) {
+         UpdateMnConfig(mnConfig);
+-        int32_t splitValue = GetSplitValueFromGroupList(groupIdx, preOffset, gmmBaseParams, groupListGm);
++        int32_t splitValue = hasExplicitSplit
++                                 ? (groupIdx == explicitExpert ? static_cast<int32_t>(explicitRows) : 0)
++                                 : GetSplitValueFromGroupList(groupIdx, preOffset, gmmBaseParams, groupListGm);
+         if (groupListType == GROUP_LIST_TYPE_SPARSE && splitValue <= 0) {
+             break;
+         }
+@@ -305,9 +331,25 @@
+         uint32_t curBlock = coreIdx >= count ? coreIdx : coreIdx + gmmBaseParams->coreNum;
+         uint32_t thresholdM_dimN = thresholdBlockNum * mnConfig.blockDimN;
+ 
++        if (bandProducer.Enabled()) {
++            bandProducer.Begin(mnConfig.m, coreIdx, gmmBaseParams->coreNum);
++            MNConfig planned = mnConfig;
++            for (uint32_t block = curBlock; block < curCount; block += gmmBaseParams->coreNum) {
++                MNBlockIdxCompute(planned, block, count, thresholdM_dimN);
++                uint32_t row = planned.mIdx * planned.singleM;
++                uint32_t rows = planned.m - row < planned.singleM ? planned.m - row : planned.singleM;
++                bandProducer.Expect(row, rows);
++            }
++            bandProducer.PublishEmpty();
++        }
+         while (curBlock < curCount) {
+             MNBlockIdxCompute(mnConfig, curBlock, count, thresholdM_dimN);
+             computeOp.MMCompute(groupIdx, mnConfig, coreIdx);
++            if (bandProducer.Enabled()) {
++                uint32_t row = mnConfig.mIdx * mnConfig.singleM;
++                uint32_t rows = mnConfig.m - row < mnConfig.singleM ? mnConfig.m - row : mnConfig.singleM;
++                bandProducer.Retire(row, rows);
++            }
+             computeOp.VectorCompute(mnConfig);
+             curBlock += gmmBaseParams->coreNum;
+         }

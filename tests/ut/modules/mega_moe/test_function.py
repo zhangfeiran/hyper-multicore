@@ -80,6 +80,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         """Native EOI operands and gradients already match the parameter storage layout."""
         spec = SimpleNamespace(
             expert_weight_layout="EOI",
+            replica_slots_per_rank=0,
             local_experts=2,
             hidden_size=4,
             intermediate_size=3,
@@ -98,15 +99,21 @@ class TestMegaMoeFunction(unittest.TestCase):
             down,
         )
         for weight, gradient in ((gate_up, gradients.grad_weight1), (down, gradients.grad_weight2)):
-            self.assertEqual(gradient.shape, weight.shape,
-                             msg=f"Gradient shape: expected={weight.shape}, actual={gradient.shape}")
-            self.assertEqual(gradient.stride(), weight.stride(),
-                             msg=f"Gradient stride: expected={weight.stride()}, actual={gradient.stride()}")
-            self.assertEqual(torch.count_nonzero(gradient).item(), 0,
-                             msg=f"Empty-expert gradients: expected=0, actual={gradient}")
+            self.assertEqual(
+                gradient.shape, weight.shape, msg=f"Gradient shape: expected={weight.shape}, actual={gradient.shape}"
+            )
+            self.assertEqual(
+                gradient.stride(),
+                weight.stride(),
+                msg=f"Gradient stride: expected={weight.stride()}, actual={gradient.stride()}",
+            )
+            self.assertEqual(
+                torch.count_nonzero(gradient).item(), 0, msg=f"Empty-expert gradients: expected=0, actual={gradient}"
+            )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
+    )
     def test_backward_unpacks_saved_tensors_once(self) -> None:
         """Feature: MegaKernel diagnostics.
         Description: Checkpoint unpack hooks must only be consumed once per backward call.
@@ -114,16 +121,28 @@ class TestMegaMoeFunction(unittest.TestCase):
         """
         tensors = tuple(torch.ones(1) for _ in range(13))
         context = Mock()
+        context.replica_route = None
+        context.empty_owner_experts = None
+        context.plan.bwd_no_replica_task_prefixes = ()
+        context.plan.bwd_task_prefixes = ()
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
         execution = function_module._BackwardExecution(
-            dispatch=torch.ones(1), grad_x=torch.ones(1), event_counters=Mock(),
-            gmm_workspace=None, swiglu_workspace=None,
+            dispatch=torch.ones(1),
+            grad_x=torch.ones(1),
+            event_counters=Mock(),
+            gmm_workspace=None,
+            swiglu_workspace=None,
             intermediates=function_module._BackwardIntermediates(*(torch.ones(1) for _ in range(5))),
         )
         with (
-            patch.object(type(context), "saved_tensors", create=True,
-                         new_callable=PropertyMock, side_effect=[tensors, RuntimeError("duplicate unpack")]) as unpack,
+            patch.object(
+                type(context),
+                "saved_tensors",
+                create=True,
+                new_callable=PropertyMock,
+                side_effect=[tensors, RuntimeError("duplicate unpack")],
+            ) as unpack,
             patch.object(function_module, "_prepare_backward_execution", return_value=execution),
             patch.object(function_module, "_launch_backward_kernel"),
             patch.object(function_module, "_restore_input_gradient", return_value=gradient) as restore,
@@ -207,21 +226,37 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertEqual(tuple(output.shape), (tokens * 2 if permuted else 4, 4))
         return output
 
-    def _check_deferred_backward(self, *, permuted: bool, input_grad: bool = True,
-                                vary_tokens: bool = False, replay: bool = False) -> None:
-        """Exercise delayed backward with an optional input permutation boundary."""
-        spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
-                               ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
-                               dispatch_mode="push", expert_weight_layout="EIO", auto_tokens=False)
-        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False)
-        for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
-                     "w1_grad", "w2_grad", "swiglu_grad"):
+    @staticmethod
+    def _deferred_resources(vary_tokens: bool) -> tuple[Any, Any]:
+        """Prepare directional buffers whose overwrite is visible to the lifetime checks."""
+        spec = SimpleNamespace(
+            hidden_size=4,
+            intermediate_size=2,
+            rank_id=0,
+            ep_size=2,
+            num_experts=4,
+            local_num_tokens=2,
+            top_k=2,
+            dispatch_mode="push",
+            expert_weight_layout="EIO",
+            auto_tokens=False,
+            replica_slots_per_rank=0,
+        )
+        plan = SimpleNamespace(
+            spec=spec,
+            reuse_backward_dispatch=False,
+            fwd_task_prefixes=(),
+            bwd_task_prefixes=(),
+            bwd_no_replica_task_prefixes=(),
+        )
+        for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad", "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
         runtime = SimpleNamespace(normal_tensor=None, kernel_name="mega_moe", rank=0)
         plan.fwd_diagnostics = MegaKernelDiagnostics(runtime)
         plan.bwd_diagnostics = MegaKernelDiagnostics(runtime)
         plan.fwd_runtime_config = plan.bwd_runtime_config = None
         workspace = Mock(
+            replica_provider=None,
             expert_capacity=128,
             expert_buffer=torch.empty(128, 4),
             routed_buffer=torch.empty(8 if vary_tokens else 4, 4),
@@ -230,6 +265,13 @@ class TestMegaMoeFunction(unittest.TestCase):
             gmm_workspace=torch.empty(1),
             swiglu_grad_workspace=torch.empty(1),
         )
+        return plan, workspace
+
+    def _check_deferred_backward(
+        self, *, permuted: bool, input_grad: bool = True, vary_tokens: bool = False, replay: bool = False
+    ) -> None:
+        """Exercise delayed backward with an optional input permutation boundary."""
+        plan, workspace = self._deferred_resources(vary_tokens)
         weight1 = torch.ones(2, 4, 4, requires_grad=True)
         weight2 = torch.ones(2, 2, 4, requires_grad=True)
         down_pointers = []
@@ -290,8 +332,9 @@ class TestMegaMoeFunction(unittest.TestCase):
         outputs = []
         sources = []
         with (
-            patch.object(MegaKernelDiagnostics, "launch",
-                         side_effect=AssertionError("ordinary path must bypass launch")),
+            patch.object(
+                MegaKernelDiagnostics, "launch", side_effect=AssertionError("ordinary path must bypass launch")
+            ),
             patch.object(
                 function_module.multicore_ops,
                 "mega_moe",
@@ -302,19 +345,34 @@ class TestMegaMoeFunction(unittest.TestCase):
                 "mega_moe_grad",
                 side_effect=backward_kernel,
             ),
-            patch.object(function_module.multicore_ops, "moe_token_permute_grad",
-                         side_effect=permutation_gradient) as mock_permutation,
+            patch.object(
+                function_module.multicore_ops, "moe_token_permute_grad", side_effect=permutation_gradient
+            ) as mock_permutation,
         ):
             for tag, capacity in enumerate(capacities, start=1):
                 tokens = (1, 3, 2, 4)[tag - 1] if vary_tokens else 2
                 source = torch.full((tokens if permuted else 4, 4), float(tag), requires_grad=input_grad)
                 route = SimpleNamespace(expert_capacity=capacity, group_list=torch.tensor([0, capacity]))
-                for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
-                             "combine_src_off", "combine_target_off", "combine_size"):
+                for name in (
+                    "dispatch_src_off",
+                    "dispatch_target_off",
+                    "dispatch_size",
+                    "combine_src_off",
+                    "combine_target_off",
+                    "combine_size",
+                ):
                     setattr(route, name, torch.zeros(4, dtype=torch.int64))
                 output = self._check_deferred_forward(
-                    source, weight1, weight2, route, plan, workspace, down_pointers,
-                    permuted=permuted, vary_tokens=vary_tokens, replay=replay,
+                    source,
+                    weight1,
+                    weight2,
+                    route,
+                    plan,
+                    workspace,
+                    down_pointers,
+                    permuted=permuted,
+                    vary_tokens=vary_tokens,
+                    replay=replay,
                 )
                 outputs.append(output)
                 sources.append(source)

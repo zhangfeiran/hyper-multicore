@@ -156,26 +156,39 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                         manager = _HeapManager(None, reference)
                         manager.reserve(((spec, _workspace_layout(spec, reference.dtype)),), allow_resize=True)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
+    )
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Feature: Dynamic event allocation.
         Description: Allocate and reuse event storage through the SHMEM API.
         Expectation: Preserve dynamic counters and ready tails without reallocating.
         """
-        spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16,
-                               ep_size=64, num_experts=1024, dispatch_mode="push")
+        spec = SimpleNamespace(
+            replica_slots_per_rank=0,
+            receive_capacity=128,
+            routed_slots=256,
+            hidden_size=16,
+            ep_size=64,
+            num_experts=1024,
+            dispatch_mode="push",
+        )
         workspace = MegaMoeWorkspace(shared=True)
         with (
-            patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
-                shape, dtype=kw["dtype"],
-            )) as allocate,
+            patch.object(
+                workspace_module.shmem,
+                "empty",
+                side_effect=lambda shape, **kw: torch.empty(
+                    shape,
+                    dtype=kw["dtype"],
+                ),
+            ) as allocate,
             patch.object(workspace_module.torch, "npu", create=True),
         ):
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
         self.assertEqual(allocate.call_count, 4)
-        self.assertEqual(workspace.event_counter_bytes, 1104 * 4)
+        self.assertEqual(workspace.event_counter_bytes, 1120 * 4)
         for tensor in (workspace.forward_event_counters, workspace.backward_event_counters):
             self.assertEqual(tensor.numel(), event_workspace_bytes(spec.ep_size, spec.num_experts))
         for allocation in allocate.call_args_list:
@@ -213,18 +226,18 @@ class TestReadyEventWorkspace(unittest.TestCase):
     @patch.object(workspace_module.shmem, "host_barrier")
     def test_initializes_once_and_preserves_ready_tail_per_direction(self, mock_barrier, mock_free) -> None:
         """Clear stale task counters without clearing a later peer signal."""
-        workspace = MegaMoeWorkspace(shared=True, event_counter_bytes=1104 * 4)
+        workspace = MegaMoeWorkspace(shared=True, event_counter_bytes=1120 * 4)
         events = [torch.full((event_workspace_bytes(64, 1024),), 123, dtype=torch.uint8) for _ in range(2)]
         workspace.forward_event_counters, workspace.backward_event_counters = events
         for forward, tensor in zip((True, False), events):
             with self.subTest(forward=forward):
                 self.assertIs(workspace.prepare_event_counters(forward=forward), tensor)
                 self.assertEqual(torch.count_nonzero(tensor).item(), 0)
-                tensor[:workspace.event_counter_bytes].fill_(51)
-                tensor[workspace.event_counter_bytes:].fill_(7)
+                tensor[: workspace.event_counter_bytes].fill_(51)
+                tensor[workspace.event_counter_bytes :].fill_(7)
                 workspace.prepare_event_counters(forward=forward)
-                self.assertEqual(torch.count_nonzero(tensor[:workspace.event_counter_bytes]).item(), 0)
-                self.assertTrue(torch.all(tensor[workspace.event_counter_bytes:] == 7))
+                self.assertEqual(torch.count_nonzero(tensor[: workspace.event_counter_bytes]).item(), 0)
+                self.assertTrue(torch.all(tensor[workspace.event_counter_bytes :] == 7))
         self.assertEqual(mock_barrier.call_count, 2)
         workspace._free_symmetric_tensors()  # pylint: disable=protected-access
         self.assertFalse(workspace.forward_ready_initialized)

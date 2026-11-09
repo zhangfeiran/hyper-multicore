@@ -19,28 +19,29 @@ Combines:
 - TaskSplitValue / init_task_split_value  — TP/EP/seq topology + per-rank counters
 - ctypes.Structure mirrors of runtime_head.hpp — passed as binary blobs to C++ kernels
 """
+
 import ctypes
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
 # ── Constants (match runtime_head.hpp exactly) ────────────────────────────────
-MAX_TENSOR_DIMS      = 4
-MAX_INPUTS_PER_TASK  = 4
+MAX_TENSOR_DIMS = 4
+MAX_INPUTS_PER_TASK = 4
 MAX_OUTPUTS_PER_TASK = 4
 
-MIN_EVENT_CAPACITY  = 1024
-NUM_WORKERS_VECTOR   = 48
-NUM_WORKERS_CUBE     = 24
+MIN_EVENT_CAPACITY = 1024
+NUM_WORKERS_VECTOR = 48
+NUM_WORKERS_CUBE = 24
 MIN_GROUP_LIST_CAPACITY = 512
 GROUP_LIST_CACHE_LINE_BYTES = 128
 ATOMIC_ADD_VALUE_LEN = 8
 READY_CACHE_LINE_BYTES = 64
-INVALID_PROFILE_DESC_ID  = 0xFFFFFFFF
+INVALID_PROFILE_DESC_ID = 0xFFFFFFFF
 INVALID_PROFILE_OWNER_ID = 0xFFFFFFFF
 DEFAULT_DEPENDENCY_POLL_INTERVAL_US = 0
 FAST_DEPENDENCY_POLL_INTERVAL_US = 5
-EVENT_INVALID_ID         = 0xFFFFFFFF
+EVENT_INVALID_ID = 0xFFFFFFFF
 RUNTIME_PROTOCOL_VERSION = 1
 
 
@@ -58,7 +59,7 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
         raise ValueError("num_experts must be positive and divisible by ep_size")
     # Ready and worker completion follow termination with separate atomic lanes.
     final_event = num_experts + 3 * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
-    required = final_event + ATOMIC_ADD_VALUE_LEN
+    required = final_event + 2 * ATOMIC_ADD_VALUE_LEN + num_experts // ep_size
     return max(MIN_EVENT_CAPACITY, (required + 15) // 16 * 16)
 
 
@@ -140,6 +141,7 @@ class DynamicType(IntEnum):
 
 
 # ── ctypes Structures (mirror runtime_head.hpp) ───────────────────────────────
+
 
 class TensorDescC(ctypes.Structure):
     """Serialized tensor address and shape descriptor."""
@@ -268,6 +270,7 @@ class SwiGluTilingDataC(ctypes.Structure):
 
 
 # ── Topology + runtime counters ───────────────────────────────────────────────
+
 
 @dataclass
 class TaskSplitValue:
@@ -423,15 +426,16 @@ def _validate_runtime_task_queues(cfg: RuntimeConfigC, event_capacity: int) -> N
             if task_id < 0 or task_id >= len(cfg.all_tasks):
                 raise ValueError(f"invalid runtime task id {task_id}")
             task = cfg.all_tasks[task_id]
-            dependency_out_of_range = (
-                task.dependent_event != 0xFFFFFFFF
-                and task.dependent_event >= event_capacity
-            )
+            dependency_out_of_range = task.dependent_event != 0xFFFFFFFF and task.dependent_event >= event_capacity
             trigger_out_of_range = task.trigger_event + ATOMIC_ADD_VALUE_LEN > event_capacity
             if dependency_out_of_range or trigger_out_of_range:
-                raise ValueError(
-                    f"task {task_id} references an event outside allocated capacity {event_capacity}"
-                )
+                raise ValueError(f"task {task_id} references an event outside allocated capacity {event_capacity}")
+            if (
+                task.task_type == TaskType.TASK_GROUPED_MATMUL
+                and task.extra_value_1
+                and task.extra_value_1 + ATOMIC_ADD_VALUE_LEN > event_capacity
+            ):
+                raise ValueError(f"task {task_id} producer event exceeds allocated capacity {event_capacity}")
 
 
 def validate_runtime_config(

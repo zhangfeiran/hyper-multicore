@@ -23,16 +23,12 @@ import unittest
 from pathlib import Path
 
 import hyper_multicore
-from hyper_multicore.modules.mega_moe.backward.gen_runtime_data import (
-    build_config_for_rank as build_backward_config,
-)
-from hyper_multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
+from hyper_multicore.modules.mega_moe.backward.gen_runtime_data import build_config_for_rank as build_backward_config
 from hyper_multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
 )
-from hyper_multicore.modules.mega_moe.forward.gen_runtime_data import (
-    build_config_for_rank as build_forward_config,
-)
+from hyper_multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
+from hyper_multicore.modules.mega_moe.forward.gen_runtime_data import build_config_for_rank as build_forward_config
 from hyper_multicore.modules.mega_moe.forward.graph import (
     build_forward_graph,
 )
@@ -138,17 +134,18 @@ class TestRuntimeSerialization(unittest.TestCase):
     def test_real_graphs_expand_event_storage(self) -> None:
         """Expand events for a valid topology with 16 experts per rank."""
         for graph_builder, config_builder in (
-            (build_forward_graph, build_forward_config), (build_backward_graph, build_backward_config),
+            (build_forward_graph, build_forward_config),
+            (build_backward_graph, build_backward_config),
         ):
             with self.subTest(graph=graph_builder.__name__):
                 values = TaskSplitValue(tp=1, ep=64, seq_size=128, all_expert_num=1024, top_k=2)
                 graph = graph_builder(values, hidden_size=128, intermediate_size=128, num_cube_cores=20)
                 graph.propagate_splits(values)
                 cfg = config_builder(graph, values, 63, 20)
-                self.assertEqual(len(cfg.all_event_num_triggers), 1104)
-                self.assertEqual(len(cfg.all_events), 1104)
+                self.assertEqual(len(cfg.all_event_num_triggers), 1120)
+                self.assertEqual(len(cfg.all_events), 1120)
                 image = serialize_runtime_config(cfg)
-                self.assertEqual(struct.unpack_from("<I", image, 12)[0], 1104)
+                self.assertEqual(struct.unpack_from("<I", image, 12)[0], 1120)
 
     def test_expert_scratch_bounds_are_checked_before_allocation_or_copy(self) -> None:
         """Reject overflow and metadata whose lists exceed the host allocation."""
@@ -159,7 +156,6 @@ class TestRuntimeSerialization(unittest.TestCase):
         cfg.dynamic_data.dynamic_group_size = 17
         with self.assertRaisesRegex(ValueError, "group-list scratch"):
             serialize_runtime_config(cfg)
-
 
     def test_backward_storage_reuse_requires_all_reader_dependencies(self) -> None:
         """Allow managed plans, but reject changed queues, joins and additional receive readers."""
@@ -398,13 +394,18 @@ class TestRuntimeCppReader(unittest.TestCase):
 
     def test_ready_header_and_persistent_storage_bounds(self) -> None:
         """Read ready metadata without tags and bound the persistent tail."""
-        for ep_size, experts, events, mode in ((2, 4, 1024, "push"), (2, 4, 1024, "pull"),
-                                                (64, 1024, 1104, "push"), (64, 1024, 1104, "pull")):
+        for ep_size, experts, events, mode in (
+            (2, 4, 1024, "push"),
+            (2, 4, 1024, "pull"),
+            (64, 1024, 1120, "push"),
+            (64, 1024, 1120, "pull"),
+        ):
             with self.subTest(ep_size=ep_size):
                 cfg = allocate_runtime_config(17, events)
                 cfg.task_num = 17
-                values = TaskSplitValue(tp=1, ep=ep_size, seq_size=128, all_expert_num=experts, top_k=2,
-                                       dispatch_mode=mode)
+                values = TaskSplitValue(
+                    tp=1, ep=ep_size, seq_size=128, all_expert_num=experts, top_k=2, dispatch_mode=mode
+                )
                 configure_ready_handshake(cfg, values)
                 cfg.diagnostic_mode = 1
                 cfg.aic_profile_record_capacity, cfg.aiv_profile_record_capacity = 101, 203
@@ -423,5 +424,8 @@ class TestRuntimeCppReader(unittest.TestCase):
                 for invalid_event in (events - 7, 0xFFFFFFFF):
                     invalid = bytearray(data)
                     struct.pack_into("<I", invalid, 16, invalid_event)
-                    self.assertFalse(self.reader.valid_ready_runtime(
-                        ctypes.create_string_buffer(bytes(invalid)), len(data), event_bytes, ep_size))
+                    self.assertFalse(
+                        self.reader.valid_ready_runtime(
+                            ctypes.create_string_buffer(bytes(invalid)), len(data), event_bytes, ep_size
+                        )
+                    )

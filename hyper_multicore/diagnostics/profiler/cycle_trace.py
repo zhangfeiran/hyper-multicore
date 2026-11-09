@@ -18,12 +18,14 @@ from __future__ import annotations
 
 __all__ = []
 
+import struct
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-import struct
 from typing import Any
 
+from hyper_multicore.diagnostics.common.graph import _scheduled_task_ids
+from hyper_multicore.diagnostics.common.runtime import DiagnosticMode, PreparedDiagnosticRuntime
 from hyper_multicore.scheduler.config import (
     EVENT_INVALID_ID,
     INVALID_PROFILE_DESC_ID,
@@ -34,9 +36,6 @@ from hyper_multicore.scheduler.config import (
     TaskDescC,
     TaskType,
 )
-from hyper_multicore.diagnostics.common.graph import _scheduled_task_ids
-from hyper_multicore.diagnostics.common.runtime import DiagnosticMode, PreparedDiagnosticRuntime
-
 
 CUBE_SLOT_COUNT = NUM_WORKERS_CUBE
 VECTOR_SLOT_COUNT = NUM_WORKERS_VECTOR
@@ -45,8 +44,9 @@ RECORD_CAPACITY_ALIGNMENT = 16
 CORE_HEADER = struct.Struct("<QIIIIII32x")
 PROFILE_RECORD = struct.Struct("<QQIIII")
 # Keep each slot representable by the Device ABI; allocate only the graph's actual requirement.
-MAX_RECORDS_PER_CORE = ((0xFFFFFFFF - CORE_HEADER.size) // PROFILE_RECORD.size
-                        // RECORD_CAPACITY_ALIGNMENT * RECORD_CAPACITY_ALIGNMENT)
+MAX_RECORDS_PER_CORE = (
+    (0xFFFFFFFF - CORE_HEADER.size) // PROFILE_RECORD.size // RECORD_CAPACITY_ALIGNMENT * RECORD_CAPACITY_ALIGNMENT
+)
 MAX_CORE_STRIDE_BYTES = CORE_HEADER.size + MAX_RECORDS_PER_CORE * PROFILE_RECORD.size
 MAX_PROFILE_BUFFER_BYTES = CORE_SLOT_COUNT * MAX_CORE_STRIDE_BYTES
 INVALID_OWNER_ID = 0xFFFFFFFF
@@ -62,6 +62,11 @@ DEFAULT_STAGE_NAMES = {
     0x10000: "WaitDependency",
     0x10006: "TerminateTask",
     0x10007: "TriggerEvent",
+    0x10008: "ReplicaW2Return",
+    0x10009: "ReplicaW13Return",
+    0x1000A: "ReplicaW13Ready",
+    0x1000B: "ReplicaW2Ready",
+    0x1001F: "WorkerComplete",
 }
 TASK_TYPE_NAMES = {
     0: "Terminate",
@@ -269,7 +274,11 @@ def _calculate_aiv_pipeline_profile_layout(
 
 
 def _calculate_event_driven_profile_layout(
-    runtime_config: RuntimeConfigC, vector_worker_stride: int = 2,
+    runtime_config: RuntimeConfigC,
+    vector_worker_stride: int = 2,
+    *,
+    extra_aiv_records: int = 0,
+    extra_aic_records: int = 0,
 ) -> _ProfileLayout:
     """Size AIC/AIV slots for event-driven task queues using the busiest worker."""
     num_workers = int(runtime_config.num_workers)
@@ -290,6 +299,8 @@ def _calculate_event_driven_profile_layout(
         int(runtime_config.task_index_num[1]),
         num_workers // vector_worker_stride,
     )
+    aic_required_records += extra_aic_records
+    aiv_required_records = max(aiv_required_records, extra_aiv_records)
     return _ProfileLayout(
         aic_required_records=aic_required_records,
         aiv_required_records=aiv_required_records,
@@ -312,9 +323,24 @@ def _calculate_profile_layout(
     raise ValueError(f"unsupported task execution mode: {metadata.execution_mode!r}")
 
 
-def _configure_profile_layout(runtime_config: RuntimeConfigC, metadata: _ProfileMetadata) -> _ProfileLayout:
+def _configure_profile_layout(
+    runtime_config: RuntimeConfigC,
+    metadata: _ProfileMetadata,
+    *,
+    extra_aiv_records: int = 0,
+    extra_aic_records: int = 0,
+) -> _ProfileLayout:
     """Calculate and serialize the bounded AIC/AIV record capacities."""
-    layout = _calculate_profile_layout(runtime_config, metadata)
+    if metadata.execution_mode is _TaskExecutionMode.EVENT_DRIVEN:
+        _validate_runtime_config(runtime_config)
+        layout = _calculate_event_driven_profile_layout(
+            runtime_config,
+            metadata.vector_worker_stride,
+            extra_aiv_records=extra_aiv_records,
+            extra_aic_records=extra_aic_records,
+        )
+    else:
+        layout = _calculate_profile_layout(runtime_config, metadata)
     runtime_config.aic_profile_record_capacity = layout.aic_record_capacity
     runtime_config.aiv_profile_record_capacity = layout.aiv_record_capacity
     return layout
@@ -365,11 +391,19 @@ class _PreparedProfileRuntime:
         runtime_config = runtime.copy_host_config()
         self._metadata = _configure_trace_metadata(runtime_config, runtime.metadata)
         self._metadata = _ProfileMetadata(
-            self._metadata.kernel_name, self._metadata.owner_label, self._metadata.stage_names,
-            self._metadata.task_stage_names, _TaskExecutionMode(runtime.spec.execution_mode),
+            self._metadata.kernel_name,
+            self._metadata.owner_label,
+            self._metadata.stage_names,
+            self._metadata.task_stage_names,
+            _TaskExecutionMode(runtime.spec.execution_mode),
             runtime.spec.vector_worker_stride,
         )
-        self._layout = _configure_profile_layout(runtime_config, self._metadata)
+        self._layout = _configure_profile_layout(
+            runtime_config,
+            self._metadata,
+            extra_aiv_records=runtime.spec.extra_aiv_records,
+            extra_aic_records=runtime.spec.extra_aic_records,
+        )
         self._rank = runtime.rank
         self._device_id = runtime.device_id
         self._host_config = runtime_config

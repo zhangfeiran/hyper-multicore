@@ -28,6 +28,7 @@ from typing import Any, NoReturn
 import torch
 
 from hyper_multicore import _collective, shmem
+from hyper_multicore.replica.capacity import ExpertReplicaConfig
 from hyper_multicore.shmem import _lifecycle
 
 from .spec import (
@@ -38,7 +39,6 @@ from .spec import (
     _resolve_receive_capacity,
 )
 from .workspace import MegaMoeWorkspace, _spec_workspace_bytes
-
 
 _HEAP_GRANULARITY_BYTES = 2 * 1024 * 1024
 _HEAP_MANAGER = None
@@ -57,6 +57,7 @@ class _WorkspaceLayout:
     collective_signature: tuple[Any, ...]
     receive_capacity: int
     token_capacity: int | None = None
+    replica_inbox_slots: int | None = None
 
 
 @dataclass
@@ -100,23 +101,28 @@ def _workspace_layout(
     dtype: torch.dtype,
     capacity: int | None = None,
     token_capacity: int | None = None,
+    *,
+    replica_inbox_slots: int | None = None,
 ) -> _WorkspaceLayout:
     """Describe one MegaMoe symmetric workspace reservation."""
     physical = dict(specification)
     if token_capacity is not None:
         physical["local_num_tokens"] = token_capacity
+    if replica_inbox_slots is not None:
+        physical["_replica_inbox_slots"] = replica_inbox_slots
     if capacity is None:
         capacity = _resolve_receive_capacity(
             specification["initial_capacity_factor"],
             physical["local_num_tokens"] * specification["top_k"],
             specification["ep_size"],
         )
-    signature = tuple(sorted((key, value) for key, value in specification.items() if key != "ep_group"))
+    signature = tuple(sorted(((key, value) for key, value in specification.items() if key != "ep_group")))
     return _WorkspaceLayout(
         required_bytes=_spec_workspace_bytes(physical, dtype, receive_capacity=capacity),
         collective_signature=signature,
         receive_capacity=capacity,
         token_capacity=physical["local_num_tokens"] if specification.get("auto_tokens", False) else None,
+        replica_inbox_slots=physical.get("_replica_inbox_slots"),
     )
 
 
@@ -326,13 +332,55 @@ class _HeapManager:
                 layouts = [layout if item is entry else item.layout for item in self.entries]
             self._restart(layouts, self._budget(self._required_bytes(layouts)))
 
-    def ensure_token_capacity(self, workspace: MegaMoeWorkspace, tokens: int, received: int) -> MegaMoeSpec:
-        """Grow source and destination storage in one transaction after route agreement.
+    def receive_capacity_limit(self, workspace: MegaMoeWorkspace, tokens: int) -> int:
+        """Query feasible Push receive rows without reserving symmetric memory.
+
+        All entries and the explicit Heap limit are agreed across the Root. The
+        result depends on those replicated layouts, not rank-local free memory.
+        Replica slots contribute their actual fixed storage, but do not change
+        the growth policy. Geometric growth is an allocation preference rather
+        than an admission limit. Only the selected destination load is allocated.
+
+        Args:
+            workspace: Bound Push workspace with automatic or fixed source storage.
+            tokens: Group-maximum actual source-token rows for this invocation.
+
+        Returns:
+            Aligned receive-row limit after accounting for other reservations.
+            Without an explicit Heap limit, returns the distinct-TopK owner bound.
+        """
+        if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
+            raise ValueError("Push capacity query requires a nonnegative integer token count")
+        with self.access():
+            entry = self._entry_for_workspace(workspace)
+            spec = entry.bound_spec
+            if spec is None or spec.dispatch_mode != "push":
+                raise RuntimeError("Receive capacity query requires a bound Push workspace")
+            if not spec.auto_tokens and tokens > spec.local_num_tokens:
+                raise ValueError("Push capacity query exceeds the fixed source-token capacity")
+            ownership = ExpertReplicaConfig(spec.logical_num_experts or spec.num_experts, spec.ep_size, 0)
+            upper = ownership.maximum_receive_rows(tokens, spec.top_k) if tokens else 0
+            if self.heap_limit is None:
+                return upper
+            token_capacity = max(spec.local_num_tokens, _align_capacity(tokens)) if spec.auto_tokens else None
+            fixed = _workspace_layout(entry.specification, self.dtype, 0, token_capacity).required_bytes
+            other = sum((item.layout.required_bytes for item in self.entries if item is not entry))
+            row_bytes = spec.hidden_size * self.element_size
+            self._budget(_round_heap_bytes(fixed + other + entry.layout.receive_capacity * row_bytes))
+            available = max(0, (self.heap_limit - other - fixed) // row_bytes)
+            allowance = available // 128 * 128
+            return min(upper, allowance)
+
+    def ensure_token_capacity(
+        self, workspace: MegaMoeWorkspace, tokens: int, received: int, *, replica_slots: int = 0
+    ) -> MegaMoeSpec:
+        """Grow source, destination and guest matrices in one transaction after route agreement.
 
         Args:
             workspace: Automatic execution resource receiving this route.
             tokens: Group-maximum actual token rows, aligned for scheduling.
             received: Group-maximum actual destination rows.
+            replica_slots: Group-maximum used guest slot prefix in the selected route.
 
         Returns:
             Committed physical specification, independent of retained execution plans.
@@ -342,34 +390,72 @@ class _HeapManager:
             spec = entry.bound_spec
             if spec is None or not spec.auto_tokens:
                 raise RuntimeError("Automatic token growth requires an automatic workspace")
-            grow_source = tokens > spec.local_num_tokens
-            grow_receive = spec.dispatch_mode == "push" and received > entry.layout.receive_capacity
-            if not grow_source and not grow_receive:
+            grow_source, grow_receive, grow_inbox = self._token_growth_requirements(
+                entry, tokens, received, replica_slots
+            )
+            if not (grow_source or grow_receive or grow_inbox):
                 return spec
-            factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
-            token_limit = ((2**31 - 1) // max(spec.hidden_size, spec.top_k) // 128) * 128
-            token_capacity = (_align_capacity(max(tokens, math.ceil(min(token_limit, spec.local_num_tokens * factor))))
-                              if grow_source else spec.local_num_tokens)
-            receive_capacity = entry.layout.receive_capacity
-            if grow_receive:
-                receive_capacity = _align_capacity(max(received, math.ceil(min(2**31 - 1, receive_capacity * factor))))
-            layout = _workspace_layout(entry.specification, self.dtype, receive_capacity, token_capacity)
+            layout = self._growing_token_layout(
+                entry, tokens, received, replica_slots, grow_source, grow_receive, grow_inbox
+            )
             layouts = [layout if item is entry else item.layout for item in self.entries]
             if self.heap_limit is not None and self._required_bytes(layouts) > self.heap_limit:
-                layout = _workspace_layout(entry.specification, self.dtype,
-                                           max(entry.layout.receive_capacity, _align_capacity(received)),
-                                           max(spec.local_num_tokens, tokens))
+                layout = _workspace_layout(
+                    entry.specification,
+                    self.dtype,
+                    max(entry.layout.receive_capacity, _align_capacity(received)),
+                    max(spec.local_num_tokens, tokens),
+                    replica_inbox_slots=layout.replica_inbox_slots,
+                )
                 layouts = [layout if item is entry else item.layout for item in self.entries]
             self._restart(layouts, self._budget(self._required_bytes(layouts)))
             return entry.bound_spec
+
+    @staticmethod
+    def _token_growth_requirements(entry, tokens, received, replica_slots):
+        """Check shape and guest-prefix growth before the read-only transaction preflight."""
+        spec = entry.bound_spec
+        grow_source = tokens > spec.local_num_tokens
+        grow_receive = spec.dispatch_mode == "push" and received > entry.layout.receive_capacity
+        inbox_slots = entry.layout.replica_inbox_slots
+        if inbox_slots is not None and (not 0 <= replica_slots <= spec.replica_slots_per_rank):
+            raise ValueError("The selected route exceeds the configured replica slot cap")
+        grow_inbox = inbox_slots is not None and replica_slots > inbox_slots
+        return grow_source, grow_receive, grow_inbox
+
+    def _growing_token_layout(self, entry, tokens, received, replica_slots, grow_source, grow_receive, grow_inbox):
+        """Compute a candidate without mutating the workspace or live symmetric addresses."""
+        spec = entry.bound_spec
+        inbox_slots = entry.layout.replica_inbox_slots
+        factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
+        token_limit = (2**31 - 1) // max(spec.hidden_size, spec.top_k) // 128 * 128
+        token_capacity = (
+            _align_capacity(max(tokens, math.ceil(min(token_limit, spec.local_num_tokens * factor))))
+            if grow_source
+            else spec.local_num_tokens
+        )
+        receive_capacity = entry.layout.receive_capacity
+        if grow_receive:
+            receive_capacity = _align_capacity(max(received, math.ceil(min(2**31 - 1, receive_capacity * factor))))
+        return _workspace_layout(
+            entry.specification,
+            self.dtype,
+            receive_capacity,
+            token_capacity,
+            replica_inbox_slots=replica_slots if grow_inbox else inbox_slots,
+        )
 
     @staticmethod
     def _layout_spec(entry: _HeapEntry, layout: _WorkspaceLayout) -> MegaMoeSpec:
         """Project candidate capacities without modifying a committed specification."""
         if layout.token_capacity is None:
             return entry.bound_spec
-        return replace(entry.bound_spec, local_num_tokens=layout.token_capacity,
-                       receive_capacity=layout.receive_capacity)
+        return replace(
+            entry.bound_spec,
+            local_num_tokens=layout.token_capacity,
+            receive_capacity=layout.receive_capacity,
+            _replica_inbox_slots=layout.replica_inbox_slots,
+        )
 
     @staticmethod
     def _required_bytes(layouts: list[_WorkspaceLayout]) -> int:
@@ -543,24 +629,26 @@ class _HeapManager:
             ) from error
 
         try:
-            result = shmem._restart(  # pylint: disable=protected-access
+            runtime_options = {}
+            if os.environ.get("HYPER_MULTICORE_SHMEM_FIXED_HEAP_REPACK") == "1":
+                runtime_options["allow_existing_runtime"] = self.heap_limit is not None
+            result = shmem._restart(
                 heap_size_bytes=heap_bytes,
                 replacements=replacements,
                 preflight_hook=lambda: self._restart_preflight(layouts, replacements, bindings, agreement),
+                **runtime_options,
             )
         except Exception:
-            if not _lifecycle._runtime_is_healthy():  # pylint: disable=protected-access
+            if not _lifecycle._runtime_is_healthy():
                 self.state = "failed"
             raise
-
         context = "MegaMoe restart result validation failed due to a local implementation error"
         try:
             self._validate_restart_result(result, bindings, layouts)
             context = "MegaMoe workspace binding failed after SHMEM restart due to a local implementation error"
             self._bind_restart_result(result, bindings, layouts)
-        except Exception as error:  # pylint: disable=broad-exception-caught
+        except Exception as error:
             raise_post_restart_failure(error, context=context)
-
         stages_ms = dict(result.stages_ms)
         for entry, layout in zip(self.entries, layouts):
             if entry.bound_spec is not None:
@@ -570,14 +658,20 @@ class _HeapManager:
                 entry.workspace.capacity_floor = layout.receive_capacity
         self.heap_bytes = heap_bytes
         self.epoch += 1
-        self.growth_records.append({
-            "epoch": self.epoch,
-            "old_heap_bytes": old_bytes,
-            "heap_bytes": heap_bytes,
-            "stages_ms": stages_ms,
-            "total_ms": (time.perf_counter() - started) * 1000,
-            "capacities": [entry.layout.receive_capacity for entry in self.entries],
-        })
+        self.growth_records.append(
+            {
+                "epoch": self.epoch,
+                "old_heap_bytes": old_bytes,
+                "heap_bytes": heap_bytes,
+                "stages_ms": stages_ms,
+                "total_ms": (time.perf_counter() - started) * 1000,
+                "capacities": [entry.layout.receive_capacity for entry in self.entries],
+            }
+        )
+        if any((entry.layout.replica_inbox_slots is not None for entry in self.entries)):
+            self.growth_records[-1]["replica_inbox_slots"] = [
+                entry.layout.replica_inbox_slots for entry in self.entries
+            ]
 
 
 def _get_heap_manager(group: Any, tensor: torch.Tensor) -> _HeapManager:

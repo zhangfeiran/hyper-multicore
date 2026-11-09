@@ -24,6 +24,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from hyper_multicore.replica.capacity import ExpertReplicaConfig
 
 _COMMUNICATION_SPLIT = 128
 _DEFAULT_CAPACITY_FACTOR = 1.25
@@ -52,8 +53,13 @@ class MegaMoeSpec:
     swiglu_limit: float | None = None
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
+    replica_slots_per_rank: int = 0
+    logical_num_experts: int = 0
+    replica_transport: str = "shmem_signal_kernel_gradient_bands"
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    _host_replica_metadata: bool = True
+    _replica_inbox_slots: int | None = None
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -67,8 +73,18 @@ class MegaMoeSpec:
 
     @property
     def local_experts(self) -> int:
-        """Return experts owned by this expert-parallel rank."""
+        """Return execution slots on this rank, including enabled guest slots."""
         return self.num_experts // self.ep_size
+
+    @property
+    def maximum_receive_capacity(self) -> int:
+        """Return the bound for dynamic growth without requiring preallocation."""
+        if not self.replica_slots_per_rank:
+            return _align_capacity(self.ep_size * self.routed_slots)
+        upper = ExpertReplicaConfig(self.logical_num_experts, self.ep_size, 0).maximum_receive_rows(
+            self.local_num_tokens, self.top_k
+        )
+        return upper if self.dispatch_mode == "pull" else max(upper, self.receive_capacity)
 
     @property
     def routed_slots(self) -> int:
@@ -98,11 +114,21 @@ def _resolve_receive_capacity(
 
 def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> tuple[int, int]:
     """Return geometric and minimum capacities without exceeding the lossless bound."""
-    upper = _align_capacity(spec.ep_size * spec.routed_slots)
+    upper = spec.maximum_receive_capacity
     if required > upper:
         raise ValueError("MegaMoe route exceeds the lossless token bound")
     requested = max(required, math.ceil(min(upper, current * spec.capacity_growth_factor)))
-    return min(upper, _align_capacity(requested)), _align_capacity(required)
+    return (min(upper, _align_capacity(requested)), _align_capacity(required))
+
+
+def initial_receive_capacity(specification: Mapping[str, Any]) -> int:
+    """Resolve the receive reservation independently of the physical guest slot cap."""
+    capacity = _resolve_receive_capacity(
+        specification["initial_capacity_factor"],
+        specification["local_num_tokens"] * specification["top_k"],
+        specification["ep_size"],
+    )
+    return capacity
 
 
 def _resolve_capacity_factors(
@@ -134,10 +160,7 @@ def _resolve_capacity_factors(
     return float(factors["initial_capacity_factor"]), float(factors["capacity_growth_factor"])
 
 
-def bind_mega_moe_spec(
-    specification: Mapping[str, Any],
-    tensor: torch.Tensor,
-) -> MegaMoeSpec:
+def bind_mega_moe_spec(specification: Mapping[str, Any], tensor: torch.Tensor) -> MegaMoeSpec:
     """Bind hardware and process-group values to the first NPU input.
 
     Args:
@@ -156,10 +179,7 @@ def bind_mega_moe_spec(
     if device.type != "npu":
         raise ValueError(f"MegaMoeExperts requires an NPU input, got {device}.")
     if tensor.dtype != torch.bfloat16:
-        raise TypeError(
-            f"MegaMoeExperts supports BF16 activations, got {tensor.dtype}."
-        )
-
+        raise TypeError(f"MegaMoeExperts supports BF16 activations, got {tensor.dtype}.")
     ep_group = specification["ep_group"]
     ep_size = specification["ep_size"]
     if dist.is_initialized():
@@ -169,41 +189,32 @@ def bind_mega_moe_spec(
         rank_id = dist.get_rank(ep_group)
     else:
         if ep_group is not None:
-            raise RuntimeError(
-                "ep_group cannot be used before torch.distributed initialization."
-            )
+            raise RuntimeError("ep_group cannot be used before torch.distributed initialization.")
         group_size = 1
         rank_id = 0
     if group_size != ep_size:
-        raise ValueError(
-            f"ep_group world size ({group_size}) does not match ep_size ({ep_size})."
-        )
-
-    device_index = (
-        device.index if device.index is not None else torch.npu.current_device()
-    )
+        raise ValueError(f"ep_group world size ({group_size}) does not match ep_size ({ep_size}).")
+    device_index = device.index if device.index is not None else torch.npu.current_device()
     device_limits = torch.npu.get_device_limit(device_index)
     num_cube_cores = device_limits.get("cube_core_num")
     if not isinstance(num_cube_cores, int) or num_cube_cores <= 0:
         raise RuntimeError(
-            "torch.npu.get_device_limit() returned an invalid cube_core_num "
-            f"for NPU {device_index}: {num_cube_cores!r}."
+            "torch.npu.get_device_limit() returned an invalid cube_core_num for "
+            f"NPU {device_index}: {num_cube_cores!r}."
         )
-
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
     initial_capacity_factor = specification["initial_capacity_factor"]
     swiglu_limit = specification["swiglu_limit"]
-    receive_capacity = _resolve_receive_capacity(
-        initial_capacity_factor,
-        local_num_tokens * top_k,
-        ep_size,
-    )
+    receive_capacity = initial_receive_capacity(specification)
     return MegaMoeSpec(
         local_num_tokens=local_num_tokens,
         hidden_size=specification["hidden_size"],
         intermediate_size=specification["intermediate_size"],
         num_experts=specification["num_experts"],
+        logical_num_experts=specification.get("logical_num_experts", specification["num_experts"]),
+        replica_slots_per_rank=specification.get("replica_slots_per_rank", 0),
+        replica_transport=specification.get("replica_transport", "shmem_signal_kernel_gradient_bands"),
         top_k=top_k,
         initial_capacity_factor=initial_capacity_factor,
         receive_capacity=receive_capacity,
@@ -219,4 +230,6 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
+        _replica_inbox_slots=specification.get("_replica_inbox_slots"),
+        _host_replica_metadata=specification.get("_host_replica_metadata", True),
     )

@@ -3,8 +3,8 @@
 ## 当前交付与源码边界
 
 本方案先移除成本模型及校准体系，保留生产无表启发式的实际决策。
-迁移目标是完整可训练的有界专家副本；本轮先完成独立规划内核及精确差分，
-尚未把副本接入目标仓的 `MegaMoeExperts`，也未迁移或验证设备执行。
+迁移目标是完整可训练的有界专家副本；规划内核及精确差分之后，已继续接入路由、Native P2P、MegaMoE、对称池和 native 梯度协议。
+执行与 DFX 见[独立无表专家副本执行闭环](expert_replica_runtime.zh-CN.md)；设备验收状态以交付 REPORT 为准。
 
 | 项目 | 冻结身份 / 状态 |
 | --- | --- |
@@ -12,9 +12,9 @@
 | 目标基线 | HyperMulticore `master`，`0b1d3c7449e53a6d4f6d73fbd7c48cabc5355f4e` |
 | 工作分支 | `feat/expert-replica-heuristic` |
 | 隔离工作树 | `/home/ma-user/zfr/hyper-multicore-expert-replica-heuristic` |
-| 当前实作 | `hyper_multicore/replica/`：11 个 Python 文件，1561 行，包括许可证、空行及文档字符串 |
+| 当前实作 | 无表规划、路由/重算/P2P、驻留/信号、MegaMoE 接入、ready/bands/ACK 及隔离构建增量 |
 | 当前验收 | 6000 组冻结无表决策精确差分；规划 UT；目标仓边界与静态检查 |
-| 完整迁移状态 | 路由、执行、传输、下游桥接及 native 构建仍按下文分段接入 |
+| 完整迁移状态 | 执行代码已接入；CPU、实际 payload 与下游桥接分开验收并记录 |
 
 来源冻结包包含原分支最新的按需副本矩阵存储改动。已有 RFC 基于更早的 `ae5256724`，
 本方案不改写它们的实验基线。目标基线的 `MegaMoeExperts` 仍公开 Push/Pull 等调优参数；
@@ -34,7 +34,7 @@
 | 输入与数值 | ragged/empty source、空源非空接收、稳定当前 ID remap、dx/router/dW 与正常优化器更新 |
 | 传输 | P2P 基线、投影 ready、gradient bands、整投影回退、credit/ACK 和 FP32 peer 顺序 |
 | 生命周期 | invocation-owned plan、F/R/Bwd、延迟与逆序 backward、共享池互斥、stream event、Heap/provider/epoch 失效 |
-| 内存 | Push 硬容量、实际对称 Heap 预算、B_max 与活跃槽位区分、按需 inbox 分配及增长事务 |
+| 内存 | Push 硬容量、实际对称 Heap 预算、B_max 与活跃槽位区分、共享 B 上限池；按需 inbox 的布局及事务边界保留，默认启用另行验收 |
 | 驻留 | saved-generation 复用；普通驻留保留安全 key 与物化失效，不猜测外部 FSDP 版本 |
 | 关闭和异常 | 不遗留 remote reader；不复用失败 payload；图、lease、provider 和 process group 顺序可验证 |
 
@@ -149,7 +149,7 @@ SHMEM 数据面已经属于独立仓，不重复导入另一份 runtime。
 
 物化证据必须由实际更新完整参数的框架提供。建议独立仓提供小型参数物化标记接口，
 下游在重新 all-gather 后刷新；它只表示新物化代次，不替换 autograd version。
-这是后续拟接入的桥接契约，当前规划包不包含该 runtime API。
+该 API 已在 `replica/residency.py` 实现；下游物化 hook 在隔离桥接工作树验证。
 
 没有权威物化证据的外部权重，普通跨调用驻留应保守 miss；不能单靠 pointer 和 Torch version 命中。
 原 saved-generation 的合法复用和每次梯度 epoch/ACK 继续独立维护。
@@ -157,7 +157,7 @@ SHMEM 数据面已经属于独立仓，不重复导入另一份 runtime。
 
 ### 对外接口
 
-后续执行接入只新增 keyword-only `replica_slots_per_rank`，默认0。
+当前执行接入只新增 keyword-only `replica_slots_per_rank`，默认0。
 无表默认策略、传输和 planner 由组件内部解析；低层研究控制不回流到模型构造器。
 不保留已经移除的成本模型参数，也不保留接受参数但不生效的兼容壳。
 原有 EIO/EOI、Push/Pull 和 `from_module` 合同独立检查；正预算 EOI 在未实现前仍明确拒绝。
@@ -167,10 +167,10 @@ SHMEM 数据面已经属于独立仓，不重复导入另一份 runtime。
 | 步骤 | 交付物 | 放行条件 | 当前状态 |
 | --- | --- | --- | --- |
 | 1 | 独立无表 planner 与不可变计划 | 精确 source/slot/dispatch/transfer 差分；边界/复杂度门 | 本轮已实现 |
-| 2 | CPU route + P2P + invocation + Native adapter | 当前 ID、empty/ragged、逆序 Bwd、P2P FP32 归还；mock 与独立 CPU 功能门 | 待接入 |
-| 3 | MegaMoE Python 接入和对称 Heap 事务 | B0 回归、home-only、按需 inbox、图/lease/growth/close 的组合门 | 待接入 |
-| 4 | native ready/bands/ACK 与最小构建增量 | 真正构建并加载当前 payload；CPU C++ harness 与 NPU 数值/生命周期门 | 待接入 |
-| 5 | 下游 checkpoint/FSDP hooks | 相同权重/路由，GAS、重算、物化、两次更新及状态对齐 | 待接入 |
+| 2 | CPU route + P2P + invocation + Native adapter | 当前 ID、empty/ragged、逆序 Bwd、P2P FP32 归还；mock 与独立 CPU 功能门 | 已接入，验收见交付 REPORT |
+| 3 | MegaMoE Python 接入和对称 Heap 事务 | B0 回归、home-only、按需 inbox、图/lease/growth/close 的组合门 | 已接入，验收见交付 REPORT |
+| 4 | native ready/bands/ACK 与最小构建增量 | 真正构建并加载当前 payload；CPU C++ harness 与 NPU 数值/生命周期门 | 已接入，验收见交付 REPORT |
+| 5 | 下游 checkpoint/FSDP hooks | 相同权重/路由，GAS、重算、物化、两次更新及状态对齐 | 已接入，验收见交付 REPORT |
 | 6 | 组件与 Trainer 对照 | profiler-off ABBA、同后端 B0、真实 bands、全 rank/node 终态和内存口径 | 待执行 |
 
 第2～5步必须共同完成才称为“功能完整的独立仓迁移”。第1步单独不能给模型传新参数，
