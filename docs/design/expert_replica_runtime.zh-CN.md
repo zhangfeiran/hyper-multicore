@@ -1,6 +1,6 @@
 # RFC：独立无表专家副本执行闭环
 
-状态：实施中；按 HyperParallel `003-RFC.yml` 的必填字段组织。本文对应独立仓
+状态：组件实现、CPU 门和单机双卡数值门已完成；按 HyperParallel `003-RFC.yml` 的必填字段组织。本文对应独立仓
 `feat/expert-replica-heuristic`，与[迁移方案](expert_replica_migration.zh-CN.md)共同评审。
 
 ## 动机（Motivation）
@@ -137,6 +137,13 @@ python scripts/check_repository.py
 设备 ST 覆盖 Push/Pull、Native P2P、B0、热/均衡、ragged/空 source、两种 checkpoint、
 两次更新及逆序 deferred backward。各 rank 分别保存终态、实际 transfer、梯度投影和最大误差。
 完整实验状态记录在交付 REPORT；没有终态证据的项目不能按通过处理。
+
+2026-11-09 的匹配构建验收：374 项 CPU UT、2098 个子例，桥接 105 项 UT，native host ctest 7/7；
+双卡 Push 7 项、Pull 7 项、Native 2 项，每项两 rank，共32条通过记录。最大 owner dW 绝对误差
+`2.9802322387695312e-8`，两步更新后的权重一致。所有 rank 正常终止，节点退出0，任务进程和设备锁
+已释放，所选两卡健康且无进程。详细来源、失败修复和边界见交付目录 `implementation/REPORT-implementation.md`。
+reentrant 原始 no-grad forward 无法从外层图观察 route；其副本完成证据采用实际 kernel 两投影归还。
+这些结果不包含 Trainer、真实多节点 FSDP 组合、性能 ABBA 或峰值 HBM 验收。
 
 ## 完整的反馈期限
 

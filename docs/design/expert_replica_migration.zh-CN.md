@@ -13,7 +13,7 @@
 | 工作分支 | `feat/expert-replica-heuristic` |
 | 隔离工作树 | `/home/ma-user/zfr/hyper-multicore-expert-replica-heuristic` |
 | 当前实作 | 无表规划、路由/重算/P2P、驻留/信号、MegaMoE 接入、ready/bands/ACK 及隔离构建增量 |
-| 当前验收 | 6000 组冻结无表决策精确差分；规划 UT；目标仓边界与静态检查 |
+| 当前验收 | 6000 组冻结无表决策精确差分；374 项 CPU UT；105 项桥接 UT；匹配 native 构建及 7 项 host 测试；双卡32条 rank/case 记录全部通过 |
 | 完整迁移状态 | 执行代码已接入；CPU、实际 payload 与下游桥接分开验收并记录 |
 
 来源冻结包包含原分支最新的按需副本矩阵存储改动。已有 RFC 基于更早的 `ae5256724`，
@@ -107,12 +107,12 @@ flowchart TD
 
 ## 完整执行链的逐文件迁移清单
 
-下表是后续允许进入迁移 diff 的边界，不表示文件已全部实现。
+下表记录已接入的迁移边界；具体数值和资源终态以交付 REPORT 为准。
 
 | 来源能力 | 目标位置 / 操作 | 必须一起完成的闭环 |
 | --- | --- | --- |
 | `routing.py` 无表部分 | `replica/routing.py` | 共用计数、collective 错误、compact home、当前 IDs、source quotas；删除成本/device/cache实验分支 |
-| `_metadata.py` 基础上传 | route 内小型 owned upload helper | pinned source 生存期、nonblocking 上传、consumer stream；不带实验 cache |
+| `_metadata.py` 基础上传 | `replica/_metadata.py` 小型 owned upload helper | pinned source 生存期、nonblocking 上传、consumer stream；不带实验 cache |
 | checkpoint resource registry | `replica/recompute.py` | F/R ordinal、exact counts/policy/group、原容量重检、异常和 early-stop 清理 |
 | `pool.py`、`transport.py` | `replica/pool.py`、`replica/transport.py` | 共享 B 池、lease/event、P2P wait、有限接收与 consume 所有权 |
 | `signal_transport.py`、`residency.py` | `replica/signal_transport.py`、`replica/residency.py` | 投影 ready、当前 ACK、generation、物化 token、按需 storage；去 observer 和旧 env 前缀 |
@@ -124,6 +124,7 @@ flowchart TD
 | 物理 guest 任务裁剪 | 从 `inactive_tasks.py` 只抽必需部分 | 不执行空 guest、不破坏 event 配额；不带成本匹配与实验队列分支 |
 | native 梯度与发布 | runtime 的 `replica_gradient.h`、`gradient_band.h`；worker 和 GMM band patch 的必要增量 | W2/W13 生产 fence、空 producer、静态 return worker、投影 quorum、ACK |
 | 构建与封装 | 当前 dependency lock、source assembly 和 native manifest 的最小增量 | patch SHA、双向算子一起构建、同包 ABI；不覆盖现有工具链与缓存机制 |
+| SHMEM SDMA | 在既有 Python API、Torch binding 和 CANN host 层补齐映射 peer copy | 权重投影和 ready 的当前 stream 顺序；低层 `put/get` 默认参数保持兼容 |
 
 `gradient_band_observer.h`、完整 profiler decoder、模型 examples、集群报告和历史采集脚本不随 runtime 迁移。
 SHMEM 数据面已经属于独立仓，不重复导入另一份 runtime。
@@ -167,10 +168,10 @@ SHMEM 数据面已经属于独立仓，不重复导入另一份 runtime。
 | 步骤 | 交付物 | 放行条件 | 当前状态 |
 | --- | --- | --- | --- |
 | 1 | 独立无表 planner 与不可变计划 | 精确 source/slot/dispatch/transfer 差分；边界/复杂度门 | 本轮已实现 |
-| 2 | CPU route + P2P + invocation + Native adapter | 当前 ID、empty/ragged、逆序 Bwd、P2P FP32 归还；mock 与独立 CPU 功能门 | 已接入，验收见交付 REPORT |
-| 3 | MegaMoE Python 接入和对称 Heap 事务 | B0 回归、home-only、按需 inbox、图/lease/growth/close 的组合门 | 已接入，验收见交付 REPORT |
-| 4 | native ready/bands/ACK 与最小构建增量 | 真正构建并加载当前 payload；CPU C++ harness 与 NPU 数值/生命周期门 | 已接入，验收见交付 REPORT |
-| 5 | 下游 checkpoint/FSDP hooks | 相同权重/路由，GAS、重算、物化、两次更新及状态对齐 | 已接入，验收见交付 REPORT |
+| 2 | CPU route + P2P + invocation + Native adapter | 当前 ID、empty/ragged、逆序 Bwd、P2P FP32 归还；mock 与独立 CPU 功能门 | CPU 与双卡 Native 数值门通过 |
+| 3 | MegaMoE Python 接入和对称 Heap 事务 | B0 回归、home-only、按需 inbox、图/lease/growth/close 的组合门 | CPU 及双卡 Push/Pull 数值门通过；默认共享 B 上限存储 |
+| 4 | native ready/bands/ACK 与最小构建增量 | 真正构建并加载当前 payload；CPU C++ harness 与 NPU 数值/生命周期门 | 构建、host harness、真实 kernel 两投影与设备释放通过 |
+| 5 | 下游 checkpoint/FSDP hooks | 相同权重/路由，GAS、重算、物化、两次更新及状态对齐 | 桥接合同 CPU 门通过；组件重算/两次更新设备通过；真实 FSDP 组合另验 |
 | 6 | 组件与 Trainer 对照 | profiler-off ABBA、同后端 B0、真实 bands、全 rank/node 终态和内存口径 | 待执行 |
 
 第2～5步必须共同完成才称为“功能完整的独立仓迁移”。第1步单独不能给模型传新参数，
@@ -188,7 +189,7 @@ python scripts/pre-commit/run_pylint.py hyper_multicore/replica/*.py tests/ut/re
 python scripts/pre-commit/run_lizard.py hyper_multicore/replica/*.py tests/ut/replica/*.py
 ```
 
-当前可以使用的仅为 CPU 规划 API：
+纯 CPU 规划入口示例（可训练组件用法见[执行闭环 RFC](expert_replica_runtime.zh-CN.md)）：
 
 ```python
 from hyper_multicore.replica import build_expert_replica_plan
@@ -207,14 +208,15 @@ plan.validate()
 refactor前后结果摘要均为 `a2fa515c2b3b4a8ab7ebd0e1802158408afad43d35ea57e8a62da8519b24b6a4`。
 参考扩展与实验搜索关闭，不把不同策略的计划混入等价声明。
 
-聚焦规划测试为17项、101个子例；与目标仓既有MegaMoE、frontend和仓库边界组合回归为99项、
-650个子例通过。既有CANN安装归属和pytest marker warning单列，不当作功能失败。
-Pylint、Lizard、Markdownlint及独立仓检查通过；本轮未修改已锁定的native patch。
+完整 CPU 回归为374项、2098个子例；下游桥接回归为105项。既有CANN安装归属和pytest marker
+warning单列，不当作功能失败。Pylint、Lizard、Markdownlint及独立仓检查分别保存日志。
+新增和修改的native patch已更新dependency lock并真正重编译；SHMEM的7项host测试通过。
+下游AutoGit全文件门存在未改动HSDP代码的基线失败，详见REPORT，不将局部UT通过等同于整门通过。
 
 本机冻结参考、复现脚本、环境、精确差分与清单保存在：
 `/home/ma-user/work/z00961864/expert-replica-minimal-migration-20261109/`。
 `migration-inventory.json`记录来源文件指纹和移除/延后分类；`compare_planners.py`可重建同种子输入。
-数值门与性能门未来必须使用新输出和匹配源码/native，不复用旧资格证书。
+设备数值门使用本轮源码及匹配native payload；性能门仍需新输出，不复用旧资格证书。
 
 ## 仍需实测的风险
 
@@ -222,5 +224,7 @@ Pylint、Lizard、Markdownlint及独立仓检查通过；本轮未修改已锁�
 框架计数、readback 和重新物化的额外成本需要在运行时接入后测量。
 减少成本体系和实验代码可以缩小维护面，不能自动消除 near-balance 开销。
 
-普通驻留与外部FSDP桥接、reentrant重算、按需inbox增长、native band patch和旧payload兼容性，
-是完整迁移中需要实际门禁的主要边界。本轮没有申请NPU、重编译native或发布分支。
+普通驻留与外部FSDP桥接、reentrant重算、按需inbox增长及native band发布，
+是需要持续验收的主要边界。首版默认共享B上限存储，旧payload不能执行新增协议。
+本轮独立构建并申请双卡执行数值ST；完整Trainer、FSDP多节点组合和性能ABBA尚未验收。
+分支保留本地，未push或发布PR。
