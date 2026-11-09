@@ -24,9 +24,6 @@ string(APPEND CANN_PACKAGE_ARCH_ROOT "/${CMAKE_SYSTEM_PROCESSOR}-linux")
 set(MHC_GRAD_TILING
     ${MHC_GRAD_HOST}/mhc_pre_sinkhorn_backward_tiling/arch22
 )
-set(CANN_OP_COMMON_INCLUDE
-    ${CANN_PACKAGE_ARCH_ROOT}/include/op_common
-)
 set(CANN_OP_HOST_INCLUDE ${CANN_OP_COMMON_INCLUDE}/op_host)
 set(CANN_ACLNN_INCLUDE
     ${CANN_PACKAGE_ARCH_ROOT}/include/aclnn
@@ -70,6 +67,8 @@ npu_op_code_gen(
     OUT_DIR ${ASCEND_AUTOGEN_PATH}
     JOIN_OP_DEF False
     COMPILE_OPTIONS
+        -I${CANN_OP_COMMON_PARENT}
+        -I${CANN_OP_COMMON_PARENT}/base
         -I${CANN_OP_COMMON_INCLUDE}
         -I${CANN_OP_HOST_INCLUDE}
 )
@@ -93,6 +92,8 @@ set(ACLNN_SOURCES
 npu_op_library(cust_opapi ACLNN ${ACLNN_SOURCES})
 target_compile_options(cust_opapi PRIVATE -fvisibility=hidden)
 target_include_directories(cust_opapi PRIVATE
+    ${CANN_OP_COMMON_PARENT}
+    ${CANN_OP_COMMON_PARENT}/base
     ${FWD_HOST}/op_api
     ${BWD_HOST}/op_api
     ${MHC_HOST}/op_api
@@ -121,6 +122,8 @@ npu_op_library(cust_op_proto GRAPH
 )
 target_compile_options(cust_op_proto PRIVATE -fvisibility=hidden)
 target_include_directories(cust_op_proto PRIVATE
+    ${CANN_OP_COMMON_PARENT}
+    ${CANN_OP_COMMON_PARENT}/base
     ${FWD_HOST}
     ${BWD_HOST}
     ${MHC_HOST}
@@ -143,6 +146,8 @@ npu_op_library(cust_optiling TILING
 )
 target_compile_options(cust_optiling PRIVATE -fvisibility=hidden)
 target_include_directories(cust_optiling PRIVATE
+    ${CANN_OP_COMMON_PARENT}
+    ${CANN_OP_COMMON_PARENT}/base
     ${FWD_HOST}
     ${BWD_HOST}
     ${MHC_HOST}

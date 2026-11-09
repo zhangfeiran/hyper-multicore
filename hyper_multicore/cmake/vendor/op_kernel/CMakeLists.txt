@@ -24,17 +24,14 @@ else()
     )
 endif()
 
-set(CANN_OP_COMMON_INCLUDE ${ASCEND_CANN_PACKAGE_PATH})
-string(APPEND CANN_OP_COMMON_INCLUDE
-    "/${CMAKE_SYSTEM_PROCESSOR}-linux/include/op_common"
-)
-
 npu_op_kernel_library(ascendc_kernels
     SRC_BASE ${HP_MULTICORE_SOURCE_ROOT}
     TILING_LIBRARY cust_optiling
 )
 
 npu_op_kernel_options(ascendc_kernels ALL OPTIONS
+    -I${CANN_OP_COMMON_PARENT}
+    -I${CANN_OP_COMMON_PARENT}/base
     -I${CANN_OP_COMMON_INCLUDE}
     -I${HP_SHMEM_SDK_ROOT}/include
     -I${HP_SHMEM_SDK_ROOT}/src/device

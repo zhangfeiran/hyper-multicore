@@ -36,6 +36,19 @@ endif()
 
 find_package(ASC REQUIRED)
 
+# Keep the per-SoC supported-op metadata at the merger's canonical path.
+set(ASCEND_FRAMEWORK_TYPE tensorflow)
+
+# CANN 8.5 installs these headers below pkg_inc; newer releases use include.
+find_path(CANN_OP_COMMON_INCLUDE log/log.h
+    PATHS
+        "${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/op_common"
+        "${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc/op_common"
+    NO_DEFAULT_PATH
+    REQUIRED
+)
+get_filename_component(CANN_OP_COMMON_PARENT "${CANN_OP_COMMON_INCLUDE}" DIRECTORY)
+
 set(package_name hyper_multicore_nn)
 npu_op_package(${package_name}
     TYPE RUN
