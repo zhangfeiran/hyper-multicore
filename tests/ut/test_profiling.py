@@ -188,7 +188,7 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
     def test_layout_rounds_busiest_workers_to_sixteen_records(self):
         """Mirror Device round-robin assignment for AIC and AIV independently."""
         for workers, aic_records, aic_capacity, buffer_size in (
-            (48, 18, 32, 53760), (64, 12, 16, 55296),
+            (48, 20, 32, 53760), (64, 14, 16, 55296),
         ):
             with self.subTest(workers=workers):
                 runtime_config = allocate_runtime_config(128, num_workers=workers)
@@ -199,7 +199,7 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
                 layout = _calculate_profile_layout(runtime_config)
 
                 self.assertEqual(layout.aic_required_records, aic_records)
-                self.assertEqual(layout.aiv_required_records, 3)
+                self.assertEqual(layout.aiv_required_records, 5)
                 self.assertEqual(layout.aic_record_capacity, aic_capacity)
                 self.assertEqual(layout.aiv_record_capacity, 16)
                 self.assertEqual(layout.cube_slot_count, workers // 2)
@@ -215,8 +215,34 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
 
         layout = _calculate_profile_layout(runtime_config)
 
-        self.assertEqual(layout.aic_required_records, 258)
+        self.assertEqual(layout.aic_required_records, 260)
         self.assertEqual(layout.aic_record_capacity, 272)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_event_queue_reserves_each_workers_two_tail_records(self):
+        """Feature: MegaKernel diagnostics.
+        Description: Profile a queue whose task count exactly fills the previous capacity.
+        Expectation: Every worker retains space for both device tail markers.
+        """
+        runtime_config = _runtime_config(384)
+        runtime_config.num_workers = 48
+        runtime_config.all_tasks[0] = _three_record_task()
+        runtime_config.task_index_num[0] = 384
+        runtime_config.task_index_num[1] = 384
+
+        layout = _calculate_profile_layout(runtime_config)
+
+        self.assertEqual(layout.aic_required_records, 50)
+        self.assertEqual(layout.aiv_required_records, 50)
+        self.assertEqual(layout.aic_record_capacity, 64)
+        self.assertEqual(layout.aiv_record_capacity, 64)
+
+        runtime_config.task_index_num[0] = 0
+        runtime_config.task_index_num[1] = 0
+        empty = _calculate_profile_layout(runtime_config)
+        self.assertEqual(empty.aic_required_records, 2)
+        self.assertEqual(empty.aiv_required_records, 2)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
