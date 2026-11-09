@@ -445,10 +445,12 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
             get_gate_grad_tiling_bytes(backward_graph.get_op("gate_grad").split_value, **gmm_options), device
         ),
         w1_grad_tiling=_tensor_from_bytes(
-            get_w1_grad_tiling_bytes(backward_graph.get_op("w1_grad").split_value, **gmm_options), device
+            get_w1_grad_tiling_bytes(backward_graph.get_op("w1_grad").split_value,
+                                     expert_weight_layout=spec.expert_weight_layout, **gmm_options), device
         ),
         w2_grad_tiling=_tensor_from_bytes(
-            get_w2_grad_tiling_bytes(backward_graph.get_op("w2_grad").split_value, **gmm_options), device
+            get_w2_grad_tiling_bytes(backward_graph.get_op("w2_grad").split_value,
+                                     expert_weight_layout=spec.expert_weight_layout, **gmm_options), device
         ),
         swiglu_grad_tiling=_tensor_from_bytes(
             _resize_swiglu_tiling(

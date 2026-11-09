@@ -36,6 +36,7 @@ from hyper_multicore.modules.mega_moe.backward.tiling_tables import (
 )
 from hyper_multicore.modules.mega_moe.forward.graph import build_forward_graph
 from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
+from hyper_multicore.modules.mega_moe.plan import build_mega_moe_plan
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.scheduler.config import TaskSplitValue
 from tests.common.mark_utils import arg_mark
@@ -381,6 +382,23 @@ class TestMegaMoeExperts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "replica_granularity"):
             MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=32, top_k=1, ep_size=4,
                            replica_granularity="bad", create_parameters=False)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_complete_plan_gradient_tiling_matches_weight_layout(self) -> None:
+        """Check actual W1/W2 plan axes against the graph for both layouts and replica budgets."""
+        for layout, budget in product(("EIO", "EOI"), (0, 2)):
+            with self.subTest(layout=layout, budget=budget), patch.object(torch.distributed, "is_initialized",
+                                                                           return_value=False):
+                spec = MegaMoeSpec(128, 6144, 2048, 32 + 4 * budget, 1, 1.25, 16384, 4, None, 0, 24,
+                                   expert_weight_layout=layout, replica_slots_per_rank=budget,
+                                   logical_num_experts=32)
+                plan = build_mega_moe_plan(spec, torch.device("cpu"))
+                for name, tiling in (("w1_grad", plan.w1_grad_tiling), ("w2_grad", plan.w2_grad_tiling)):
+                    words = struct.unpack(f"<{tiling.numel() // 4}I", tiling.numpy().tobytes())
+                    matmul = words.index(393216) - 19
+                    actual = list(words[matmul + 1:matmul + 3])
+                    expected = plan.backward_graph.get_op(name).outputs[0].shape[1:]
+                    self.assertEqual(actual, expected, msg=f"{layout} B{budget} {name} tiling axes")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
