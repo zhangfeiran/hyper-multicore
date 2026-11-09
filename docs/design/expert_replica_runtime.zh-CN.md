@@ -43,6 +43,7 @@ sequenceDiagram
 | `replica/residency.py` | owner 授权的驻留证据、物化失效、slot 全局写入历史 |
 | `replica/signal_transport.py` | credit、projection ready、epoch、ACK、saved generation |
 | `modules/mega_moe/` | B0/owner/guest 执行、owned backward state、Heap 事务、静态任务裁剪 |
+| `shmem/_api.py`、`shmem/ccsrc/` | 映射 peer 的 SDMA put/get；默认 RMA 签名保持兼容 |
 | `ops/runtime/` 与锁定 GMM patch | complete-K band 发布、FIX fence、归还和释放 reader 的完成边界 |
 
 初版业务构造器只新增 `replica_slots_per_rank`。启发式沿用默认 40% receive-peak 降幅门槛和
@@ -77,6 +78,11 @@ Pull 的暂存字节限制、B0 route/header cache、CPU 可导入及原独立�
 独立仓不导入 HyperParallel。下游桥接把 `ExpertParallel`、GroupedExperts、checkpoint registry 和
 完整参数物化 hooks 指向独立实现；框架 mesh、并行切分与参数所有权继续由下游维护。
 原框架中的私有历史 multicore 模块不属于新的独立 API。
+
+SHMEM 的低层 `put/get(..., use_sdma=True)` 在当前 NPU stream 上复制到直接映射的 peer，
+由 CANN 地址映射失败时返回错误。默认 `put/get` 保持原有 RMA 调用签名。
+权重及 ready publication 使用这条 SDMA 路径，梯度的内部回退也需要对应的 get 支持；
+必须同时迁移 Python API、pybind 参数和 CANN host stream copy，不能只迁移调用方。
 
 ### 最小性与替代方案
 
@@ -126,6 +132,8 @@ pytest -q tests/torch/test_expert_replica.py
 python scripts/check_repository.py
 ```
 
+两 rank 的 Push 热副本用例显式使用已有的 `initial_capacity_factor=1.0`，保持 40% 准入门槛，
+确保测试输入确实可准入。ragged 长度为 1024/769；空 source 的 Push 允许 owner-only 回退。
 设备 ST 覆盖 Push/Pull、Native P2P、B0、热/均衡、ragged/空 source、两种 checkpoint、
 两次更新及逆序 deferred backward。各 rank 分别保存终态、实际 transfer、梯度投影和最大误差。
 完整实验状态记录在交付 REPORT；没有终态证据的项目不能按通过处理。

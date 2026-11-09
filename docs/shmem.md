@@ -430,8 +430,3 @@ SHMEM没有独立对外构建开关。根 `bash build.sh` 必须构建 Torch Mul
 
 私有库位于`hyper_multicore/shmem/lib`，使用专属SONAME，避免与框架自带的通用SHMEM库冲突。制品不携带
 RPATH或RUNPATH，运行时搜索路径由Multicore `set_env.bash`统一配置。详见[构建与使用](build.md)。
-
-
-`put` 和 `get` 可显式传入 `use_sdma=True`，在当前 NPU stream 上复制到直接映射的 peer。
-该选项要求 CANN 能映射对应的对称地址；无法映射时返回错误。默认调用保留原来的 SHMEM RMA 路径。
-返回仍然只表示已经入队，接收方需使用对应 ready/ACK 协议确认数据完成。
