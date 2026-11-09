@@ -32,6 +32,7 @@ from packaging.utils import canonicalize_name
 from ._bootstrap import load_module
 from .build_utils import version_label
 from .soc_selection import DEFAULT_SOC_LIST, SOC_ARCHITECTURES, SUPPORTED_SOCS
+from .validate_kernel_metadata import validate_production_kernel_metadata
 
 COMPONENT_VERSION = "0.1.0.dev0"
 _MANIFEST = load_module("native_manifest")
@@ -261,6 +262,11 @@ def _validate_vendor_resources(root: Path, soc_list: list[str], host_arch: str) 
                 if not matches:
                     raise RuntimeError(f"Missing native payload resource: {soc}/{operator}/*{suffix}")
                 required.extend(matches)
+                if suffix == ".json":
+                    try:
+                        validate_production_kernel_metadata(matches)
+                    except (OSError, ValueError) as error:
+                        raise RuntimeError(str(error)) from error
         for index in indexes:
             required.extend(_kernel_index_resources(vendor / "kernel", index, SOC_ARCHITECTURES[soc]))
         for path in required:

@@ -22,6 +22,10 @@ __aicore__ inline SwiGluClampPosition GetSwiGluClampPosition(const TaskDesc &tas
   return static_cast<SwiGluClampPosition>(task.extra_value_1 & 1U);
 }
 
+__aicore__ inline bool GetSwiGluHfBf16(const TaskDesc &task) {
+  return (task.extra_value_1 & 8U) != 0;
+}
+
 enum class MegaMoeActivationWeighting : uint32_t { UNWEIGHTED = 0, BEFORE_FC2 = 4 };
 enum class MegaMoeTransportPayload : uint32_t {
   TOKENS = 0, TOKENS_WITH_PROBABILITIES = 4, TOKENS_WITH_PROBABILITY_GRADIENTS = 8
@@ -58,9 +62,10 @@ __aicore__ inline bool IsProbabilityOperandValid(const TaskDesc &task, bool weig
 __aicore__ inline bool IsActivationTaskOptionsValid(const TaskDesc &task, uint32_t probability_position) {
   constexpr uint32_t allowed = static_cast<uint32_t>(SwiGluTaskIteration::PERSISTENT_LANES) |
       static_cast<uint32_t>(SwiGluClampPosition::AFTER_SILU) |
-      static_cast<uint32_t>(MegaMoeActivationWeighting::BEFORE_FC2);
+      static_cast<uint32_t>(MegaMoeActivationWeighting::BEFORE_FC2) | 8U;
   if ((task.extra_value_1 & ~allowed) != 0) return false;
   if ((GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU) && task.extra_value_0 == 0) return false;
+  if (GetSwiGluHfBf16(task) && task.extra_value_0 != 0) return false;
   const bool weighted = GetMegaMoeActivationWeighting(task) == MegaMoeActivationWeighting::BEFORE_FC2;
   const uint32_t inputs = task.task_type == TaskType::TASK_SWI_GLU ? 1U : 2U;
   return IsProbabilityOperandValid(task, weighted, inputs, probability_position);

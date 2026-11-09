@@ -1,3 +1,4 @@
 * text=auto eol=lf
 *.patch -text
 hyper_multicore/ops/patches/*.patch -whitespace
+hyper_multicore/shmem/_build/patches/*.patch -whitespace

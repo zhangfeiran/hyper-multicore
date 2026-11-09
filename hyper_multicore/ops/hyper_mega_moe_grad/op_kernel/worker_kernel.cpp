@@ -143,7 +143,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   uint32_t gradient_order_[GRADIENT_ORDER_MAX_EXPERTS];
 
   __aicore__ inline void ValidateGradientTask(const TaskDesc &task, uint32_t experts, uint32_t policy) {
-    if (this->home_experts_ != 0 || task.task_type != TaskType::TASK_GROUPED_MATMUL ||
+    if ((this->home_experts_ != 0 && this->home_experts_ != experts) ||
+        task.task_type != TaskType::TASK_GROUPED_MATMUL ||
         experts == 0 || experts > GRADIENT_ORDER_MAX_EXPERTS || policy < 1 || policy == 5 ||
         policy > GRADIENT_SHAPE_POLICY) AscendC::Trap();
     const uint32_t position = task.outputs[0].input_position;
@@ -169,7 +170,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       const uint32_t ordinal = position == 6 ? active_w2_++ : active_w1_++;
       return ordinal == 0 ? GRADIENT_LANE_DISABLED : ordinal;
     }
-    if (this->home_experts_ != 0) AscendC::Trap();
+    if (this->home_experts_ != 0 && this->home_experts_ != task.inputs[2].dim[0]) AscendC::Trap();
     return expert;
   }
 
@@ -257,7 +258,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                                                                        sizeof(DTYPE_DISPATCH_TARGET);
       // Recompute only a worker tile, not a per-graph activation tensor.
       swi_glu(input, activation, nullptr, tiling, GetSwiGluClampLimit(task),
-              GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU);
+              GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU,
+            GetSwiGluHfBf16(task));
       {
         RoutingProbabilityTile<DTYPE_DISPATCH_TARGET> operation;
         operation.Backward(
@@ -269,7 +271,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       }
     }
     swi_glu_grad(gradient, input, output, input_list[SWIGLU_GRAD_WORKSPACE_IDX], tiling,
-                 GetSwiGluClampLimit(task), GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU);
+                 GetSwiGluClampLimit(task), GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU,
+                 GetSwiGluHfBf16(task));
   }
 
   __aicore__ inline void ExecuteSwiGluGradLegacy(const TaskDesc &task_desc) {

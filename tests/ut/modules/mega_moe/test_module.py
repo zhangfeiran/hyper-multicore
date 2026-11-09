@@ -615,6 +615,24 @@ class TestMegaMoeExperts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "EOI expert weights must be contiguous"):
             experts._validate_tensors(hidden_states, (noncontiguous_gate_up, noncontiguous_down))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_eoi_replica_policy_is_recorded_and_checked(self) -> None:
+        """Bind whole-expert replicas to contiguous EOI matrices."""
+        options = MegaMoeTuningOptions(replica_slots_per_rank=2, replica_granularity="expert")
+        with patch.object(mega_moe_module, "_resolve_ep_size", return_value=4):
+            experts = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=32, top_k=1,
+                                     tuning_options=options)
+            self.addCleanup(experts.close)
+            self.assertEqual(experts.replica_granularity, "expert")
+            hidden = SimpleNamespace(dtype=torch.bfloat16, is_npu=True, device=torch.device("cpu"))
+            weights = (torch.empty(8, 16, 16, dtype=torch.bfloat16),
+                       torch.empty(8, 16, 8, dtype=torch.bfloat16))
+            experts._validate_tensors(hidden, weights)
+            self.assertEqual(experts._pending_layout, "EOI")
+            with self.assertRaisesRegex(ValueError, "replica_granularity"):
+                MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=32, top_k=1,
+                               tuning_options=MegaMoeTuningOptions(replica_granularity="bad"))
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_eio_is_the_default_native_graph_layout(self) -> None:
@@ -755,7 +773,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         route = SimpleNamespace(
             routed_tokens=object(),
             metadata=SimpleNamespace(
-                empty_owner_experts=None, replica_route=None, plan_tokens=128, maximum_edge_rows=None
+                empty_owner_experts=None, replica_route=None, plan_tokens=128, maximum_edge_rows=None, schedule=None
             ),
             unpermute_mapping=object(),
             maximum_received_slots=512,

@@ -1,0 +1,32 @@
+diff --git a/mhc/mhc_pre_sinkhorn/op_host/op_tiling/mhc_pre_sinkhorn_tiling_arch35.cpp b/mhc/mhc_pre_sinkhorn/op_host/op_tiling/mhc_pre_sinkhorn_tiling_arch35.cpp
+--- a/mhc/mhc_pre_sinkhorn/op_host/op_tiling/mhc_pre_sinkhorn_tiling_arch35.cpp
++++ b/mhc/mhc_pre_sinkhorn/op_host/op_tiling/mhc_pre_sinkhorn_tiling_arch35.cpp
+@@ -19,6 +19,19 @@
+ using namespace ge;
+ namespace optiling {
+ namespace {
++// Older SDKs expose only the legacy deterministic setting.
++template <class Context>
++auto GetDeterministicLevel(Context* context, int) -> decltype(context->GetDeterministicLevel())
++{
++    return context->GetDeterministicLevel();
++}
++
++template <class Context>
++auto GetDeterministicLevel(Context* context, long) -> decltype(context->GetDeterministic())
++{
++    return context->GetDeterministic();
++}
++
+ int64_t CeilDiv(int64_t x, int64_t y)
+ {
+     if (y != 0) {
+@@ -484,7 +497,7 @@
+     uint64_t originalKDimNum = kDimNum;
+ 
+     // 如果开启了batch一致性开关，则强制走M分核模板
+-    int32_t deterministicLevel = context_->GetDeterministicLevel();
++    int32_t deterministicLevel = GetDeterministicLevel(context_, 0);
+     OP_LOGD(context_->GetNodeName(), "ops: MhcPreSinkhorn, deterministic_level=%d", deterministicLevel);
+     if (deterministicLevel == BATCH_CONSISTENCY_LEVEL) {
+         OP_LOGI(context_->GetNodeName(),

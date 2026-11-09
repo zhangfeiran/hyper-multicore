@@ -19,7 +19,7 @@ from typing import Any
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 from hyper_multicore.tasks.alltoall import ShmemTaskPartition
 from hyper_multicore.scheduler.config import TaskType
-from hyper_multicore.tasks.swiglu import SwiGluClampPosition, SwiGluTaskIteration
+from hyper_multicore.tasks.swiglu import SwiGluClampPosition, SwiGluTaskIteration, SwiGluPrecision
 from .probability_abi import ProbabilityLayout
 
 
@@ -52,11 +52,13 @@ def transport_payload(task: Any) -> MegaMoeTransportPayload:
 
 def _activation_options(task: Any) -> bool:
     allowed = int(SwiGluTaskIteration.PERSISTENT_LANES | SwiGluClampPosition.AFTER_SILU
-                  | MegaMoeActivationWeighting.BEFORE_FC2)
+                  | MegaMoeActivationWeighting.BEFORE_FC2 | SwiGluPrecision.HF_BF16)
     if task.extra_value_1 & ~allowed:
         raise ValueError(f"invalid activation flags {task.extra_value_1:#x}")
     if task.extra_value_1 & SwiGluClampPosition.AFTER_SILU and task.extra_value_0 == 0:
         raise ValueError("clamp position requires a clamp limit")
+    if task.extra_value_1 & SwiGluPrecision.HF_BF16 and task.extra_value_0:
+        raise ValueError("HF BF16 rounding cannot be combined with a clamp limit")
     return activation_weighting(task) == MegaMoeActivationWeighting.BEFORE_FC2
 
 

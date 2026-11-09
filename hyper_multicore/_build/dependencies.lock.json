@@ -49,6 +49,11 @@
             "purpose": "add optional pre/post-SiLU clipping and dynamic tail bounds"
           },
           {
+            "path": "hyper_multicore/ops/patches/swi_glu_hf_bf16.patch",
+            "sha256": "7229ef3cf13941588e296506c6cefbaae363989acfbf536d210176cb44412a09",
+            "purpose": "add optional BF16 intermediate rounding for separate SiLU and multiply semantics"
+          },
+          {
             "path": "hyper_multicore/ops/patches/rms_norm_worker_fusion.patch",
             "sha256": "d1751299e120709f3a625af9b6d606c1696059fbb55c99ed01788765f1840004",
             "purpose": "add a logical token-block RMSNorm entry point and non-atomic Ascend950 backward-cache writes"
@@ -117,6 +122,11 @@
                 "path": "hyper_multicore/ops/patches/mhc_post_backward_and_pre_sinkhorn_backward_4_task_primitives.patch",
                 "sha256": "12434fae310dca30b53bc285a0a54af49e221275c52b9b3437302d2f851c005e",
                 "purpose": "expose task-local Prepare, PhiRms, and PreviousX worker primitives"
+              },
+              {
+                "path": "hyper_multicore/ops/patches/mhc_tiling_cann_compat.patch",
+                "sha256": "9cdd9cdaaea272d18e15465af56bb63b5da0f18651f4677d17aadbf9d2902b24",
+                "purpose": "use the legacy deterministic setting when the selected CANN SDK has no GetDeterministicLevel API"
               }
             ],
             "upgrade_policy": "a version change must pass HyperMegaMhc accuracy and performance validation"
@@ -142,6 +152,11 @@
             "sha256": "3ec6f508509a70add2bb55671acf32cbfa77ef4eb2f75e2a56da2080607c2eb5",
             "upstream_issue": "https://gitcode.com/cann/shmem/issues/704",
             "purpose": "provide the HP-private hpshmem_log sink interface"
+          },
+          {
+            "path": "hyper_multicore/shmem/_build/patches/cann_kernel_debug.patch",
+            "sha256": "168053e41b9097c4e82b22200264e8815f40736f0a4f197b99d03af1eba3641b",
+            "purpose": "suppress production device printf metadata on CANN 8.5 while retaining traps and opt-in debugging"
           }
         ],
         "packaging_policy": {

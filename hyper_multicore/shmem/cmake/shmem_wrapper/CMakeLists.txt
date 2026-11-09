@@ -25,6 +25,8 @@ endif()
 # policy and deliberately applies it after upstream has declared every target.
 add_subdirectory("${HP_SHMEM_SOURCE_DIR}" shmem-upstream)
 
+target_compile_definitions(aclshmem_device PRIVATE ACLSHMEM_PRODUCTION_KERNEL=1)
+
 set_target_properties(shmem PROPERTIES OUTPUT_NAME hyper_multicore_shmem)
 set_target_properties(shmem_utils PROPERTIES OUTPUT_NAME hyper_multicore_shmem_utils)
 foreach(target_name

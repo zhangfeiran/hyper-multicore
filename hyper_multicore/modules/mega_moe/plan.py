@@ -198,6 +198,8 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
         top_k=spec.top_k,
         dispatch_mode=spec.dispatch_mode,
         communication_rows=spec._communication_rows,
+        expert_rows_bound=spec.schedule_expert_rows,
+        source_expert_rows_bound=spec.schedule_source_expert_rows,
     )
 
 
@@ -253,6 +255,7 @@ def _build_backward_runtime_graph(spec, task_values, weight_grad_dtype, compact)
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
+        swiglu_hf_bf16=spec.swiglu_hf_bf16,
         clamp_after_activation=spec.clamp_after_activation,
         apply_probs_before_fc2=spec.apply_probs_before_fc2,
         expert_weight_layout=spec.expert_weight_layout,
@@ -298,6 +301,7 @@ def _build_runtime_artifacts(
         swiglu_limit=spec.swiglu_limit,
         clamp_after_activation=spec.clamp_after_activation,
         apply_probs_before_fc2=spec.apply_probs_before_fc2,
+        swiglu_hf_bf16=spec.swiglu_hf_bf16,
         expert_weight_layout=spec.expert_weight_layout,
     )
     compact_requested = _compact_schedule_requested(spec)

@@ -36,7 +36,7 @@ from .component_cache import provenance
 SCRIPTS = (
     "build.sh", "_build/assemble_multicore_source.py", "_build/merge_multicore_vendors.py",
     "_build/vendor_cache.py", "_build/soc_selection.py", "_build/prepare_dependencies.py",
-    "_build/dependencies.lock.json",
+    "_build/dependencies.lock.json", "_build/validate_kernel_metadata.py",
     "_build/component_cache.py", "_build/component_inputs.py", "_build/component_cli.py", "_build/kernel_cache.py",
     "cmake/hardening.cmake",
     "shmem/_build/shmem_sdk.sh",

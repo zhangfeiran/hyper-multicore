@@ -35,8 +35,9 @@ from hyper_multicore.replica.admission import (
     reduction_basis_points,
     resolve_replica_admission,
 )
-from hyper_multicore.replica.capacity import ExpertReplicaConfig
+from hyper_multicore.replica.capacity import ExpertReplicaConfig, _integer
 from hyper_multicore.replica.recompute import get_recompute_state
+from hyper_multicore.replica.signal_transport import KERNEL_GRADIENT_TRANSPORT_MODES
 from hyper_multicore.replica.routing import (
     ReplicaRoute,
     _GatheredReplicaCounts,
@@ -52,8 +53,7 @@ from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
-from .route import _INVALID_WEIGHT_MASK, prepare_topk_route, restore_topk_output
-
+from .route import _INVALID_WEIGHT_MASK, RouteSchedule, prepare_topk_route, restore_topk_output
 from .configuration import execution_options as _execution_options
 from .configuration import qualify_topology_schedule, summary_admission
 from .inactive_tasks import replica_runtime_schedule
@@ -140,7 +140,10 @@ class _MegaMoeExecutionResources:
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
         self.spec = qualify_topology_schedule(self.spec, self.rank_nodes)
-        reservations = tuple(((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications))
+        reservations = tuple(
+            (item, _workspace_layout({**item, "expert_weight_layout": expert_weight_layout}, tensor.dtype))
+            for item in active_specifications
+        )
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
         added_specifications = self.heap_manager.reserve(
             reservations,
@@ -163,7 +166,8 @@ class _MegaMoeExecutionResources:
                 self.home_spec = None
                 self.home_plan = None
                 if self.spec.replica_slots_per_rank:
-                    home_spec = replace(self.spec, num_experts=self.spec.logical_num_experts, replica_slots_per_rank=0)
+                    home_spec = replace(self.spec, num_experts=self.spec.logical_num_experts,
+                                        replica_slots_per_rank=0, route_task_bounds=False)
                     if mega_moe_event_capacity(home_spec.num_experts, home_spec.ep_size) == mega_moe_event_capacity(
                         self.spec.num_experts, self.spec.ep_size
                     ):
@@ -272,6 +276,13 @@ class _MegaMoeExecutionResources:
             "_summary_home_admission",
             "replica_slots_per_rank",
             "replica_transport",
+            "swiglu_hf_bf16",
+            "replica_granularity",
+            "gate_up_expert_padding",
+            "replica_min_rows",
+            "replica_minimum_load_reduction",
+            "single_expert_tasks",
+            "route_task_bounds",
         )
         manifest = (
             "dynamic_tokens_v4",
@@ -289,7 +300,8 @@ class _MegaMoeExecutionResources:
 
     def plan_for_tokens(self, tokens: int, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
                         batch_experts: bool = False, nominal_schedule: bool = False,
-                        home_only: bool = False, maximum_edge_rows: int | None = None) -> Any:
+                        home_only: bool = False, maximum_edge_rows: int | None = None,
+                        schedule: RouteSchedule | None = None) -> Any:
         """Reuse one covering plan per geometric bucket within committed capacity.
 
         Args:
@@ -302,6 +314,7 @@ class _MegaMoeExecutionResources:
 
             home_only: Use the original expert topology without guest slots.
             maximum_edge_rows: Validated EP-wide bound on a source-to-expert segment.
+            schedule: Optional exact expert bounds from the validated route.
 
         Returns:
             Immutable plan covering the requested rows without enlarging storage.
@@ -322,25 +335,40 @@ class _MegaMoeExecutionResources:
             key = (key, "batched_experts")
         if nominal_schedule:
             key = (key, "nominal_schedule")
+        schedule_tokens = min(bucket, self._token_capacity)
+        bounds = {}
+        if schedule is not None:
+            if schedule.expert_rows > schedule_tokens * spec.ep_size or schedule.source_expert_rows > schedule_tokens:
+                raise RuntimeError("MegaMoe route counts exceed supported per-expert task bounds")
+            expert = min(schedule_tokens * spec.ep_size, 1 << (max(128, schedule.expert_rows) - 1).bit_length())
+            source = min(schedule_tokens, 1 << (max(128, schedule.source_expert_rows) - 1).bit_length())
+            key = (key, expert, source)
+            bounds = {"schedule_expert_rows": expert, "schedule_source_expert_rows": source}
         communication_rows = None
         if spec._compact_communication and maximum_edge_rows is not None:
             if not 0 <= maximum_edge_rows <= tokens:
                 raise ValueError("MegaMoe route exceeds the schedule's per-edge token capacity")
             edge_bucket = 1 << (max(_COMMUNICATION_SPLIT, maximum_edge_rows) - 1).bit_length()
-            if edge_bucket < tokens:
+            source_bound = bounds.get("schedule_source_expert_rows", schedule_tokens)
+            if edge_bucket > source_bound:
+                raise RuntimeError("MegaMoe communication bound exceeds the expert route bound")
+            if edge_bucket < source_bound:
                 communication_rows = edge_bucket
                 key = (key, edge_bucket)
         plan = self._plans.get(key)
         if plan is None or plan.spec.plan_tokens < tokens:
-            schedule_tokens = min(bucket, self._token_capacity)
             options = {} if weight_grad_dtype is None else {"weight_grad_dtype": weight_grad_dtype}
             plan = build_mega_moe_plan(
                 replace(spec, schedule_tokens=schedule_tokens, _communication_rows=communication_rows,
                         batch_experts=batch_experts,
-                        nominal_schedule=nominal_schedule), device, **options)
+                        nominal_schedule=nominal_schedule, **bounds), device, **options)
             # INT32 route bounds allow at most 25 buckets starting at 128 rows.
             # A growing partial bucket replaces its plan; backward keeps the old object.
             self._plans[key] = plan
+        if schedule is not None or communication_rows is not None:
+            self._plans[key] = self._plans.pop(key)
+            while len(self._plans) > 64:
+                self._plans.pop(next(iter(self._plans)))
         return plan
 
     def close(self) -> None:
@@ -419,23 +447,51 @@ class MegaMoeExperts(MulticoreModule):
                 raise TypeError(f"{name} must be a boolean")
         ep_size = _resolve_ep_size(ep_group)
         replica_slots_per_rank = tuning.replica_slots_per_rank
+        replica_granularity = tuning.replica_granularity
+        single_expert_tasks = tuning.single_expert_tasks
+        route_task_bounds = tuning.route_task_bounds
+        replica_transport = tuning.replica_transport
+        replica_min_rows = tuning.replica_min_rows
+        replica_minimum_load_reduction = tuning.replica_minimum_load_reduction
+        initial_token_capacity = tuning.initial_token_capacity
+        gate_up_expert_padding = tuning.gate_up_expert_padding
+        if replica_granularity not in ("token", "expert"):
+            raise ValueError("replica_granularity must be 'token' or 'expert'")
+        if not isinstance(single_expert_tasks, bool) or not isinstance(route_task_bounds, bool):
+            raise ValueError("single_expert_tasks and route_task_bounds must be boolean")
+        if replica_transport not in ("p2p", *KERNEL_GRADIENT_TRANSPORT_MODES):
+            raise ValueError("Unsupported replica_transport")
+        _integer(replica_min_rows, "replica_min_rows", 0)
+        resolve_replica_admission(replica_minimum_load_reduction)
+        _integer(initial_token_capacity, "initial_token_capacity", 1)
+        _integer(gate_up_expert_padding, "gate_up_expert_padding", 0)
+        if gate_up_expert_padding and (replica_slots_per_rank or gate_up_expert_padding % ep_size):
+            raise ValueError("gate_up_expert_padding requires B0 and divisibility by EP")
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
-        self.replica_min_rows = 1024
-        self.replica_transport = "shmem_signal_kernel_gradient_bands"
-        self._summary_home_admission = summary_admission(replica_slots_per_rank)
+        self.replica_min_rows = replica_min_rows
+        self.replica_minimum_load_reduction = replica_minimum_load_reduction
+        self.replica_transport = replica_transport
+        self._summary_home_admission = summary_admission(replica_slots_per_rank, replica_minimum_load_reduction)
         self._summary_home_bypasses = 0
         specification = {
-            "local_num_tokens": _COMMUNICATION_SPLIT,
+            "local_num_tokens": _align_capacity(initial_token_capacity),
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": replica_config.physical_experts,
             "logical_num_experts": num_experts,
             "replica_slots_per_rank": replica_slots_per_rank,
             "replica_transport": self.replica_transport,
+            "replica_granularity": replica_granularity,
+            "gate_up_expert_padding": gate_up_expert_padding,
+            "replica_min_rows": replica_min_rows,
+            "replica_minimum_load_reduction": replica_minimum_load_reduction,
             "top_k": top_k,
             "swiglu_limit": numerics.swiglu_limit,
             "clamp_after_activation": numerics.clamp_after_silu,
             "apply_probs_before_fc2": numerics.apply_probs_before_fc2,
+            "swiglu_hf_bf16": numerics.swiglu_hf_bf16,
+            "single_expert_tasks": single_expert_tasks,
+            "route_task_bounds": route_task_bounds,
             "ep_size": ep_size,
             "ep_group": ep_group,
             "dispatch_mode": tuning.dispatch_mode,
@@ -459,6 +515,9 @@ class MegaMoeExperts(MulticoreModule):
         self._pending_layout = None
         self.replica_config = replica_config
         self.replica_slots_per_rank = replica_slots_per_rank
+        self.replica_granularity = replica_granularity
+        self.gate_up_expert_padding = gate_up_expert_padding
+        self.initial_token_capacity = specification["local_num_tokens"]
         self._initialize_module_state(specification)
 
     def _initialize_module_state(
@@ -469,13 +528,16 @@ class MegaMoeExperts(MulticoreModule):
         self.intermediate_size = specification["intermediate_size"]
         self.num_experts = self.replica_config.num_experts
         self.top_k = specification["top_k"]
+        self.single_expert_tasks = specification.get("single_expert_tasks", False)
+        self.route_task_bounds = specification.get("route_task_bounds", False)
         self.ep_size = specification["ep_size"]
         self.local_experts = self.num_experts // self.ep_size
         self._ep_group = specification["ep_group"]
         local, hidden, intermediate = self.local_experts, self.hidden_size, self.intermediate_size
         self._weight_shapes = {
             "EIO": ((local, hidden, intermediate * 2), (local, intermediate, hidden)),
-            "EOI": ((local, intermediate * 2, hidden), (local, hidden, intermediate)),
+            "EOI": ((local + self.gate_up_expert_padding // self.ep_size, intermediate * 2, hidden),
+                    (local, hidden, intermediate)),
         }
 
     @property
@@ -496,6 +558,9 @@ class MegaMoeExperts(MulticoreModule):
     @classmethod
     def _resolve_specification(cls, specification: dict[str, Any]) -> dict[str, Any]:
         """Validate and normalize configuration before registering an execution owner."""
+        hf_bf16 = specification.get("swiglu_hf_bf16", False)
+        if not isinstance(hf_bf16, bool) or (hf_bf16 and specification["swiglu_limit"] is not None):
+            raise ValueError("swiglu_hf_bf16 must be boolean and cannot be combined with swiglu_limit")
         initial_capacity_factor, capacity_growth_factor = _resolve_capacity_factors(
             specification["dispatch_mode"],
             specification["initial_capacity_factor"],
@@ -611,13 +676,11 @@ class MegaMoeExperts(MulticoreModule):
             self._resource_group.compatibility_key = (self._base_compatibility_key, layout)
 
     def _validate_layout_storage(self, layout: str, weight1: torch.Tensor, weight2: torch.Tensor) -> None:
-        """Reject unsupported EOI storage and physical replica combinations."""
+        """Require dense EOI weights for zero-copy expert and replica execution."""
         if layout == "EOI" and (
             not weight1.is_contiguous() or not weight2.is_contiguous()
         ):
             raise _InvalidExpertWeights("EOI expert weights must be contiguous for zero-copy execution.")
-        if layout == "EOI" and self.replica_slots_per_rank:
-            raise _InvalidExpertWeights("Hot replicas require EIO weights; EOI supports B0")
 
     def _validate_forward_inputs(
         self,
@@ -732,6 +795,7 @@ class MegaMoeExperts(MulticoreModule):
             _trusted_counts=counts,
             _gathered_counts=gathered,
             _route_cache=getattr(resources.workspace, "replica_route_cache", None),
+            _whole_experts=self.replica_granularity == "expert",
         )
 
     def _replica_route_selector(self, resources, hidden, ids, trusted, mask, state):
@@ -872,6 +936,7 @@ class MegaMoeExperts(MulticoreModule):
             execution_plan = resources.plan_for_tokens(
                 route.metadata.plan_tokens, hidden_flat.device, home_only=route_state.home_only,
                 maximum_edge_rows=route.metadata.maximum_edge_rows,
+                schedule=getattr(route.metadata, "schedule", None),
             )
             resources.last_execution_plan = execution_plan
             if not torch.is_grad_enabled():

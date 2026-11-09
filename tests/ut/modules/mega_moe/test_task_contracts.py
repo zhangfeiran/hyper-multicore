@@ -62,10 +62,10 @@ class TestTaskContracts(unittest.TestCase):
             self.assertEqual(combine.remote_writes, ("returned_dp",))
 
     def test_final_serializer_rejects_invalid_options(self):
-        """Unknown bits and a communication-only bit cannot enter a SwiGLU task."""
+        """Unknown bits and weighting without operands cannot enter a SwiGLU task."""
         _, config, _, _ = _build_runtime_artifacts(self.spec(weighted=False))
         index = next(i for i, task in enumerate(config.all_tasks) if task.task_type == TaskType.TASK_SWI_GLU)
-        for flags in (8, 12, 0x80000000):
+        for flags in (16, 12, 0x80000000):
             with self.subTest(flags=flags), self.assertRaises(ValueError):
                 config.all_tasks[index].extra_value_1 = flags
                 serialize_runtime_config(config)
@@ -114,7 +114,7 @@ class TestTaskContracts(unittest.TestCase):
         copied = copy_runtime_config(config)
         copied.diagnostic_mode = 1
         task = next(t for t in copied.all_tasks if t.task_type == TaskType.TASK_SWI_GLU)
-        task.extra_value_1 = 8
+        task.extra_value_1 = 16
         with self.assertRaises(ValueError):
             serialize_runtime_config(copied)
         self.assertTrue(serialize_runtime_config(config))

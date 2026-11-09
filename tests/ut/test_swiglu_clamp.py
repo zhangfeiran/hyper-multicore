@@ -26,6 +26,7 @@ from hyper_multicore.modules.mega_moe.forward.graph import (
 )
 from hyper_multicore.scheduler.builder import build_runtime_config
 from hyper_multicore.scheduler.config import TaskSplitValue, TaskType
+from hyper_multicore.tasks.swiglu import SwiGluPrecision
 
 
 class TestSwiGLUClamp(unittest.TestCase):
@@ -164,6 +165,31 @@ class TestSwiGLUClamp(unittest.TestCase):
                     num_cube_cores=20,
                     swiglu_limit=clamp_limit,
                 )
+                graph.propagate_splits(values)
+                build_runtime_config(graph, values, num_cube_cores=20)
+
+    def test_hf_bf16_rounding_is_serialized_for_both_directions(self) -> None:
+        """Preserve the optional cast boundaries on every SwiGLU task."""
+        for graph_builder, task_type in ((build_forward_graph, TaskType.TASK_SWI_GLU),
+                                         (build_backward_graph, TaskType.TASK_SWI_GLU_GRAD)):
+            for enabled in (False, True):
+                with self.subTest(task_type=task_type, enabled=enabled):
+                    values = TaskSplitValue(tp=1, ep=1, seq_size=128, all_expert_num=4, top_k=2)
+                    graph = graph_builder(values, hidden_size=16, intermediate_size=8,
+                                          num_cube_cores=20, swiglu_hf_bf16=enabled)
+                    graph.propagate_splits(values)
+                    config = build_runtime_config(graph, values, num_cube_cores=20)
+                    tasks = [task for task in config.all_tasks[:config.task_num] if task.task_type == task_type]
+                    self.assertTrue(tasks)
+                    self.assertTrue(all(task.extra_value_1 == (SwiGluPrecision.HF_BF16 if enabled else 0) for task in tasks))
+
+    def test_hf_bf16_rejects_clamp_or_non_boolean_flags(self) -> None:
+        """Keep clamped and separate-rounding semantics mutually exclusive."""
+        for flag, limit in ((True, 10), ("true", None), (1, None)):
+            with self.subTest(flag=flag, limit=limit), self.assertRaisesRegex(ValueError, "hf_bf16"):
+                values = TaskSplitValue(tp=1, ep=1, seq_size=128, all_expert_num=4, top_k=2)
+                graph = build_forward_graph(values, hidden_size=16, intermediate_size=8, num_cube_cores=20,
+                                            swiglu_hf_bf16=flag, swiglu_limit=limit)
                 graph.propagate_splits(values)
                 build_runtime_config(graph, values, num_cube_cores=20)
 

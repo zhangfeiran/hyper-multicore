@@ -49,3 +49,11 @@ class MegaMoeTuningOptions:
     dispatch_split: int = 128
     combine_split: int = 128
     replica_slots_per_rank: int = 0
+    initial_token_capacity: int = 128
+    single_expert_tasks: bool = False
+    route_task_bounds: bool = False
+    replica_granularity: Literal["token", "expert"] = "token"
+    gate_up_expert_padding: int = 0
+    replica_transport: str = "shmem_signal_kernel_gradient_bands"
+    replica_min_rows: int = 1024
+    replica_minimum_load_reduction: float | None = None

@@ -209,7 +209,7 @@ def _worker_w13_order(selected, gates, weights, worker, num_experts, num_cores):
             or weight.task_type != TaskType.TASK_GROUPED_MATMUL
             or (weight.dependent_event != gate.trigger_event)
             or (weight.num_inputs != 3)
-            or (tuple((weight.inputs[i].input_position for i in range(3))) != (17, 10, 19))
+            or (tuple((weight.inputs[i].input_position for i in range(3))) not in ((17, 10, 19), (10, 17, 19)))
         ):
             return None
         order.append(expert)
