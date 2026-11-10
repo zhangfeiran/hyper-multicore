@@ -282,6 +282,7 @@ class _MegaMoeExecutionResources:
             "_vector_event_refresh_us",
             "_batch_empty_dispatch",
             "_batch_empty_combine",
+            "_compact_communication",
             "_selective_owner_gradient_init",
             "_summary_home_admission",
             "replica_slots_per_rank",
@@ -300,12 +301,16 @@ class _MegaMoeExecutionResources:
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
         self.rank_nodes = _node_ids([value[-1] for value in manifests])
 
-    def plan_for_tokens(self, tokens: int, device: Any, *, home_only: bool = False) -> Any:
+    def plan_for_tokens(
+        self, tokens: int, device: Any, *, home_only: bool = False, maximum_edge_rows: int | None = None
+    ) -> Any:
         """Reuse one covering plan per geometric bucket within committed capacity.
 
         Args:
             tokens: EP group maximum input rows, already aligned to 128.
             device: Execution device used for the parameters and workspace.
+            home_only: Use the original expert topology without guest slots.
+            maximum_edge_rows: Validated EP-wide bound on a source-to-expert segment.
 
         Returns:
             Immutable plan covering the requested rows without enlarging storage.
@@ -320,10 +325,20 @@ class _MegaMoeExecutionResources:
             )
         bucket = 1 << (max(128, tokens) - 1).bit_length()
         key = (bucket, True) if home_only else bucket
+        communication_rows = None
+        if spec._compact_communication and maximum_edge_rows is not None:
+            if not 0 <= maximum_edge_rows <= tokens:
+                raise ValueError("MegaMoe route exceeds the schedule's per-edge token capacity")
+            edge_bucket = 1 << (max(_COMMUNICATION_SPLIT, maximum_edge_rows) - 1).bit_length()
+            if edge_bucket < tokens:
+                communication_rows = edge_bucket
+                key = (key, edge_bucket)
         plan = self._plans.get(key)
         if plan is None or plan.spec.plan_tokens < tokens:
             schedule_tokens = min(bucket, self._token_capacity)
-            plan = build_mega_moe_plan(replace(spec, schedule_tokens=schedule_tokens), device)
+            plan = build_mega_moe_plan(
+                replace(spec, schedule_tokens=schedule_tokens, _communication_rows=communication_rows), device
+            )
             self._plans[key] = plan
         return plan
 
@@ -863,7 +878,8 @@ class MegaMoeExperts(MulticoreModule):
             if not pull and (not automatic):
                 resources.ensure_capacity(route.maximum_received_slots)
             execution_plan = resources.plan_for_tokens(
-                route.metadata.plan_tokens, hidden_flat.device, home_only=route_state.home_only
+                route.metadata.plan_tokens, hidden_flat.device, home_only=route_state.home_only,
+                maximum_edge_rows=route.metadata.maximum_edge_rows,
             )
             resources.last_execution_plan = execution_plan
             expert_output = execute_mega_moe_with_permutation(

@@ -14,6 +14,7 @@
 # ============================================================================
 """MoE-FFN forward compute graph."""
 
+from hyper_multicore.scheduler.config import TaskSplitValue
 from hyper_multicore.scheduler.graph import (
     ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType,
 )
@@ -109,7 +110,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
         split_value=dispatch_sv,
         split_spec=SplitSpec(
             split_inputs=None, split_output_dims=[0],
-            task_num_fn=lambda tsv: tsv.all_expert_num * (tsv.per_expert_seq_to_other // dispatch_sv),
+            task_num_fn=lambda tsv: tsv.all_expert_num * tsv.communication_tiles(dispatch_sv),
         ),
         tiling_position=-1,
         fill_config=AllToAllFillConfig(moe_type=AllToAllType.DISPATCH, advance="vector",
@@ -160,7 +161,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
         param_positions=[13, 11, 14, 15, 12], split_value=combine_sv,
         split_spec=SplitSpec(
             split_inputs=[(1, 0)], split_output_dims=[0],
-            task_num_fn=lambda tsv: tsv.all_expert_num * (tsv.per_expert_seq_to_other // combine_sv),
+            task_num_fn=lambda tsv: tsv.all_expert_num * tsv.communication_tiles(combine_sv),
         ),
         tiling_position=-1,
         fill_config=AllToAllFillConfig(moe_type=AllToAllType.COMBINE, advance="vector", event_group=1),
@@ -168,7 +169,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
     return dispatch, up_proj, swiglu, down_proj, combine
 
 
-def build_forward_graph(tsv, *,
+def build_forward_graph(tsv: TaskSplitValue, *,
                         dispatch_sv:  int = 128,
                         up_proj_sv:   int = 4096,
                         swiglu_sv:    int = 128,

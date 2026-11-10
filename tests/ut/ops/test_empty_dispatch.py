@@ -34,6 +34,46 @@ from hyper_multicore.scheduler.config import TaskType
 class TestEmptyDispatch(unittest.TestCase):
     """Only owner-only Push dispatch participates in the experiment."""
 
+    def test_compact_communication_preserves_edges_and_event_credits(self) -> None:
+        """Check Dispatch and Combine tile coverage in both forward and backward graphs."""
+        for slots in (0, 6):
+            with self.subTest(slots=slots):
+                spec = MegaMoeSpec(
+                    local_num_tokens=1024, hidden_size=5120, intermediate_size=2304,
+                    num_experts=24 + 4 * slots, top_k=6, initial_capacity_factor=1.25,
+                    receive_capacity=12288, ep_size=4, ep_group=None, rank_id=3,
+                    num_cube_cores=24, logical_num_experts=24, replica_slots_per_rank=slots,
+                    dispatch_split=128, combine_split=256, _batch_empty_combine=True,
+                )
+                _, full_fwd, _, full_bwd = _build_runtime_artifacts(spec)
+                _, compact_fwd, _, compact_bwd = _build_runtime_artifacts(replace(spec, _communication_rows=257))
+                for full, compact, combine_position in ((full_fwd, compact_fwd, 15), (full_bwd, compact_bwd, 16)):
+                    self.assertEqual(compact.event_capacity, full.event_capacity)
+                    self.assertEqual(compact.task_index_num[0], full.task_index_num[0])
+                    self.assertLess(compact.task_index_num[1], full.task_index_num[1])
+                    self._assert_compact_edges(compact, spec, combine_position)
+
+    def _assert_compact_edges(self, config, spec: MegaMoeSpec, combine_position: int) -> None:
+        """Decode native descriptors to check whole tile coverage for every peer and slot."""
+        groups = {}
+        for index in config.vector_task_indices[: config.task_index_num[1]]:
+            task = config.all_tasks[index]
+            if task.task_type != TaskType.TASK_SHMEM_PUT_MEM_SIGNAL:
+                continue
+            position = int(task.inputs[3].input_position)
+            self.assertIn(position, (4, combine_position))
+            tiles = 3 if position == 4 else 2
+            group, tile = divmod(task.task_index, tiles)
+            self.assertEqual(task.inputs[3].base_ptr_offset, group)
+            self.assertEqual(task.task_split_num, spec.num_experts * tiles)
+            self.assertGreaterEqual(tiles * task.task_split_value, 257)
+            if position == 4:
+                self.assertEqual(config.all_event_num_triggers[task.trigger_event], tiles * spec.ep_size)
+            groups.setdefault((position, group), []).append(tile)
+        for position, tiles in ((4, 3), (combine_position, 2)):
+            for group in range(spec.num_experts):
+                self.assertEqual(sorted(groups[position, group]), list(range(tiles)))
+
     def test_only_dispatch_tasks_change_with_rotated_peer_queues(self) -> None:
         """RATR must retain every source-to-destination tile, dependency and trigger threshold."""
         for mode, slots in (("push", 0), ("push", 2), ("pull", 0)):

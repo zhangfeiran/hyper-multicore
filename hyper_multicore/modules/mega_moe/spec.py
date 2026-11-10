@@ -66,6 +66,8 @@ class MegaMoeSpec:
     _selective_owner_gradient_init: bool = False
     _host_replica_metadata: bool = True
     _replica_inbox_slots: int | None = None
+    _compact_communication: bool = False
+    _communication_rows: int | None = None
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -242,4 +244,5 @@ def bind_mega_moe_spec(specification: Mapping[str, Any], tensor: torch.Tensor) -
         _selective_owner_gradient_init=specification.get("_selective_owner_gradient_init", False),
         _replica_inbox_slots=specification.get("_replica_inbox_slots"),
         _host_replica_metadata=specification.get("_host_replica_metadata", True),
+        _compact_communication=specification.get("_compact_communication", False),
     )

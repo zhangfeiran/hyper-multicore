@@ -91,6 +91,8 @@ def execution_options(dispatch_mode: str, budget: int) -> dict:
         and os.environ.get("HYPER_MULTICORE_MOE_BATCH_EMPTY_DISPATCH") == "1",
         "_batch_empty_combine": dispatch_mode == "push"
         and os.environ.get("HYPER_MULTICORE_MOE_BATCH_EMPTY_COMBINE") == "1",
+        "_compact_communication": dispatch_mode == "push"
+        and os.environ.get("HYPER_MULTICORE_MOE_COMPACT_COMMUNICATION") == "1",
         "_selective_owner_gradient_init": os.environ.get("HYPER_MULTICORE_MOE_OWNER_GRADIENT_INIT") != "full",
         "_host_replica_metadata": os.environ.get("HYPER_MULTICORE_MOE_ROUTE_METADATA") != "device",
     }

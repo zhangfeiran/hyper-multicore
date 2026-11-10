@@ -134,6 +134,25 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_communication_plan_covers_larger_edges_without_mutating_retained_plan(self) -> None:
+        """A different edge bucket cannot reuse the previous invocation's narrower graph."""
+        resources = self._cache_resources(8192, automatic=True)
+        resources.spec = replace(resources.spec, _compact_communication=True)
+        with patch.object(mega_moe_module, "build_mega_moe_plan",
+                          side_effect=lambda spec, device: SimpleNamespace(spec=spec)):
+            retained = resources.plan_for_tokens(4096, "cpu", maximum_edge_rows=257)
+            larger = resources.plan_for_tokens(4096, "cpu", maximum_edge_rows=513)
+            full = resources.plan_for_tokens(4096, "cpu", maximum_edge_rows=2586)
+            self.assertEqual((retained.spec._communication_rows, larger.spec._communication_rows), (512, 1024))
+            self.assertIsNone(full.spec._communication_rows)
+            self.assertIs(resources.plan_for_tokens(4096, "cpu", maximum_edge_rows=512), retained)
+            self.assertEqual(retained.spec.plan_tokens, 4096)
+            self.assertEqual(retained.spec.receive_capacity, resources.spec.receive_capacity)
+            with self.assertRaisesRegex(ValueError, "per-edge token capacity"):
+                resources.plan_for_tokens(4096, "cpu", maximum_edge_rows=4097)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_automatic_plan_uses_committed_capacity_in_both_transports(self) -> None:
         """Feature: automatic token schedule coverage.
 
@@ -501,7 +520,9 @@ class TestMegaMoeExperts(unittest.TestCase):
         )
         route = SimpleNamespace(
             routed_tokens=object(),
-            metadata=SimpleNamespace(empty_owner_experts=None, replica_route=None, plan_tokens=128),
+            metadata=SimpleNamespace(
+                empty_owner_experts=None, replica_route=None, plan_tokens=128, maximum_edge_rows=None
+            ),
             unpermute_mapping=object(),
             maximum_received_slots=512,
         )

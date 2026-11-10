@@ -136,7 +136,7 @@ class TestMegaMoeRoute(unittest.TestCase):
         staged = hidden.repeat_interleave(2, dim=0)
         original_publish = route_module._publish_staged_pull
 
-        def gather(output: torch.Tensor, value: torch.Tensor, **_kwargs: object) -> Mock:
+        def gather(output: torch.Tensor, _value: torch.Tensor, **_kwargs: object) -> Mock:
             """Complete agreement after ordinary-memory permutation was submitted."""
             output.copy_(wire.flatten())
             return Mock(wait=lambda: order.append("wait"))
@@ -187,7 +187,7 @@ class TestMegaMoeRoute(unittest.TestCase):
         hidden, ids = torch.ones(1, 4), torch.tensor([[0, 1]], dtype=torch.int32)
         wire = torch.tensor([[0, 1, 15, 1, 1, 0, 0], [0, 1, 0, 1, 1, 0, 0]])
 
-        def gather(output: torch.Tensor, value: torch.Tensor, **_kwargs: object) -> Mock:
+        def gather(output: torch.Tensor, _value: torch.Tensor, **_kwargs: object) -> Mock:
             """Inject an incompatible peer mask through the real wire-validation path."""
             output.copy_(wire.flatten())
             return Mock()
@@ -560,6 +560,30 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         schedule = max(128, (maximum_tokens + 127) // 128 * 128)
         return max(1, int(loads[spec.rank_id])), schedule, int(loads.max())
 
+    def test_compact_schedule_uses_the_current_group_maximum_on_both_count_paths(self) -> None:
+        """The current maximum survives a cache hit but changes with the source counts."""
+        for experts in (24, 640):
+            with self.subTest(experts=experts):
+                spec = replace(self._spec(experts), _compact_communication=True)
+                payload = self._payload(experts, torch.int32)
+                expected = int(payload[:, 3:].max())
+                workspace = SimpleNamespace(route_cache=None)
+                evidence = route_module._RouteEvidence()
+                summary, raw, _ = route_module._read_cached_route(payload, spec, workspace, "cpu", evidence)
+                self.assertEqual(evidence.maximum_edge_rows, expected)
+                if raw is not None:
+                    metadata = route_module._dynamic_route_metadata(payload[0, 3:], payload, raw, spec, summary[0])
+                    route_module._cache_host_route(
+                        workspace, spec, raw, summary, metadata, "cpu", maximum_edge_rows=expected
+                    )
+                    cached_evidence = route_module._RouteEvidence()
+                    route_module._read_cached_route(payload, spec, workspace, "cpu", cached_evidence)
+                    self.assertEqual(cached_evidence.maximum_edge_rows, expected)
+                payload[-1, 3:].zero_()
+                payload[-1, 3:5] = 257
+                route_module._read_cached_route(payload, spec, workspace, "cpu", evidence)
+                self.assertEqual(evidence.maximum_edge_rows, 257)
+
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
     )
@@ -688,7 +712,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                                     wait_for_reuse=lambda: None)
         observed_ids = []
 
-        def gather(output: torch.Tensor, value: torch.Tensor, **_kwargs: object) -> Mock:
+        def gather(output: torch.Tensor, _value: torch.Tensor, **_kwargs: object) -> Mock:
             """Return all peers' current counts without a real process group."""
             output.copy_(payload.flatten())
             return Mock()
@@ -702,7 +726,8 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather) as exchange,
               patch.object(route_module, "_permute_topk_input", side_effect=permute),
               patch.object(route_module, "_permute_topk_input_out", side_effect=permute),
-              patch.object(route_module, "_dynamic_route_metadata", wraps=route_module._dynamic_route_metadata) as build,
+              patch.object(route_module, "_dynamic_route_metadata", wraps=route_module._dynamic_route_metadata)
+              as build,
               patch.object(route_module, "_host_route_metadata", wraps=route_module._host_route_metadata) as host_build,
               patch.object(route_module, "_compute_route_metadata", wraps=route_module._compute_route_metadata)
               as device_build):
@@ -756,7 +781,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         workspace = SimpleNamespace(route_cache=None, in_use=True, source_buffer=torch.empty(1024, 16))
         grow, permute = Mock(), Mock(return_value=(hidden.repeat_interleave(2, dim=0), torch.arange(2)))
 
-        def gather(output: torch.Tensor, value: torch.Tensor, **_kwargs: object) -> Mock:
+        def gather(output: torch.Tensor, _value: torch.Tensor, **_kwargs: object) -> Mock:
             """Supply valid and invalid wire tables in consecutive calls."""
             output.copy_(payload.flatten())
             return Mock()

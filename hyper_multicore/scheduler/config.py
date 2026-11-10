@@ -21,7 +21,7 @@ Combines:
 """
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
 
@@ -288,6 +288,7 @@ class TaskSplitValue:
     all_expert_num: int = 32
     top_k:          int = 8
     dispatch_mode: str = "push"
+    communication_rows: int | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         """Reject topology values that would invalidate runtime arithmetic."""
@@ -311,6 +312,13 @@ class TaskSplitValue:
             raise ValueError(
                 f"all_expert_num ({self.all_expert_num}) must be divisible by ep ({self.ep})."
             )
+        rows = self.communication_rows
+        if rows is not None and (
+            not isinstance(rows, int) or isinstance(rows, bool) or not 0 < rows <= self.per_expert_seq_to_other
+        ):
+            raise ValueError("communication_rows must be within the per-edge token capacity")
+        if rows is not None and self.dispatch_mode != "push":
+            raise ValueError("communication_rows is only supported for Push")
 
     # ── Derived properties ────────────────────────────────────────────────────
     @property
@@ -337,6 +345,12 @@ class TaskSplitValue:
     def per_expert_seq_to_other(self) -> int:
         """Sequence length per expert when sending to other ranks."""
         return self.seq_all // (self.ep * self.top_k)
+
+    def communication_tiles(self, split_rows: int) -> int:
+        """Cover the agreed edge bound without changing the full-token schedule."""
+        if self.communication_rows is None:
+            return self.per_expert_seq_to_other // split_rows
+        return (self.communication_rows + split_rows - 1) // split_rows
 
     @property
     def all_event_num(self) -> int:

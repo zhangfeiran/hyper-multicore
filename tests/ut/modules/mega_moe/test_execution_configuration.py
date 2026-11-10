@@ -64,9 +64,17 @@ class TestExecutionConfiguration(unittest.TestCase):
             self.assertEqual(values["_gradient_queue_order"], "auto")
             self.assertTrue(values["_selective_owner_gradient_init"])
             self.assertFalse(values["_batch_empty_combine"])
+            self.assertFalse(values["_compact_communication"])
         with patch.dict(os.environ, {"HYPER_MULTICORE_MOE_GRADIENT_QUEUE_ORDER": "unsupported"}, clear=True):
             with self.assertRaisesRegex(ValueError, "GRADIENT_QUEUE_ORDER"):
                 execution_options("push", 1)
+
+    def test_compact_communication_only_admits_push(self) -> None:
+        """The internal switch can cover both owner and guest Push routes."""
+        with patch.dict(os.environ, {"HYPER_MULTICORE_MOE_COMPACT_COMMUNICATION": "1"}, clear=True):
+            for budget in (0, 6):
+                self.assertTrue(execution_options("push", budget)["_compact_communication"])
+                self.assertFalse(execution_options("pull", budget)["_compact_communication"])
 
     def test_owner_skip_requires_positive_k_and_no_guests(self) -> None:
         """Only a positive source covering every expert proves complete owner overwrites."""
