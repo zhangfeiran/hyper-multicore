@@ -136,3 +136,22 @@ python examples/longcat_flash/check_count_kernel.py --output ./longcat-count-che
 
 该命令只测试整数计数算子，改变专家数和行数以覆盖计数边界，不用于替代上述原宽
 LongCat 专家组件精度或性能验证。
+
+## HF 原始实现数值诊断（可选）
+
+如果项目已安装包含 `LongcatFlashExperts` 的 Transformers，可用实际安装的 HF 类分别对照
+原生 GMM 和 MegaMoE 的两种 SwiGLU 模式；它不依赖 HyperParallel，也不会安装或替换
+Torch、torch-npu 或 Transformers：
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=1 \
+  examples/longcat_flash/diagnose_hf.py --ep 1 --tokens 257 \
+  --real 8 --zero 4 --top-k 12 --routing-backend torch \
+  --output ./longcat-hf-diagnosis
+```
+
+该诊断维持原宽 H6144/I2048、每卡 8 个真实专家及 4 个零专家。
+报告分别保存 `native_GMM_hf_vs_HF`、`native_GMM_fused_vs_HF` 及对应的
+`Mega_vs_native_GMM` 输出和梯度误差。HF 逐专家与 GMM 的差异作为诊断项保留；
+重复 HF 的一致性以及相同 SwiGLU 语义下的 MegaMoE/GMM 对照是退出状态的主验收项。
+这些合成输入不能取代客户真实权重、路由和完整训练的排查。
