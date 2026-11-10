@@ -116,3 +116,9 @@ python -m torch.distributed.run --standalone --nproc-per-node=4 \
 push/native/native/push，保留全部样本。报告中包含本机路径、软件版本和设备名称，
 向外发送前由用户检查。计时仅包含专家组件前向加反向，不含 router projection、
 优化器或全模型其他部分。
+
+Push 的可选通信任务裁剪可通过所有 rank 一致设置
+`HYPER_MULTICORE_MOE_COMPACT_COMMUNICATION=1` 进行实验。对照实验应使用同一批
+输入并分别运行开关开启和关闭的进程；查看报告中的
+`compact_communication_requested`、`last_execution_plan` 和对应任务数量，
+确认实际执行计划是否发生变化。该开关的性能收益需在目标设备及实际路由上测量。
