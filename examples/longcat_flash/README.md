@@ -154,4 +154,6 @@ python -m torch.distributed.run --standalone --nproc-per-node=1 \
 报告分别保存 `native_GMM_hf_vs_HF`、`native_GMM_fused_vs_HF` 及对应的
 `Mega_vs_native_GMM` 输出和梯度误差。HF 逐专家与 GMM 的差异作为诊断项保留；
 重复 HF 的一致性以及相同 SwiGLU 语义下的 MegaMoE/GMM 对照是退出状态的主验收项。
+报告中的 `primary_status` 和 `hf_strict_status` 分别表示主验收及 HF 严格对照结果，
+前者通过并不意味着后者通过。
 这些合成输入不能取代客户真实权重、路由和完整训练的排查。
