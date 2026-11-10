@@ -199,6 +199,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             "mxfp8_v1",
             self.spec.mx_vector_policy,
             self.spec.mx_poll_policy,
+            self.spec.mx_skip_gradient_zero,
             self.spec.mx_swiglu_row_only,
             self.spec.mx_ready_depth,
             self.spec.compute_stages,
@@ -277,6 +278,19 @@ def _mx_window_options(vector_policy: str) -> tuple[int, bool]:
     return int(depth), row_only == "1"
 
 
+def _mx_b0_options(replica_slots: int) -> tuple[str, bool]:
+    """Freeze independent PR7 experiments before binding shared runtime resources."""
+    poll = os.environ.get("PANGU_MX_POLL_POLICY", "0")
+    skip_zero = os.environ.get("PANGU_MX_B0_SKIP_GRAD_ZERO", "0")
+    if poll not in ("0", "fast", "pr7"):
+        raise ValueError("PANGU_MX_POLL_POLICY must be 0, fast or pr7.")
+    if skip_zero not in ("0", "1"):
+        raise ValueError("PANGU_MX_B0_SKIP_GRAD_ZERO must be 0 or 1.")
+    if skip_zero == "1" and replica_slots:
+        raise ValueError("PANGU_MX_B0_SKIP_GRAD_ZERO requires B0 output ownership.")
+    return poll, skip_zero == "1"
+
+
 class MXFP8MegaMoeExperts(MegaMoeExperts):
     """Execute MXFP8 experts while keeping FSDP root Parameters phase-current.
 
@@ -339,6 +353,7 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             raise ValueError("MXFP8 projection prefetch requires HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable.")
         udma_gradients = mx_udma_gradient_enabled(replica_slots_per_rank, replica_transport)
         depth, row_only = _mx_window_options(vector_policy)
+        poll, skip_gradient_zero = _mx_b0_options(replica_slots_per_rank)
         source_row_fp8 = source_row_fp8_enabled(vector_policy=vector_policy, row_only=row_only,
                                                replica_slots=replica_slots_per_rank, hidden_size=hidden_size)
         config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
@@ -374,7 +389,8 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             "mx_swiglu_row_only": row_only,
             "mx_source_row_fp8": source_row_fp8,
             "mx_ready_depth": depth,
-            "mx_poll_policy": "0",
+            "mx_poll_policy": poll,
+            "mx_skip_gradient_zero": skip_gradient_zero,
             "_replica_cost_model_enabled": False,
         }
         specification = self._resolve_specification(specification)

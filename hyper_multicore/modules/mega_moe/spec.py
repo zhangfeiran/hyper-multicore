@@ -88,6 +88,7 @@ class MegaMoeSpec:
     mx_swiglu_row_only: bool = False
     mx_ready_depth: int = 0
     mx_poll_policy: str = "0"
+    mx_skip_gradient_zero: bool = False
     mx_schedule_dir: str = ""
     mx_gradient_udma: bool = False
 
@@ -272,6 +273,7 @@ def bind_mega_moe_spec(
         mx_swiglu_row_only=specification.get("mx_swiglu_row_only", False),
         mx_ready_depth=specification.get("mx_ready_depth", 0),
         mx_poll_policy=specification.get("mx_poll_policy", "0"),
+        mx_skip_gradient_zero=specification.get("mx_skip_gradient_zero", False),
         mx_gradient_udma=specification.get("mx_gradient_udma", False),
         replica_transport=specification.get("replica_transport", "shmem_signal_kernel_gradient_bands"),
         top_k=top_k,
