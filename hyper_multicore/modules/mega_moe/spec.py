@@ -25,10 +25,28 @@ import torch
 import torch.distributed as dist
 
 from hyper_multicore._core_spec import get_device_core_spec
+from hyper_multicore.replica.capacity import ExpertReplicaConfig
+
+
+def _route_metadata_rows(routed_slots: int, num_experts: int, ep_size: int, mode: str) -> int:
+    """Keep peer-visible records, diagnostic lines and local tile credits disjoint."""
+    rows = routed_slots + 8 * num_experts * ((routed_slots + 127) // 128)
+    if mode == "peer_tile":
+        counters = ((ep_size * routed_slots + 127) // 128) * (num_experts // ep_size)
+        rows += (counters + 3) // 4
+    return rows
 
 
 _COMMUNICATION_SPLIT = 128
 _DEFAULT_CAPACITY_FACTOR = 1.25
+_A5_SHARED_FORWARD_MIN_ROWS = 512
+
+
+def _supports_indexed_backward_pair(forward: str, dispatch: str, replica_slots: int = 0) -> bool:
+    """Match original-row sources while keeping peer replica pairings disabled."""
+    return dispatch == "pull" and (
+        forward == "indexed" or (forward in ("peer_token", "peer_tile") and replica_slots == 0)
+    )
 
 
 @dataclass(frozen=True)
@@ -54,8 +72,24 @@ class MegaMoeSpec:
     swiglu_limit: float | None = None
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
+    forward_ingress_mode: str = "legacy"
+    backward_ingress_mode: str = "legacy"
+    shared_intermediate_size: int = 0
+    shared_placement: str = "idle"
+    forward_shared_expert: bool = True
+    backward_shared_expert: bool = False
+    replica_slots_per_rank: int = 0
+    logical_num_experts: int = 0
+    replica_transport: str = "shmem_signal_kernel_gradient_bands"
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    compute_stages: int = 3
+    mx_vector_policy: str = "legacy_odd"
+    mx_swiglu_row_only: bool = False
+    mx_ready_depth: int = 0
+    mx_poll_policy: str = "0"
+    mx_schedule_dir: str = ""
+    mx_gradient_udma: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -69,8 +103,17 @@ class MegaMoeSpec:
 
     @property
     def local_experts(self) -> int:
-        """Return experts owned by this expert-parallel rank."""
+        """Return execution slots on this rank, including enabled guest slots."""
         return self.num_experts // self.ep_size
+
+    @property
+    def maximum_receive_capacity(self) -> int:
+        """Return the bound for dynamic growth without requiring preallocation."""
+        if not self.replica_slots_per_rank:
+            return _align_capacity(self.ep_size * self.routed_slots)
+        upper = ExpertReplicaConfig(self.logical_num_experts, self.ep_size, 0).maximum_receive_rows(
+            self.local_num_tokens, self.top_k)
+        return upper if self.dispatch_mode == 'pull' else max(upper, self.receive_capacity)
 
     @property
     def routed_slots(self) -> int:
@@ -100,11 +143,24 @@ def _resolve_receive_capacity(
 
 def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> tuple[int, int]:
     """Return geometric and minimum capacities without exceeding the lossless bound."""
-    upper = _align_capacity(spec.ep_size * spec.routed_slots)
+    upper = spec.maximum_receive_capacity
     if required > upper:
         raise ValueError("MegaMoe route exceeds the lossless token bound")
     requested = max(required, math.ceil(min(upper, current * spec.capacity_growth_factor)))
     return min(upper, _align_capacity(requested)), _align_capacity(required)
+
+
+def initial_receive_capacity(specification: Mapping[str, Any]) -> int:
+    """Resolve the receive reservation independently of the physical guest slot cap.
+
+    Args:
+        specification: Validated unbound executor configuration.
+    """
+    capacity = _resolve_receive_capacity(
+        specification["initial_capacity_factor"],
+        specification["local_num_tokens"] * specification["top_k"], specification["ep_size"],
+    )
+    return capacity
 
 
 def _resolve_capacity_factors(
@@ -188,18 +244,36 @@ def bind_mega_moe_spec(
 
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
+    forward_ingress_mode = specification.get("forward_ingress_mode", "legacy")
+    if forward_ingress_mode != "legacy" and core_spec.num_cube_cores != 32:
+        raise ValueError("Indexed forward ingress requires the Ascend 950 32-Cube BF16 kernel.")
+    backward_ingress_mode = specification.get("backward_ingress_mode", "legacy")
+    if backward_ingress_mode != "legacy" and core_spec.num_cube_cores != 32:
+        raise ValueError("Indexed backward ingress requires the Ascend 950 32-Cube BF16 kernel.")
     initial_capacity_factor = specification["initial_capacity_factor"]
     swiglu_limit = specification["swiglu_limit"]
-    receive_capacity = _resolve_receive_capacity(
-        initial_capacity_factor,
-        local_num_tokens * top_k,
-        ep_size,
-    )
+    shared_intermediate_size = specification.get("shared_intermediate_size", 0)
+    forward_shared_expert = specification.get("forward_shared_expert", True)
+    if (not specification.get("auto_tokens", False) and core_spec.num_cube_cores == 32
+            and shared_intermediate_size and local_num_tokens < _A5_SHARED_FORWARD_MIN_ROWS):
+        # Smaller integrated shared forwards have not met the strict gradient
+        # agreement gate. The native path retains that contract for these rows.
+        forward_shared_expert = False
+    receive_capacity = initial_receive_capacity(specification)
     return MegaMoeSpec(
         local_num_tokens=local_num_tokens,
         hidden_size=specification["hidden_size"],
         intermediate_size=specification["intermediate_size"],
         num_experts=specification["num_experts"],
+        logical_num_experts=specification.get("logical_num_experts", specification["num_experts"]),
+        replica_slots_per_rank=specification.get("replica_slots_per_rank", 0),
+        compute_stages=specification.get("compute_stages", 3),
+        mx_vector_policy=specification.get("mx_vector_policy", "legacy_odd"),
+        mx_swiglu_row_only=specification.get("mx_swiglu_row_only", False),
+        mx_ready_depth=specification.get("mx_ready_depth", 0),
+        mx_poll_policy=specification.get("mx_poll_policy", "0"),
+        mx_gradient_udma=specification.get("mx_gradient_udma", False),
+        replica_transport=specification.get("replica_transport", "shmem_signal_kernel_gradient_bands"),
         top_k=top_k,
         initial_capacity_factor=initial_capacity_factor,
         receive_capacity=receive_capacity,
@@ -215,4 +289,10 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
+        forward_ingress_mode=forward_ingress_mode,
+        backward_ingress_mode=backward_ingress_mode,
+        shared_intermediate_size=shared_intermediate_size,
+        shared_placement=specification.get("shared_placement", "idle"),
+        forward_shared_expert=forward_shared_expert,
+        backward_shared_expert=specification.get("backward_shared_expert", False),
     )

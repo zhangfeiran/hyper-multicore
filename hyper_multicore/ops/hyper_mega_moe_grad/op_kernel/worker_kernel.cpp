@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -19,8 +19,18 @@
 #include "swi_glu/swi_glu.cpp"
 #include "swi_glu_grad/swi_glu_grad.cpp"
 #include "grouped_matmul/grouped_matmul.cpp"
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+#include "bf16_gmm/cgmct_worker.h"
+#include "bf16_gmm/blaze_worker.h"
+#include "bf16_gmm/shared_worker.h"
+#endif
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
+#include "runtime/empty_tail_credit.h"
+#include "runtime/bf16_clamp.h"
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+#include "runtime/indexed_backward.h"
+#endif
 
 using namespace AscendC;
 
@@ -31,6 +41,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   // input_list layout for hyper_mega_moe_grad (backward):
   //   [30] = tiling params  [31] = all_event_counters  [32] = diagnostic_buffer
   //   [25] = gmm_workspace  [26] = swi_glu_grad_workspace
+  static constexpr uint32_t SHARED_PTRS_IDX = 33;
   static constexpr uint32_t TILING_IDX              = 30;
   static constexpr uint32_t EVENT_IDX               = 31;
   static constexpr uint32_t DIAGNOSTIC_IDX          = 32;
@@ -58,14 +69,51 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       case TaskType::TASK_MATMUL:
         ExecuteMatmul(task_desc);
         break;
-      case TaskType::TASK_GROUPED_MATMUL:
+      case TaskType::TASK_GROUPED_MATMUL: {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        const uint32_t variant = A5GmmVariant(task_desc);
+        if (task_desc.inputs[0].tensor_type == 2 || task_desc.outputs[0].data_type != sizeof(bfloat16_t)) {
+          ExecuteGroupedMatmul(task_desc);
+          break;
+        }
+        GM_ADDR resolved_inputs[SHARED_PTRS_IDX + 1];
+        GM_ADDR *gmm_inputs = A5ExpertInputs(task_desc, resolved_inputs);
+        if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+          if (variant == 1) {
+            MulticoreBf16::ExecuteCgmctTask(task_desc, gmm_inputs, this->core_num);
+          } else if (variant == 2) {
+            MulticoreBf16::ExecuteBlazeTask(task_desc, gmm_inputs, this->core_num);
+          } else if (variant == 3) {
+            MulticoreBf16::ExecuteBlazeTask<true>(task_desc, gmm_inputs, this->core_num);
+          } else {
+            ExecuteGroupedMatmul(task_desc);
+          }
+        } else {
+          ExecuteGroupedMatmul(task_desc);
+        }
+#else
         ExecuteGroupedMatmul(task_desc);
+#endif
         break;
+      }
       case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
         ExecuteShmemPutMem(task_desc);
         break;
       case TaskType::TASK_SHMEM_GET_MEM:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        if (task_desc.extra_value_1 == 8) {
+          BackwardIndexed::ExecuteGet<DTYPE_DISPATCH_TARGET>(task_desc, input_list, TILING_IDX);
+          break;
+        }
+#endif
         ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc);
+        break;
+      case TaskType::TASK_MOE_ROUTE_GRAD:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+#ifndef __DAV_CUBE__
+        BackwardIndexed::ProbabilityGradient<DTYPE_DISPATCH_TARGET>(input_list, task_desc).Run();
+#endif
+#endif
         break;
       case TaskType::TASK_SWI_GLU_GRAD:
         ExecuteSwiGluGrad(task_desc);
@@ -76,12 +124,41 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
  private:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+  __aicore__ inline uint32_t A5GmmVariant(const TaskDesc &task) {
+    if (task.extra_value_2 == 0x4D54494C) { return 2; }
+    return (task.extra_value_2 & 0xFFFF0000U) == 0x41350000U ? task.extra_value_2 & 0xFFFFU : 0;
+  }
+
+  __aicore__ inline GM_ADDR *A5ExpertInputs(const TaskDesc &task, GM_ADDR *resolved) {
+    if (this->home_experts_ == 0) { return input_list; }
+    const uint32_t expert = task.task_index / this->core_num;
+    GlobalTensor<int64_t> groups;
+    groups.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[2].input_position]));
+    const int64_t rows = groups.GetValue(expert) - (expert == 0 ? 0 : groups.GetValue(expert - 1));
+    if (rows == 0) { return input_list; }
+    for (uint32_t index = 0; index <= SHARED_PTRS_IDX; ++index) { resolved[index] = input_list[index]; }
+    const uint32_t position = task.inputs[1].input_position;
+    const int64_t matrix_bytes = static_cast<int64_t>(task.inputs[1].dim[1]) *
+                                 task.inputs[1].dim[2] * task.inputs[1].data_type;
+    const uint32_t projection = (position == 5 || position == 11) ? 0 : 1;
+    GM_ADDR weight = this->GetExpertMatrix(position, expert, matrix_bytes, projection);
+    // The dense A5 helper adds its physical expert offset after resolving the base.
+    resolved[position] = reinterpret_cast<GM_ADDR>(reinterpret_cast<uint64_t>(weight) - expert * matrix_bytes);
+    return resolved;
+  }
+#endif
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
     union {
       uint32_t bits;
       float value;
     } encoded = {};
     encoded.bits = task_desc.extra_value_0;
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+      return Bf16ClampLimit(encoded.value);
+    }
+#endif
     return encoded.value;
   }
 
@@ -108,6 +185,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
   __aicore__ inline void ExecuteSwiGluGrad(const TaskDesc &task_desc) {
+    if (task_desc.inputs[0].tensor_type == 2) {
+      swi_glu_grad(SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.inputs[1]),
+                   SharedTensorAddress(task_desc.outputs[0]), input_list[SWIGLU_GRAD_WORKSPACE_IDX],
+                   input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
+                  GetSwiGluClampLimit(task_desc));
+      return;
+    }
+
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.outputs[0].dynamic_shape == 1) {
       DynamicData dynamic_data;
       getDynamicData(this->runtimeConfigPtr, &(dynamic_data));
@@ -175,7 +260,32 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     }
   }
 
+  __aicore__ inline void ExecuteSharedGroupedMatmul(const TaskDesc &task_desc) {
+    GM_ADDR tiling_address =
+      input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset + 2016 * AscendC::GetBlockIdx();
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+      if (task_desc.extra_value_0 == MulticoreBf16::SHARED_BLAZE_TAG &&
+          task_desc.outputs[0].data_type == sizeof(bfloat16_t)) {
+        MulticoreBf16::ExecuteSharedBlazeTask(
+          task_desc, SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.inputs[1]),
+          SharedTensorAddress(task_desc.outputs[0]), tiling_address, task_desc.task_index, this->core_num);
+        return;
+      }
+    }
+#endif
+    grouped_matmul(SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.inputs[1]), nullptr, nullptr,
+                   nullptr, nullptr, nullptr, SharedTensorAddress(task_desc.inputs[2]), nullptr,
+                   SharedTensorAddress(task_desc.outputs[0]), input_list[WORKSPACE_IDX], tiling_address,
+                   task_desc.inputs[0].transpose_flag == 1, task_desc.inputs[1].transpose_flag == 1);
+  }
+
   __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {
+    if (task_desc.inputs[0].tensor_type == 2) {
+      ExecuteSharedGroupedMatmul(task_desc);
+      return;
+    }
+
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
       DynamicData dynamic_data;
       getDynamicData(this->runtimeConfigPtr, &(dynamic_data));
@@ -198,7 +308,19 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           value = value - grouped_list_tensor.GetValue(data_index - 1);
           start = grouped_list_tensor.GetValue(data_index - 1);
         }
+        uint32_t band_output_rows = 0, band_rows = 0;
+        int32_t band_epoch = 0;
+        GM_ADDR band_flags = this->GetGradientBandProduction(
+            task_desc.outputs[0].input_position, data_index, &band_output_rows, &band_rows, &band_epoch);
         if (value == 0) {
+          if (band_flags != nullptr) {
+            MulticoreRuntime::GradientBandProducer producer;
+            producer.Set(band_flags, band_epoch, band_rows);
+            producer.SetProfile(this->replica_trace_, task_desc.outputs[0].input_position == 18,
+                                getExtraValueFromTiling(input_list[TILING_IDX], 0) % ep, data_index);
+            producer.Begin(band_output_rows, this->worker_id_, this->core_num);
+            producer.PublishEmpty();
+          }
           return;
         }
         for (uint32_t i = 0; i < expert_num_single_rank; i++) {
@@ -209,6 +331,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           } else {
             grouped_list_tensor_real.SetValue(i, 0);
           }
+        }
+        if (this->home_experts_ > 0) {
+          grouped_list_tensor_real.SetValue(0, value);
         }
         cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
 
@@ -226,6 +351,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
           cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
         }
+        if (this->home_experts_ > 0) {
+          tilingdata_data->gmmBaseParams.groupNum = 1;
+          cacheWriteThrough(tiling_data_addr, sizeof(tilingdata_data->gmmBaseParams));
+        }
         PipeBarrier<PIPE_ALL>();
 
         int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
@@ -238,12 +367,31 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                                     ? start * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
                                     : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
 
+        GM_ADDR weight_base = input_list[task_desc.inputs[1].input_position];
+        GM_ADDR output_base = input_list[task_desc.outputs[0].input_position];
+        if (this->home_experts_ > 0) {
+          if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
+            const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[0].dim[1]) *
+                                         task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
+            const uint32_t position = task_desc.outputs[0].input_position;
+            output_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 18 ? 2 : 3);
+            output_0_offset = 0;
+          } else {
+            const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
+                                         task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+            const uint32_t position = task_desc.inputs[1].input_position;
+            weight_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 11 ? 0 : 1);
+          }
+        }
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position] + input_1_offset, nullptr, nullptr, nullptr,
+                       weight_base + input_1_offset, nullptr, nullptr, nullptr,
                        nullptr, nullptr, grouped_list_real, nullptr,
-                       input_list[task_desc.outputs[0].input_position] + output_0_offset, input_list[WORKSPACE_IDX],
+                       output_base + output_0_offset, input_list[WORKSPACE_IDX],
                        tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
-                       getTransposeData(task_desc.inputs[1].transpose_flag));
+                       getTransposeData(task_desc.inputs[1].transpose_flag),
+                       task_desc.outputs[0].data_type == sizeof(float), band_flags, band_epoch, band_rows,
+                       this->replica_trace_, task_desc.outputs[0].input_position == 18,
+                       getExtraValueFromTiling(input_list[TILING_IDX], 0) % ep, data_index);
       }
       return;
     }
@@ -273,8 +421,20 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     int32_t start = value * task_desc.task_split_value * hidden_size;
     int32_t end = (value + 1) * task_desc.task_split_value * hidden_size;
     if (start >= size_) {
-      aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, 1, ACLSHMEM_SIGNAL_ADD,
-                          target_pe);
+      int32_t credit = 1;
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+      if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+        // The experimental tag keeps the same binary's original path available.
+        if (task_desc.extra_value_1 == 1) {
+          credit = EmptyTailCompletionCredit(value, single_expert_task_num, size_, send_data_size_);
+          if (credit == 0) {
+            return;
+          }
+        }
+      }
+#endif
+      aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event,
+                          credit, ACLSHMEM_SIGNAL_ADD, target_pe);
       return;
     } else {
       if (end > size_) {

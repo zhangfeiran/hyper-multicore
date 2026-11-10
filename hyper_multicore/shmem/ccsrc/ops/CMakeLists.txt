@@ -70,10 +70,12 @@ set(CMAKE_CPP_COMPILE_OPTIONS
 )
 
 set(HP_SHMEM_SOC_TYPE "Ascend910B" CACHE STRING "SHMEM device generation")
-if(HP_SHMEM_SOC_TYPE STREQUAL "Ascend950")
+if(HP_SHMEM_SOC_TYPE STREQUAL "Ascend910B")
+    set(SHMEM_VECTOR_ARCH dav-c220-vec)
+elseif(HP_SHMEM_SOC_TYPE STREQUAL "Ascend950")
     set(SHMEM_VECTOR_ARCH dav-c310-vec)
 else()
-    set(SHMEM_VECTOR_ARCH dav-c220-vec)
+    message(FATAL_ERROR "Unsupported SHMEM device generation: ${HP_SHMEM_SOC_TYPE}")
 endif()
 
 include_directories(

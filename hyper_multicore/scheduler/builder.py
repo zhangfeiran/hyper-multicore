@@ -45,7 +45,8 @@ def allocate_graph_config(graph: ComputeGraph, tsv: TaskSplitValue,
     """
     required = 1 + sum(op.task_num for op in graph.topological_sort())
     return allocate_runtime_config(
-        required, mega_moe_event_capacity(tsv.all_expert_num, tsv.ep), tsv.single_rank_expert_num,
+        required, mega_moe_event_capacity(tsv.all_expert_num, tsv.ep,
+                                          shared_expert=tsv.shared_expert), tsv.single_rank_expert_num,
         num_workers=2 * num_cube_cores,
     )
 

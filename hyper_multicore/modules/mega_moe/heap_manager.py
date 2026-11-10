@@ -27,6 +27,7 @@ from typing import Any, NoReturn
 
 import torch
 
+from hyper_multicore.replica.capacity import ExpertReplicaConfig
 from hyper_multicore import _collective, shmem
 from hyper_multicore.shmem import _lifecycle
 
@@ -47,6 +48,13 @@ _HEAP_MANAGER = None
 def _round_heap_bytes(value: int) -> int:
     """Round the aggregate payload size to physical Heap pages."""
     return (value + _HEAP_GRANULARITY_BYTES - 1) // _HEAP_GRANULARITY_BYTES * _HEAP_GRANULARITY_BYTES
+
+
+def _configured_heap_size(current: str | None, legacy: str | None) -> str | None:
+    """Accept the legacy setting while rejecting ambiguous heap budgets."""
+    if current is not None and legacy is not None and current != legacy:
+        raise ValueError("Conflicting HYPER_MULTICORE_SHMEM_HEAP_SIZE and HYPER_PARALLEL_SHMEM_HEAP_SIZE")
+    return current if current is not None else legacy
 
 
 @dataclass(frozen=True)
@@ -178,11 +186,13 @@ class _HeapManager:
             layouts = [entry.layout for entry in self.entries]
             try:
                 configured = os.getenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE")
+                legacy_configured = os.getenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE")
+                effective = configured if configured is not None else legacy_configured
                 if not self._configured:
                     self._run_and_check_consistency(
-                        lambda: self._configure(configured),
+                        lambda: self._configure(_configured_heap_size(configured, legacy_configured)),
                         stage="Configuration",
-                        value=(configured, str(self.dtype), tuple(layouts)),
+                        value=(effective, str(self.dtype), tuple(layouts)),
                     )
                     self._configured = True
                 else:
@@ -325,6 +335,46 @@ class _HeapManager:
                 layout = _workspace_layout(entry.specification, self.dtype, minimum, entry.layout.token_capacity)
                 layouts = [layout if item is entry else item.layout for item in self.entries]
             self._restart(layouts, self._budget(self._required_bytes(layouts)))
+
+    def receive_capacity_limit(self, workspace: MegaMoeWorkspace, tokens: int) -> int:
+        """Query feasible Push receive rows without reserving symmetric memory.
+
+        All entries and the explicit Heap limit are agreed across the Root. The
+        result depends on those replicated layouts, not rank-local free memory.
+        Replica slots contribute their actual fixed storage, but do not change
+        the growth policy. Geometric growth is an allocation preference rather
+        than an admission limit. Only the selected destination load is allocated.
+
+        Args:
+            workspace: Bound Push workspace with automatic or fixed source storage.
+            tokens: Group-maximum actual source-token rows for this invocation.
+
+        Returns:
+            Aligned receive-row limit after accounting for other reservations.
+            Without an explicit Heap limit, returns the distinct-TopK owner bound.
+        """
+        if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
+            raise ValueError('Push capacity query requires a nonnegative integer token count')
+        with self.access():
+            entry = self._entry_for_workspace(workspace)
+            spec = entry.bound_spec
+            if spec is None or spec.dispatch_mode != 'push':
+                raise RuntimeError('Receive capacity query requires a bound Push workspace')
+            if not spec.auto_tokens and tokens > spec.local_num_tokens:
+                raise ValueError('Push capacity query exceeds the fixed source-token capacity')
+            ownership = ExpertReplicaConfig(spec.logical_num_experts or spec.num_experts, spec.ep_size, 0)
+            upper = ownership.maximum_receive_rows(tokens, spec.top_k) if tokens else 0
+            if self.heap_limit is None:
+                return upper
+            token_capacity = max(spec.local_num_tokens, _align_capacity(tokens)) if spec.auto_tokens else None
+            fixed = _workspace_layout(entry.specification, self.dtype, 0, token_capacity).required_bytes
+            other = sum(item.layout.required_bytes for item in self.entries if item is not entry)
+            row_bytes = spec.hidden_size * self.element_size
+            # Source growth cannot reclaim an already committed receive buffer.
+            self._budget(_round_heap_bytes(fixed + other + entry.layout.receive_capacity * row_bytes))
+            available = max(0, (self.heap_limit - other - fixed) // row_bytes)
+            allowance = available // 128 * 128
+            return min(upper, allowance)
 
     def ensure_token_capacity(self, workspace: MegaMoeWorkspace, tokens: int, received: int) -> MegaMoeSpec:
         """Grow source and destination storage in one transaction after route agreement.
@@ -543,10 +593,14 @@ class _HeapManager:
             ) from error
 
         try:
+            runtime_options = {}
+            if os.environ.get("HYPER_PARALLEL_SHMEM_FIXED_HEAP_REPACK") == "1":
+                runtime_options["allow_existing_runtime"] = self.heap_limit is not None
             result = shmem._restart(  # pylint: disable=protected-access
                 heap_size_bytes=heap_bytes,
                 replacements=replacements,
                 preflight_hook=lambda: self._restart_preflight(layouts, replacements, bindings, agreement),
+                **runtime_options,
             )
         except Exception:
             if not _lifecycle._runtime_is_healthy():  # pylint: disable=protected-access

@@ -57,7 +57,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
             _shutdown=Mock(return_value=None),
             _debug_state=Mock(return_value={
                 "state": "Ready",
-                "config": {"heap_size_bytes": 128},
+                "config": {"heap_size_bytes": 128, "data_engine": "mte", "udma_qp_num": 32},
                 "device_index": 0,
                 "active_allocations": [],
             }),
@@ -406,7 +406,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
             """Expose the mutable mocked Allocation registry."""
             return {
                 "state": "Ready",
-                "config": {"heap_size_bytes": 256},
+                "config": {"heap_size_bytes": 256, "data_engine": "mte", "udma_qp_num": 32},
                 "device_index": 0,
                 "active_allocations": list(active_allocations),
             }
@@ -418,7 +418,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
             operations.append("bootstrap")
             return b"replacement-bootstrap"
 
-        def initialize(*_args: object) -> None:
+        def initialize(*_args: object, **_kwargs: object) -> None:
             """Record Native initialize ordering."""
             operations.append("initialize")
 
@@ -480,7 +480,8 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertEqual(self.dist.all_gather_object.call_count, 7)
         payloads = [call.args[1] for call in self.dist.all_gather_object.call_args_list]
         self.assertEqual(payloads[0], (
-            (256, ("layout", 1), (((4,), "torch.float32", 16),), (((8,), "torch.float32", 16, 32),)),
+            (256, ("layout", 1), (((4,), "torch.float32", 16),), (((8,), "torch.float32", 16, 32),),
+             "mte", 32, False),
             None,
             False,
         ))
@@ -511,7 +512,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
 
         self.native._debug_state.return_value = {
             "state": "Ready",
-            "config": {"heap_size_bytes": 128},
+            "config": {"heap_size_bytes": 128, "data_engine": "mte", "udma_qp_num": 32},
             "device_index": 0,
             "active_allocations": [{"allocation_base": 1234, "allocation_bytes": 16}],
         }
@@ -546,7 +547,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
             )
         self.torch.npu.is_current_stream_capturing.return_value = False
         self.native._debug_state.return_value = {
-            "state": "Ready", "config": {"heap_size_bytes": 128}, "device_index": 0, "active_allocations": [],
+            "state": "Ready", "config": {"heap_size_bytes": 128, "data_engine": "mte", "udma_qp_num": 32}, "device_index": 0, "active_allocations": [],
         }
 
         def peer_preflight_error(output: list, value: object, **_kwargs: object) -> None:
@@ -659,7 +660,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
                 self.native._debug_state.reset_mock(side_effect=True)
                 self.native._debug_state.return_value = {
                     "state": "Ready",
-                    "config": {"heap_size_bytes": 128},
+                    "config": {"heap_size_bytes": 128, "data_engine": "mte", "udma_qp_num": 32},
                     "device_index": 0,
                     "active_allocations": [],
                 }

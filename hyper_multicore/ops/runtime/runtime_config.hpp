@@ -104,6 +104,9 @@ enum class TaskType : uint32_t {
   TASK_GATE_GRAD_ADD_SELECTED = 139,
   TASK_GATE_GRAD_ZEROS = 140,
   TASK_SHMEM_GET_MEM = 141,
+  TASK_MOE_OWNER_GET = 142,
+  TASK_MOE_TOKEN_GET = 143,
+  TASK_MOE_ROUTE_GRAD = 144,
 };
 
 enum class EventType : uint32_t {
@@ -165,7 +168,7 @@ struct TaskDesc {
   uint32_t task_split_num;
   uint32_t task_split_value;
   uint32_t extra_value_0;
-  uint32_t extra_value_1;
+  uint32_t extra_value_1;  // GMM: optional producer completion event; zero disables it.
   uint32_t extra_value_2;
   uint32_t profile_desc_id;
   uint32_t profile_owner_id;

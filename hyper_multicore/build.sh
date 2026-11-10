@@ -193,6 +193,9 @@ function validate_multicore_vendor() {
         aclnnHyperMegaGateRouteGrad
         aclnnHyperMegaGateRouteGradGetWorkspaceSize
     )
+    if [[ ",${soc_list}," == *,ascend950,* ]]; then
+        required_symbols+=(aclnnPanguMxfp8TaskGraph aclnnPanguMxfp8TaskGraphGetWorkspaceSize)
+    fi
 
     if [[ -n "${build_log}" ]]; then
         validate_multicore_build_log "${build_log}"
@@ -229,8 +232,12 @@ function validate_multicore_vendor() {
         if [[ "${kernel_layout}" == "architecture" ]]; then
             read -r kernel_id _ <<< "$("${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/soc_selection.py" --groups "${soc}")"
         fi
-        for op_name in hyper_mega_moe hyper_mega_moe_grad hyper_mega_mhc hyper_mega_mhc_grad \
-                hyper_mega_gate_route hyper_mega_gate_route_grad; do
+        local -a validation_ops=(hyper_mega_moe hyper_mega_moe_grad hyper_mega_mhc hyper_mega_mhc_grad
+                                 hyper_mega_gate_route hyper_mega_gate_route_grad)
+        if [[ "${soc}" == ascend950 ]]; then
+            validation_ops+=(pangu_mxfp8_task_graph)
+        fi
+        for op_name in "${validation_ops[@]}"; do
             mapfile -t artifacts < <(
                 find "${vendor_root}/op_impl/ai_core/tbe/kernel/${kernel_id}/${op_name}" \
                     -maxdepth 1 -type f -name '*.o' -print 2>/dev/null
@@ -260,8 +267,7 @@ function validate_multicore_vendor() {
         require_nonempty_artifact \
             "${vendor_root}/op_impl/ai_core/tbe/kernel/config/${soc}/binary_info_config.json" \
             "${soc} binary index"
-        for op_name in hyper_mega_moe hyper_mega_moe_grad hyper_mega_mhc hyper_mega_mhc_grad \
-                hyper_mega_gate_route hyper_mega_gate_route_grad; do
+        for op_name in "${validation_ops[@]}"; do
             require_nonempty_artifact \
                 "${vendor_root}/op_impl/ai_core/tbe/kernel/config/${soc}/${op_name}.json" \
                 "${soc} ${op_name} binary config"
@@ -587,7 +593,42 @@ PYCONTEXT
 
         CURRENT_REASON_CODE="CANN_VENDOR_VALIDATION_FAILED"
         validate_multicore_vendor "${VENDOR_ROOT}" "${CANN_SOC_LIST}" "" architecture
+        "${PYTHON_BIN}" - "${VENDOR_ROOT}" "${OUTPUT_ROOT}" <<'PY'
+from pathlib import Path
+import hashlib
+import json
+import sys
+
+vendor, output = map(Path, sys.argv[1:])
+kernels = vendor / 'op_impl/ai_core/tbe/kernel/arch35/pangu_mxfp8_task_graph'
+if kernels.is_dir():
+    objects = list(kernels.glob('*.o'))
+    if len(objects) != 1:
+        raise RuntimeError(f'Expected one MXFP8 primary object, found {objects}')
+    binary = objects[0]
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    metadata = json.loads(binary.with_suffix('.json').read_text())
+    if metadata.get('sha256') != digest:
+        raise RuntimeError(f'MXFP8 kernel metadata does not match {binary}')
+    receipt = {'schema': 7, 'object': binary.name, 'sha256': digest,
+               'features': ['nograd_row_only', 'ready_math', 'nograd_x_row_only', 'replica_udma_gradient',
+                            'replica_udma_gradient_peer_qp', 'mx_token_mapped_mte', 'mx_source_row_fp8',
+                            'mx_source_row_ready_event', 'mx_source_row_base_bindings', 'mx_token_mte_scratch_v1']}
+    target = output / 'capabilities/mxfp8_window.json'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(receipt, indent=2) + '\n')
+PY
         cp "${PROJECT_ROOT}/hyper_multicore/set_env.bash" "${OUTPUT_ROOT}/set_env.bash"
+
+        # The current optional device planner and counter are compiled for 910B/910C.
+        if [[ ",${CANN_SOC_LIST}," == *,ascend910b,* || ",${CANN_SOC_LIST}," == *,ascend910_93,* ]]; then
+            CURRENT_REASON_CODE="REPLICA_DEVICE_BUILD_FAILED"
+            cmake -S "${PROJECT_ROOT}/hyper_multicore/replica/_device_kernel" \
+                -B "${WORK_ROOT}/replica-device" -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX="${OUTPUT_ROOT}/replica"
+            cmake --build "${WORK_ROOT}/replica-device" --parallel "${NATIVE_JOBS}"
+            cmake --install "${WORK_ROOT}/replica-device" --strip
+        fi
 
         while IFS= read -r packaged_library; do
             validate_shared_library_security "${packaged_library}"

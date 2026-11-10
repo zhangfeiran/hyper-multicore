@@ -33,6 +33,8 @@ from hyper_multicore.diagnostics.common.session import (
 from hyper_multicore.diagnostics.profiler.cycle_trace import _PreparedProfileRuntime
 from hyper_multicore.diagnostics.common.call import DiagnosticCall, LaunchArguments, LaunchContext
 from hyper_multicore.diagnostics.common.schedule import DiagnosticAction
+from hyper_multicore.replica._observer import _set_replica_observer
+from hyper_multicore.diagnostics.profiler.replica import ReplicaHostCapture
 
 
 @dataclass
@@ -44,6 +46,8 @@ class _RawInvocation:
     direction: str
     step: int
     invocation_id: int
+    replica_lease_id: int | None = None
+    tags: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -76,6 +80,7 @@ class _TraceAccumulator:
             "rank": metadata.get("rank", invocation.runtime.rank),
             "deviceId": metadata.get("deviceId", invocation.runtime.device_id),
             "anchorCycle": metadata["anchorCycle"],
+            "cycleFrequencyMHz": metadata["cycleFrequencyMHz"],
             "recordCount": metadata["recordCount"],
             "droppedRecordCount": metadata["droppedRecordCount"],
         }
@@ -83,6 +88,10 @@ class _TraceAccumulator:
             if key in metadata:
                 invocation_metadata[key] = metadata[key]
         self.invocation_metadata.append(invocation_metadata)
+        if invocation.replica_lease_id is not None:
+            invocation_metadata["replicaLeaseId"] = invocation.replica_lease_id
+        if invocation.tags:
+            invocation_metadata["tags"] = dict(invocation.tags)
         self._append_events(trace["traceEvents"], invocation, shift_us)
 
     def _append_events(
@@ -107,6 +116,10 @@ class _TraceAccumulator:
                 "step": invocation.step,
                 "direction": invocation.direction,
             }
+            if invocation.replica_lease_id is not None:
+                copied_event["args"]["replica_lease_id"] = invocation.replica_lease_id
+            if invocation.tags:
+                copied_event["args"]["tags"] = dict(invocation.tags)
             self.trace_events.append(copied_event)
 
 
@@ -139,6 +152,7 @@ class _ProfileCall(DiagnosticCall):
         self.step = step
         self.invocation_id = invocation_id
         self.finished = False
+        self.tags: dict[str, str] = {}
 
     def complete(self) -> None:
         """Mark the direct-write profile buffer as complete after a successful launch."""
@@ -192,6 +206,9 @@ class TorchMegaKernelProfiler:
         self._raw_invocations: list[_RawInvocation] = []
         self._last_trace: dict[str, Any] | None = None
         self._window_index = 0
+        self._replica_capture = ReplicaHostCapture(
+            lambda: self.is_capture_enabled() and self._action is not DiagnosticAction.WARMUP,
+            lambda: self._step)
 
     @property
     def step_num(self) -> int:
@@ -206,6 +223,11 @@ class TorchMegaKernelProfiler:
     def __enter__(self) -> TorchMegaKernelProfiler:
         """Activate this profiler as the process-local MegaKernel session."""
         _activate_session("profiler", self)
+        try:
+            _set_replica_observer(self._replica_capture)
+        except BaseException:
+            _deactivate_session(self)
+            raise
         self._entered = True
         return self
 
@@ -222,6 +244,7 @@ class TorchMegaKernelProfiler:
                 self._release_profile_buffer(call, cache=False)
             self._pending.clear()
             self._release_profile_buffer_pool()
+            _set_replica_observer(None)
             _deactivate_session(self)
             self._profile_runtimes.clear()
             self._entered = False
@@ -288,7 +311,9 @@ class TorchMegaKernelProfiler:
         if runtime is None:
             runtime = _PreparedProfileRuntime(context.runtime)
             self._profile_runtimes[context.runtime] = runtime
-        return self.acquire_call(runtime, context.fallback_event_counters, context.direction)
+        call = self.acquire_call(runtime, context.fallback_event_counters, context.direction)
+        call.tags = dict(context.tags or {})
+        return call
 
     def acquire_call(
         self,
@@ -320,6 +345,7 @@ class TorchMegaKernelProfiler:
             profile_buffer_key=profile_buffer_key,
             invocation_id=invocation_id,
         )
+        call.replica_lease_id = self._replica_capture.current_lease
         self._pending.append(call)
         return call
 
@@ -411,6 +437,8 @@ class TorchMegaKernelProfiler:
                         direction=call.direction,
                         step=call.step,
                         invocation_id=call.invocation_id,
+                        replica_lease_id=getattr(call, "replica_lease_id", None),
+                        tags=dict(call.tags),
                     )
                 )
             self._release_profile_buffer(call, cache=True)
@@ -430,6 +458,7 @@ class TorchMegaKernelProfiler:
     def _finalize_window(self) -> None:
         try:
             self._last_trace = self._build_trace(self._raw_invocations)
+            self._last_trace["replicaHostObservations"] = self._replica_capture.take()
         finally:
             self._raw_invocations.clear()
         self._window_index += 1

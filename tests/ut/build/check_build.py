@@ -22,6 +22,7 @@ import importlib.util
 import io
 import json
 import os
+import runpy
 from pathlib import Path
 import shutil
 import shlex
@@ -395,6 +396,7 @@ while not Path(sys.argv[1]).exists():
             write(tools / name, '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TOOL_CALLS"\n').chmod(0o755)
         cann = directory / "cann"
         cann.mkdir()
+        write(cann / "lib64/libhcomm.so")
         env = {key: value for key, value in os.environ.items() if not key.startswith("HP_")}
         env.update(PATH=str(tools) + os.pathsep + os.environ["PATH"], PYTHON_BIN=sys.executable,
                    ASCEND_HOME_PATH=str(cann), TOOL_CALLS=str(directory / "calls"))
@@ -600,11 +602,16 @@ time.sleep(30)
         for soc in series:
             write(tbe / f"config/{soc}/aic-{soc}-ops-info.json", "{}")
         index = {}
-        for operator in ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_mega_mhc", "hyper_mega_mhc_grad",
-                         "hyper_mega_gate_route", "hyper_mega_gate_route_grad"):
-            relative = f"{compile_soc}/{operator}/kernel"
+        operators = ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_mega_mhc", "hyper_mega_mhc_grad",
+                     "hyper_mega_gate_route", "hyper_mega_gate_route_grad")
+        if compile_soc == "ascend950":
+            operators += ("pangu_mxfp8_task_graph",)
+        for operator in operators:
+            name = "PanguMxfp8TaskGraph_ed65f2bbd39f9cc68999acec5148f3f8" if operator == "pangu_mxfp8_task_graph" else "kernel"
+            relative = f"{compile_soc}/{operator}/{name}"
             write(tbe / f"kernel/{relative}.o")
-            write(tbe / f"kernel/{relative}.json", "{}")
+            metadata = {"sha256": hashlib.sha256(b"fixture").hexdigest()} if operator == "pangu_mxfp8_task_graph" else {}
+            write(tbe / f"kernel/{relative}.json", json.dumps(metadata))
             write(tbe / f"kernel/config/{compile_soc}/{operator}.json", json.dumps({
                 "binList": [{"binInfo": {"jsonFilePath": relative + ".json"}}]}))
             index[operator] = {"binaryList": [{"binPath": relative + ".o", "jsonPath": relative + ".json"}]}
@@ -623,7 +630,17 @@ time.sleep(30)
         identities = {soc: "f" * 64 for soc in ("ascend910b", "ascend950")}
         with patch.object(MERGE, "_host_elf_abi_fingerprint", return_value={}):
             MERGE.merge_vendors([("ascend910b", b), ("ascend950", a5)], output, identities, socs)
+            receipt_path = self.root / "payload/lib/capabilities/mxfp8_window.json"
+            receipt = {"schema": 7, "object": "PanguMxfp8TaskGraph_ed65f2bbd39f9cc68999acec5148f3f8.o",
+                       "sha256": hashlib.sha256(b"fixture").hexdigest(), "features": []}
+            write(receipt_path, json.dumps(receipt))
             ARTIFACTS._validate_vendor_resources(self.root / "payload", socs, "aarch64")
+            receipt["sha256"] = "0" * 64
+            write(receipt_path, json.dumps(receipt))
+            with self.assertRaisesRegex(RuntimeError, "Invalid MXFP8 native payload"):
+                ARTIFACTS._validate_vendor_resources(self.root / "payload", socs, "aarch64")
+            receipt["sha256"] = hashlib.sha256(b"fixture").hexdigest()
+            write(receipt_path, json.dumps(receipt))
             kernel = output / "op_impl/ai_core/tbe/kernel"
             self.assertEqual({p.name for p in kernel.iterdir()}, {"arch22", "arch35", "config"})
             left = kernel / "config/ascend910b/hyper_mega_moe.json"
@@ -823,6 +840,33 @@ time.sleep(30)
         self.assertFalse((outside.parent / "new").exists())
         self.assertTrue(outside.is_file())
 
+    def test_wheel_rejects_missing_or_duplicate_replica_host_extension(self):
+        """A wheel must retain exactly one selected native replica planner extension."""
+        for names in ([], ["hyper_multicore/replica/_host_kernel/_replica_host.a.so",
+                           "hyper_multicore/replica/_host_kernel/_replica_host.b.so"]):
+            with self.subTest(names=names), self.assertRaisesRegex(ValueError, "exactly one native replica host extension"):
+                PUBLICATION.validate_wheel_payload(None, names, self.root, {"payload_sha256": {}})
+
+    def test_repository_check_allows_known_settings_but_rejects_old_imports(self):
+        """Legacy settings cannot reopen the standalone package boundary."""
+        project = self.root / "boundary"
+        write(project / "hyper_multicore/_build/prepare_dependencies.py",
+              "def load_dependency_locks(): return {}\n")
+        for name in ("scripts", "tests", "examples"):
+            (project / name).mkdir()
+        for name in ("setup.py", "build.sh", "MANIFEST.in", "requirements.txt"):
+            write(project / name, "")
+        source = write(project / "hyper_multicore/settings.py", "NAME = 'HYPER_PARALLEL_REPLICA_HOST_NATIVE'\n")
+        checker = runpy.run_path(str(ROOT / "scripts/check_repository.py"))["main"]
+        with patch.dict(checker.__globals__, ROOT=project):
+            checker()
+            source.write_text("from hyper" + "_parallel.core import multicore\n")
+            with self.assertRaisesRegex(SystemExit, "Forbidden downstream import"):
+                checker()
+            source.write_text("NAME = 'HYPER" + "_PARALLEL_UNREVIEWED_SETTING'\n")
+            with self.assertRaisesRegex(SystemExit, "Unsupported legacy identifiers"):
+                checker()
+
     def test_wheel_integrity_rejects_changed_and_missing_payload(self):
         """Payload membership and hashes reject invalid staged wheel contents."""
         content = b"native fixture"
@@ -834,6 +878,7 @@ time.sleep(30)
                                   "adapters/manifest.json": hashlib.sha256(b"{}").hexdigest()}}
         wheel = self.root / "fixture.whl"
         with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("hyper_multicore/replica/_host_kernel/_replica_host.a.so", content)
             archive.writestr("hyper_multicore/" + relative, content)
             archive.writestr("hyper_multicore/build_info.json", "{}")
             archive.writestr("hyper_multicore/adapters/manifest.json", "{}")
@@ -844,7 +889,7 @@ time.sleep(30)
             with self.assertRaisesRegex(ValueError, "payload mismatch"):
                 PUBLICATION.validate_wheel_payload(archive, members, payload, info)
             with self.assertRaisesRegex(ValueError, "membership mismatch"):
-                PUBLICATION.validate_wheel_payload(archive, [], payload, info)
+                PUBLICATION.validate_wheel_payload(archive, ["hyper_multicore/replica/_host_kernel/_replica_host.a.so"], payload, info)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,27 @@
 # -----------------------------------------------------------------------------------------------------------
 # Private SHMEM SDK preparation for Multicore builds.
 
+function hp_shmem_soc_type() {
+    local selected_type="" requested_soc soc_type
+    local -a requested_socs=()
+    IFS=',' read -r -a requested_socs <<< "$1"
+    for requested_soc in "${requested_socs[@]}"; do
+        requested_soc="${requested_soc//[[:space:]]/}"
+        case "${requested_soc}" in
+            ascend910b|ascend910_93) soc_type=Ascend910B ;;
+            ascend950) soc_type=Ascend950 ;;
+            *) echo "ERROR: Unsupported SHMEM SoC '${requested_soc}'." >&2; return 10 ;;
+        esac
+        if [[ -n "${selected_type}" && "${selected_type}" != "${soc_type}" ]]; then
+            echo "ERROR: Prepare separate SHMEM SDKs for the requested device generations." >&2
+            return 10
+        fi
+        selected_type=${soc_type}
+    done
+    [[ -n "${selected_type}" ]] || return 10
+    printf '%s\n' "${selected_type}"
+}
+
 function hp_prepare_shmem_sdk() {
     local project_root=$1
     local soc_list=$2
@@ -35,6 +56,11 @@ function hp_prepare_shmem_sdk() {
         echo "HP_NATIVE_REASON_CODE=CANN_ENV_NOT_CONFIGURED"
         echo "ERROR: ASCEND_HOME_PATH must identify the selected CANN installation." >&2
         echo "       Source the required CANN set_env.sh before invoking the native build." >&2
+        return 3
+    fi
+    if [[ "${soc_type}" == Ascend950 && ! -s "${ASCEND_HOME_PATH}/lib64/libhcomm.so" ]]; then
+        echo "HP_NATIVE_REASON_CODE=A5_HCOMM_LIBRARY_NOT_FOUND"
+        echo "ERROR: Ascend950 SHMEM requires lib64/libhcomm.so in the selected CANN installation." >&2
         return 3
     fi
     local cann_version_file="${ASCEND_HOME_PATH}/opp/version.info"
@@ -124,6 +150,9 @@ print(hashlib.sha256(encoded).hexdigest())
             sha256sum "${project_root}/hyper_multicore/cmake/hardening.cmake" \
                 "${project_root}/hyper_multicore/shmem/cmake/shmem_wrapper/CMakeLists.txt" \
                 "${project_root}/hyper_multicore/shmem/_build/shmem_sdk.sh"
+            if [[ "${soc_type}" == Ascend950 ]]; then
+                sha256sum "${ASCEND_HOME_PATH}/lib64/libhcomm.so"
+            fi
         } | sha256sum | awk '{print substr($1, 1, 16)}'
     )
     if [[ ! "${toolchain_key}" =~ ^[0-9a-f]{16}$ ]]; then
@@ -231,8 +260,8 @@ PY
         -DUSE_UNIT_TEST=OFF \
         -DUSE_EXAMPLES=OFF \
         -DBUILD_PYTHON=OFF \
-        -DCMAKE_DISABLE_FIND_PACKAGE_MPI=TRUE \
         -DACLSHMEM_RDMA_SUPPORT=OFF \
+        -DCMAKE_DISABLE_FIND_PACKAGE_MPI=TRUE \
         -DSOC_TYPE="${soc_type}"
     cmake --build "${build_dir}" --parallel "${native_jobs}"
     cmake --install "${build_dir}" --prefix "${install_root}/shmem"

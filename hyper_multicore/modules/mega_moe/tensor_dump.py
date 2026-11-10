@@ -105,7 +105,12 @@ def _resolve_swiglu(context: L1TensorViewContext) -> L1TensorView:
 
 def _resolve_alltoall(context: L1TensorViewContext) -> L1TensorView:
     """Resolve local communication operands while rejecting remote-address reads."""
-    is_pull = int(context.task_desc.task_type) == TaskType.TASK_SHMEM_GET_MEM
+    if (int(context.task_desc.task_type) in (TaskType.TASK_MOE_OWNER_GET, TaskType.TASK_MOE_TOKEN_GET)
+            or (int(context.task_desc.task_type) == TaskType.TASK_SHMEM_GET_MEM
+                and context.task_desc.extra_value_0 == 16 and context.task_desc.extra_value_1 == 2)):
+        raise ValueError("Owner fanout has multiple destination ranges; select the Up-projection input instead")
+    is_pull = int(context.task_desc.task_type) in (
+        TaskType.TASK_SHMEM_GET_MEM, TaskType.TASK_MOE_OWNER_GET, TaskType.TASK_MOE_TOKEN_GET)
     if is_pull and context.io == "input" and context.index == 1:
         raise ValueError("MegaMoe pull sources belong to a remote rank; select the local dispatch output instead")
     if context.io == "output" and not is_pull:
@@ -161,7 +166,8 @@ def resolve_mega_moe_l1_tensor_view(context: Any) -> L1TensorView:
         return _resolve_grouped_matmul(context)
     if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
         return _resolve_swiglu(context)
-    if task_type in (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM):
+    if task_type in (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM,
+                     TaskType.TASK_MOE_OWNER_GET, TaskType.TASK_MOE_TOKEN_GET):
         return _resolve_alltoall(context)
     return context.default_view
 

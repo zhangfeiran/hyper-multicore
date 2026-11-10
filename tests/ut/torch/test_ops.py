@@ -84,7 +84,9 @@ class TestTorchOps(unittest.TestCase):
             patch.object(ops, "preload_vendor_library") as preload,
             patch.object(ops.torch.ops, "load_library") as load,
             patch.object(ops.torch.ops.hyper_multicore, "mega_moe_transport_version",
-                         return_value=1, create=True) as version,
+                         return_value=7, create=True) as version,
+            patch.object(ops.torch.ops.hyper_multicore, "mega_moe_shared_version",
+                         return_value=4, create=True) as shared_version,
             patch.object(ops.torch.ops.hyper_multicore, "mega_moe_grad", self._backward_op(), create=True) as backward,
         ):
             ops._load_native()
@@ -106,13 +108,19 @@ class TestTorchOps(unittest.TestCase):
             self.backend.assert_called_once_with()
             preload.assert_called_once_with(Path("vendor"))
             load.assert_called_once_with("good.so")
-            for protocol, alias, message in ((0, "a", "transport ABI"), (1, "e", "storage reuse")):
+            for protocol, alias, message in ((0, "a", "transport ABI"), (7, "e", "storage reuse")):
                 _loader._loaded_kinds.clear()
                 _loader._native_failure = None
                 version.return_value = protocol
                 backward.default._schema = self._backward_op(alias).default._schema
                 with self.assertRaisesRegex(NativeComponentUnavailableError, message):
                     ops._load_native()
+            _loader._loaded_kinds.clear()
+            _loader._native_failure = None
+            version.return_value = 7
+            shared_version.return_value = 3
+            with self.assertRaisesRegex(NativeComponentUnavailableError, "shared-expert ABI"):
+                ops._load_native()
 
     def test_import_and_gate_bridge_keep_shared_adapter_lazy(self):
         """Importing the shared wrappers and selecting them must not load native code."""

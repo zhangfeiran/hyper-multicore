@@ -24,9 +24,10 @@ if TYPE_CHECKING:
     from hyper_multicore.modules.mega_gate.module import MegaGate
     from hyper_multicore.modules.mega_mhc.module import MegaMhc
     from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
+    from hyper_multicore.modules.mega_moe.mxfp8_module import MXFP8MegaMoeExperts
 
 __all__ = [
-    "MegaGate", "MegaMhc", "MegaMoeExperts", "MegaKernelDiagnostics",
+    "MegaGate", "MegaMhc", "MegaMoeExperts", "MXFP8MegaMoeExperts", "MegaKernelDiagnostics",
     "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
 ]
 
@@ -44,6 +45,10 @@ def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     elif name == "MegaMoeExperts":
         from hyper_multicore.modules.mega_moe.module import (  # pylint: disable=import-outside-toplevel
             MegaMoeExperts as value,
+        )
+    elif name == "MXFP8MegaMoeExperts":
+        from hyper_multicore.modules.mega_moe.mxfp8_module import (  # pylint: disable=import-outside-toplevel
+            MXFP8MegaMoeExperts as value,
         )
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

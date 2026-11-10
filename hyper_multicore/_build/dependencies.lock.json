@@ -59,7 +59,24 @@
             "purpose": "add task-local RMSNormGrad execution without shared-workspace initialization, explicit pipe cleanup and Ascend950 BF16 output packing"
           }
         ],
-        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix",
+        "mxfp8_patches": [
+          {
+            "path": "hyper_multicore/ops/mxfp8_quant/logical_vector_worker.patch",
+            "sha256": "30f4b3adae3a2335385ec8d8e32d9d46d773795fc236ad9d3a3b13a2acfc719c",
+            "purpose": "accept a task-local logical vector index while preserving original standalone defaults"
+          },
+          {
+            "path": "hyper_multicore/ops/mxfp8_quant/row_only_logical_worker.patch",
+            "sha256": "7e7e3eaa1aeacfb26d0b48225d693beae1b939bd8cc3868f5dacf58acd8079ff",
+            "purpose": "Expose logical worker index for the unchanged standard row-only SwiGLU primitive."
+          },
+          {
+            "path": "hyper_multicore/ops/mxfp8_quant/x_row_only_worker.patch",
+            "sha256": "1e9089b709ae3ebb47162c7859696d40759ba488d5cbcc3ddbe84be865c03098",
+            "purpose": "Skip unused column-axis quantization in original no-grad forward while preserving row math and standalone defaults."
+          }
+        ]
       },
       "ops_transformer": {
         "repository": "https://gitcode.com/cann/ops-transformer.git",
@@ -74,11 +91,23 @@
             "patches": [
               {
                 "path": "hyper_multicore/ops/patches/grouped_matmul_fusion.patch",
-                "sha256": "f908a2dd909f75cc16b4532c24a2916858324f06034635e51fdab36056384c5c",
+                "sha256": "27d7f1405462d0f3443ec11c884ba150cb210e6d49466bcc499a7774188ca597",
                 "purpose": "expose the selected grouped-matmul path as an inline building block"
+              },
+              {
+                "path": "hyper_multicore/ops/patches/grouped_matmul_bands.patch",
+                "sha256": "7b7ef9d8aa6eee1c33fc55481333115b50d09667563af3690b45a23aa8c7c0db",
+                "purpose": "publish complete-K gradient row bands after final GM write fences"
               }
             ],
-            "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+            "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix",
+            "mxfp8_patches": [
+              {
+                "path": "hyper_multicore/ops/mxfp8/mx_gmm_logical_worker.patch",
+                "sha256": "f657cdb4d3d4446ac8ff072af428aadba5b2529462cdbb88599406d0c3392919",
+                "purpose": "expose task-local MX grouped GEMM execution through a logical cube partition"
+              }
+            ]
           },
           "mhc": {
             "version": "58b4a6bde",
@@ -132,6 +161,11 @@
             "sha256": "3ec6f508509a70add2bb55671acf32cbfa77ef4eb2f75e2a56da2080607c2eb5",
             "upstream_issue": "https://gitcode.com/cann/shmem/issues/704",
             "purpose": "provide the HP-private hpshmem_log sink interface"
+          },
+          {
+            "path": "hyper_multicore/shmem/_build/patches/bootstrap_client_disconnect.patch",
+            "sha256": "3d14e41c0b14b61ee2f819b949790fe6fb7cb0de6a7a54885ef07701fc735c59",
+            "purpose": "Keep each bootstrap server alive until session clients disconnect and propagate bounded close errors"
           }
         ],
         "packaging_policy": {

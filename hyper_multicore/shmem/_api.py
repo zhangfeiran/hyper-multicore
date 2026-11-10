@@ -179,13 +179,14 @@ def host_barrier() -> None:
 
 
 @_runtime_access
-def put(remote_dst: torch.Tensor, local_src: torch.Tensor, target_pe: int) -> None:
+def put(remote_dst: torch.Tensor, local_src: torch.Tensor, target_pe: int, *, use_sdma: bool = False) -> None:
     """Enqueue a byte-for-byte Put to one Root WORLD PE.
 
     Args:
         remote_dst: Contiguous symmetric destination Tensor or view.
         local_src: Contiguous local NPU source Tensor with the same byte count.
         target_pe: Destination in CANN Root WORLD coordinates.
+        use_sdma: Use ACL stream copies to directly mapped peers; reject unmapped peers.
 
     Raises:
         RuntimeError: If no SHMEM reference is active or the Runtime rejects the operation.
@@ -194,17 +195,21 @@ def put(remote_dst: torch.Tensor, local_src: torch.Tensor, target_pe: int) -> No
         Return only confirms enqueue on the current NPU Stream. Call ``shmem.acquire()`` first;
         the final ``shmem.release()`` must not run concurrently with this call.
     """
-    _load_native()._put(remote_dst, local_src, target_pe)  # pylint: disable=protected-access
+    if use_sdma:
+        _load_native()._put(remote_dst, local_src, target_pe, use_sdma=True)  # pylint: disable=protected-access
+    else:
+        _load_native()._put(remote_dst, local_src, target_pe)  # pylint: disable=protected-access
 
 
 @_runtime_access
-def get(local_dst: torch.Tensor, remote_src: torch.Tensor, source_pe: int) -> None:
+def get(local_dst: torch.Tensor, remote_src: torch.Tensor, source_pe: int, *, use_sdma: bool = False) -> None:
     """Enqueue a byte-for-byte Get from one Root WORLD PE.
 
     Args:
         local_dst: Contiguous local NPU destination Tensor.
         remote_src: Contiguous symmetric source Tensor or view with the same byte count.
         source_pe: Source in CANN Root WORLD coordinates.
+        use_sdma: Use ACL stream copies from directly mapped peers; reject unmapped peers.
 
     Raises:
         RuntimeError: If no SHMEM reference is active or the Runtime rejects the operation.
@@ -213,7 +218,10 @@ def get(local_dst: torch.Tensor, remote_src: torch.Tensor, source_pe: int) -> No
         Return only confirms enqueue on the current NPU Stream. Call ``shmem.acquire()`` first;
         the final ``shmem.release()`` must not run concurrently with this call.
     """
-    _load_native()._get(local_dst, remote_src, source_pe)  # pylint: disable=protected-access
+    if use_sdma:
+        _load_native()._get(local_dst, remote_src, source_pe, use_sdma=True)  # pylint: disable=protected-access
+    else:
+        _load_native()._get(local_dst, remote_src, source_pe)  # pylint: disable=protected-access
 
 
 @_runtime_access
@@ -224,6 +232,7 @@ def signal(remote_signal: torch.Tensor, value: int, target_pe: int, *, operation
         remote_signal: Contiguous symmetric Tensor view containing one ``int32`` element.
         value: Signed 32-bit update value.
         target_pe: Destination in CANN Root WORLD coordinates.
+        use_sdma: Use ACL stream copies to directly mapped peers; reject unmapped peers.
         operation: Exactly ``"set"`` or ``"add"``.
 
     Raises:

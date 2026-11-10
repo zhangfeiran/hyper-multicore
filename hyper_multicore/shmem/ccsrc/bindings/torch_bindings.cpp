@@ -391,7 +391,8 @@ AllocationView TensorView(const at::Tensor &tensor) {
 
 py::bytes GetUniqueId() { return py::bytes(UnwrapOperation(cann::host::get_unique_id(), "GetUniqueId")); }
 
-void Initialize(int32_t root_rank, int32_t root_size, const py::bytes &unique_id, uint64_t heap_size_bytes) {
+void Initialize(int32_t root_rank, int32_t root_size, const py::bytes &unique_id, uint64_t heap_size_bytes,
+                const std::optional<std::string> &data_engine, const std::optional<uint32_t> &udma_qp_num) {
   const auto config = runtime::LoadConfigFromEnvironment();
   if (!config.ok()) {
     ThrowStatus(config.error(), DfxOperation::Initialize, DfxPhase::Validation);
@@ -399,6 +400,22 @@ void Initialize(int32_t root_rank, int32_t root_size, const py::bytes &unique_id
   auto effective_config = config.value();
   if (heap_size_bytes != 0) {
     effective_config.heap_size_bytes = heap_size_bytes;
+  }
+  if (data_engine.has_value()) {
+    if (*data_engine != "mte" && *data_engine != "mte_udma") {
+      throw py::value_error("data_engine must be 'mte' or 'mte_udma'");
+    }
+    effective_config.data_engine = *data_engine == "mte_udma" ? runtime::DataEngine::MteUdma
+                                                             : runtime::DataEngine::Mte;
+  }
+  if (udma_qp_num.has_value()) {
+    if (*udma_qp_num != 1 && *udma_qp_num != 8 && *udma_qp_num != 16 && *udma_qp_num != 32) {
+      throw py::value_error("udma_qp_num must be 1, 8, 16 or 32");
+    }
+    effective_config.udma_qp_num = *udma_qp_num;
+  }
+  if (effective_config.data_engine != runtime::DataEngine::MteUdma && effective_config.udma_qp_num != 32) {
+    throw py::value_error("A reduced udma_qp_num requires data_engine='mte_udma'");
   }
   RequireOk(
     Runtime::Instance().Initialize(RootWorldInfo{root_rank, root_size}, effective_config,
@@ -556,7 +573,7 @@ void ResolveSymmetricTensor(const at::Tensor &tensor, std::string_view operation
   static_cast<void>(UnwrapRuntime(Runtime::Instance().ResolveAllocation(TensorView(tensor)), operation));
 }
 
-void Put(const at::Tensor &remote_dst, const at::Tensor &local_src, int64_t target_pe) {
+void Put(const at::Tensor &remote_dst, const at::Tensor &local_src, int64_t target_pe, bool use_sdma) {
   constexpr std::string_view kOperation = "put";
   ValidateContiguousNpuTensor(remote_dst, "remote_dst");
   ValidateContiguousNpuTensor(local_src, "local_src");
@@ -576,11 +593,18 @@ void Put(const at::Tensor &remote_dst, const at::Tensor &local_src, int64_t targ
   HP_SM_LOG_DEBUG(UnwrapRuntime(Runtime::Instance().RootRank(), kOperation), "Put", "Enqueue",
                   "target_pe=%d bytes=%" PRIu64 " remote_addr=%p local_addr=%p", root_pe, bytes, remote_dst.data_ptr(),
                   local_src.data_ptr());
+  if (use_sdma) {
+    RequireRuntimeOk(
+      cann::host::copy_peer_on_stream(reinterpret_cast<uintptr_t>(remote_dst.data_ptr()),
+                                     reinterpret_cast<uintptr_t>(local_src.data_ptr()), bytes, root_pe, true, stream),
+      kOperation);
+    return;
+  }
   cann::host::put_on_stream(reinterpret_cast<uintptr_t>(remote_dst.data_ptr()),
                             reinterpret_cast<uintptr_t>(local_src.data_ptr()), bytes, root_pe, stream);
 }
 
-void Get(const at::Tensor &local_dst, const at::Tensor &remote_src, int64_t source_pe) {
+void Get(const at::Tensor &local_dst, const at::Tensor &remote_src, int64_t source_pe, bool use_sdma) {
   constexpr std::string_view kOperation = "get";
   ValidateContiguousNpuTensor(local_dst, "local_dst");
   ValidateContiguousNpuTensor(remote_src, "remote_src");
@@ -600,6 +624,13 @@ void Get(const at::Tensor &local_dst, const at::Tensor &remote_src, int64_t sour
   HP_SM_LOG_DEBUG(UnwrapRuntime(Runtime::Instance().RootRank(), kOperation), "Get", "Enqueue",
                   "source_pe=%d bytes=%" PRIu64 " local_addr=%p remote_addr=%p", root_pe, bytes, local_dst.data_ptr(),
                   remote_src.data_ptr());
+  if (use_sdma) {
+    RequireRuntimeOk(
+      cann::host::copy_peer_on_stream(reinterpret_cast<uintptr_t>(remote_src.data_ptr()),
+                                     reinterpret_cast<uintptr_t>(local_dst.data_ptr()), bytes, root_pe, false, stream),
+      kOperation);
+    return;
+  }
   cann::host::get_on_stream(reinterpret_cast<uintptr_t>(local_dst.data_ptr()),
                             reinterpret_cast<uintptr_t>(remote_src.data_ptr()), bytes, root_pe, stream);
 }
@@ -725,6 +756,7 @@ py::object ConfigObject(const std::optional<Config> &config) {
   result["heap_size_bytes"] = config->heap_size_bytes;
   result["timeout_seconds"] = config->timeout_seconds;
   result["data_engine"] = ToString(config->data_engine);
+  result["udma_qp_num"] = config->udma_qp_num;
   result["bootstrap_endpoint_base"] = config->bootstrap_endpoint_base;
   return std::move(result);
 }
@@ -784,12 +816,15 @@ PYBIND11_MODULE(hyper_multicore_shmem_torch, module) {
   module.doc() = "Private Torch binding for the HyperMulticore SHMEM Runtime";
   module.def("_get_unique_id", &bindings::GetUniqueId);
   module.def("_initialize", &bindings::Initialize, py::arg("root_rank"), py::arg("root_size"),
-             py::arg("unique_id") = py::bytes(), py::arg("heap_size_bytes") = 0);
+             py::arg("unique_id") = py::bytes(), py::arg("heap_size_bytes") = 0, py::kw_only(),
+             py::arg("data_engine") = std::nullopt, py::arg("udma_qp_num") = std::nullopt);
   module.def("_empty", &bindings::Empty, py::arg("shape"), py::arg("dtype"), py::arg("alignment") = std::nullopt);
   module.def("_free", &bindings::Free, py::arg("tensor"));
   module.def("_barrier", &bindings::Barrier, py::kw_only(), py::arg("blocking") = true);
-  module.def("_put", &bindings::Put, py::arg("remote_dst"), py::arg("local_src"), py::arg("target_pe"));
-  module.def("_get", &bindings::Get, py::arg("local_dst"), py::arg("remote_src"), py::arg("source_pe"));
+  module.def("_put", &bindings::Put, py::arg("remote_dst"), py::arg("local_src"), py::arg("target_pe"),
+             py::arg("use_sdma") = false);
+  module.def("_get", &bindings::Get, py::arg("local_dst"), py::arg("remote_src"), py::arg("source_pe"),
+             py::arg("use_sdma") = false);
   module.def("_signal", &bindings::Signal, py::arg("remote_signal"), py::arg("value"), py::arg("target_pe"),
              py::kw_only(), py::arg("operation") = "set");
   module.def("_wait_signal", &bindings::WaitSignal, py::arg("signal"), py::arg("value"), py::kw_only(),

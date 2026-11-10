@@ -83,6 +83,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             local_experts=2,
             hidden_size=4,
             intermediate_size=3,
+            replica_slots_per_rank=0,
         )
         plan = SimpleNamespace(spec=spec)
         gate_up = torch.empty(2, 6, 4)
@@ -116,6 +117,9 @@ class TestMegaMoeFunction(unittest.TestCase):
         context = Mock()
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
+        context.plan.spec.replica_slots_per_rank = 0
+        context.replica_route = None
+        context.workspace.replica_provider = None
         execution = function_module._BackwardExecution(
             dispatch=torch.ones(1), grad_x=torch.ones(1), event_counters=Mock(),
             gmm_workspace=None, swiglu_workspace=None,
@@ -210,10 +214,10 @@ class TestMegaMoeFunction(unittest.TestCase):
     def _check_deferred_backward(self, *, permuted: bool, input_grad: bool = True,
                                 vary_tokens: bool = False, replay: bool = False) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
-        spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
+        spec = SimpleNamespace(replica_slots_per_rank=0, hidden_size=4, intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
                                dispatch_mode="push", expert_weight_layout="EIO", auto_tokens=False)
-        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False)
+        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False, fwd_task_prefixes=(), bwd_task_prefixes=())
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
@@ -222,6 +226,9 @@ class TestMegaMoeFunction(unittest.TestCase):
         plan.bwd_diagnostics = MegaKernelDiagnostics(runtime)
         plan.fwd_runtime_config = plan.bwd_runtime_config = None
         workspace = Mock(
+            replica_inbox=None,
+            replica_provider=None,
+            replica_runtime_images={},
             expert_capacity=128,
             expert_buffer=torch.empty(128, 4),
             routed_buffer=torch.empty(8 if vary_tokens else 4, 4),
@@ -308,7 +315,8 @@ class TestMegaMoeFunction(unittest.TestCase):
             for tag, capacity in enumerate(capacities, start=1):
                 tokens = (1, 3, 2, 4)[tag - 1] if vary_tokens else 2
                 source = torch.full((tokens if permuted else 4, 4), float(tag), requires_grad=input_grad)
-                route = SimpleNamespace(expert_capacity=capacity, group_list=torch.tensor([0, capacity]))
+                route = SimpleNamespace(replica_route=None, expert_capacity=capacity,
+                                        group_list=torch.tensor([0, capacity]))
                 for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
                              "combine_src_off", "combine_target_off", "combine_size"):
                     setattr(route, name, torch.zeros(4, dtype=torch.int64))

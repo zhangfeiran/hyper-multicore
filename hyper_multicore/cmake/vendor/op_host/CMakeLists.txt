@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 
+set(MX_HOST ${HP_MULTICORE_SOURCE_ROOT}/pangu_mxfp8_task_graph/op_host)
 set(FWD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe/op_host)
 set(BWD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_grad/op_host)
 set(MHC_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_mhc/op_host)
@@ -64,6 +65,11 @@ set(OP_TILING_SOURCES
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_tiling.cpp
 )
 
+list(APPEND OP_SCHEMA_SOURCES
+    ${MX_HOST}/pangu_mxfp8_task_graph_def.cpp
+    ${MX_HOST}/pangu_mxfp8_task_graph_infershape.cpp)
+list(APPEND OP_TILING_SOURCES ${MX_HOST}/pangu_mxfp8_task_graph_tiling.cpp)
+
 function(hp_generate_op_definitions)
     set(ASCEND_COMPUTE_UNIT ${HP_MULTICORE_REGISTERED_SOCS})
     npu_op_code_gen(
@@ -106,9 +112,11 @@ set(ACLNN_SOURCES
     ${GATE_GRAD_HOST}/op_api/hyper_mega_gate_route_grad_post.cpp
     ${GATE_GRAD_HOST}/op_api/linear_index/linear_index.cpp
 )
+list(APPEND ACLNN_SOURCES ${MX_HOST}/op_api/pangu_mxfp8_task_graph.cpp)
 npu_op_library(cust_opapi ACLNN ${ACLNN_SOURCES})
 target_compile_options(cust_opapi PRIVATE -fvisibility=hidden)
 target_include_directories(cust_opapi PRIVATE
+    ${MX_HOST}/op_api
     ${FWD_HOST}/op_api
     ${BWD_HOST}/op_api
     ${MHC_HOST}/op_api
@@ -137,6 +145,7 @@ npu_op_library(cust_op_proto GRAPH
 )
 target_compile_options(cust_op_proto PRIVATE -fvisibility=hidden)
 target_include_directories(cust_op_proto PRIVATE
+    ${MX_HOST}
     ${FWD_HOST}
     ${BWD_HOST}
     ${MHC_HOST}
@@ -159,6 +168,7 @@ npu_op_library(cust_optiling TILING
 )
 target_compile_options(cust_optiling PRIVATE -fvisibility=hidden)
 target_include_directories(cust_optiling PRIVATE
+    ${MX_HOST}
     ${FWD_HOST}
     ${BWD_HOST}
     ${MHC_HOST}
@@ -190,3 +200,9 @@ npu_op_package_add(${package_name}
         ${GATE_HOST}/op_api/aclnn_hyper_mega_gate_route.h
         ${GATE_GRAD_HOST}/op_api/aclnn_hyper_mega_gate_route_grad.h
 )
+
+if(ASCEND_COMPUTE_UNIT STREQUAL "ascend950")
+    npu_op_package_add(${package_name}
+        TYPE ACLNN
+        FILES ${MX_HOST}/op_api/aclnn_pangu_mxfp8_task_graph.h)
+endif()

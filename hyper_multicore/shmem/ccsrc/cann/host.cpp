@@ -21,8 +21,6 @@
 #include "cann/log.h"
 #include "shmem.h"
 
-#define HP_SHMEM_UDMA_QP_NUM 1U
-
 namespace hyper_multicore::shmem::cann::host {
 namespace {
 
@@ -246,7 +244,11 @@ runtime::Status initialize(const InitOptions &options) {
   }
 
   if (options.data_engine == runtime::DataEngine::MteUdma) {
-    const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, HP_SHMEM_UDMA_QP_NUM);
+    if (options.udma_qp_num != 1U && options.udma_qp_num != 8U &&
+        options.udma_qp_num != 16U && options.udma_qp_num != 32U) {
+      return InvalidArgument("UDMA QP count must be 1, 8, 16 or 32");
+    }
+    const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, options.udma_qp_num);
     if (qp_status != ACLSHMEM_SUCCESS) {
       return CannFailure("aclshmemx_set_qp_num", qp_status);
     }
@@ -255,7 +257,7 @@ runtime::Status initialize(const InitOptions &options) {
     if (get_status != ACLSHMEM_SUCCESS) {
       return CannFailure("aclshmemx_get_qp_num", get_status);
     }
-    if (actual_qps != HP_SHMEM_UDMA_QP_NUM) {
+    if (actual_qps != options.udma_qp_num) {
       return InvalidArgument("UDMA QP count does not match the requested configuration");
     }
   }
@@ -345,6 +347,20 @@ void get_on_stream(uintptr_t local_dst, uintptr_t remote_src, uint64_t bytes, in
   aclshmemx_getmem_on_stream(reinterpret_cast<void *>(local_dst), reinterpret_cast<void *>(remote_src),
                              static_cast<std::size_t>(bytes), source_pe,
                              reinterpret_cast<aclrtStream>(stream.native_handle));
+}
+
+runtime::Status copy_peer_on_stream(uintptr_t symmetric, uintptr_t local, uint64_t bytes, int32_t peer,
+                                    bool is_put, const runtime::StreamView &stream) {
+  void *remote = aclshmem_ptr(reinterpret_cast<void *>(symmetric), peer);
+  if (remote == nullptr) {
+    return InvalidArgument("SDMA requires a directly mapped SHMEM peer");
+  }
+  void *local_ptr = reinterpret_cast<void *>(local);
+  void *destination = is_put ? remote : local_ptr;
+  const void *source = is_put ? local_ptr : remote;
+  const aclError result = aclrtMemcpyAsync(destination, bytes, source, bytes, ACL_MEMCPY_DEVICE_TO_DEVICE,
+                                         reinterpret_cast<aclrtStream>(stream.native_handle));
+  return result == ACL_SUCCESS ? Success() : AclFailure("aclrtMemcpyAsync", result);
 }
 
 void signal_on_stream(uintptr_t remote_signal, int32_t value, SignalOp operation, int32_t target_pe,

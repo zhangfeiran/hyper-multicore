@@ -86,6 +86,10 @@ def load_torch_npu() -> ModuleType:
             "for your Torch/CANN environment. Inspect hyper_multicore_build_info for packaged branches. "
             f"{diagnostic_context()}"
         ) from error
+    except (ImportError, OSError, RuntimeError) as error:
+        raise NativeComponentUnavailableError(
+            f"[HYPER-MULTICORE-PTA-IMPORT-FAILED] {diagnostic_context()}: {error}"
+        ) from error
     try:
         return importlib.import_module("torch_npu")
     except (ImportError, OSError, RuntimeError) as error:

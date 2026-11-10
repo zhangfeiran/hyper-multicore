@@ -18,6 +18,7 @@ import unittest
 
 from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
 from hyper_multicore.scheduler.config import (
+    ATOMIC_ADD_VALUE_LEN,
     TaskSplitValue,
     TaskType,
     configure_ready_handshake,
@@ -135,19 +136,21 @@ class TestReadyHandshakeConfig(unittest.TestCase):
         self.assertEqual(rebuilt.ready_event, values.all_event_num + 3)
         self.assertGreater(rebuilt.ready_event, 1024)
         self.assertEqual(rebuilt.all_event_num_triggers[rebuilt.ready_event], 1)
-        self.assertEqual(event_workspace_bytes(64, 1024), 1104 * 4 + 2 * 65 * 64)
+        self.assertEqual(event_workspace_bytes(64, 1024), 1120 * 4 + 2 * 65 * 64)
         with self.assertRaisesRegex(ValueError, "event_capacity"):
             configure_ready_handshake(allocate_runtime_config(16), values)
 
     def test_ready_atomic_tail_crosses_event_alignment_boundary(self) -> None:
-        """Include ready's final zero lanes when termination alone fits."""
+        """Include the ready lanes and the per-expert producer fences."""
         values = TaskSplitValue(tp=1, ep=71, seq_size=128, all_expert_num=1065, top_k=2)
         capacity = mega_moe_event_capacity(values.all_expert_num, values.ep)
         config = allocate_runtime_config(16, capacity)
         configure_ready_handshake(config, values)
-        self.assertEqual(capacity, 1136)
+        self.assertEqual(capacity, 1168)
         self.assertEqual(config.ready_event, 1114)
         self.assertLessEqual(config.ready_event + 8, capacity)
+        self.assertGreaterEqual(capacity, config.ready_event + 3 * ATOMIC_ADD_VALUE_LEN
+                                + values.all_expert_num // values.ep)
 
     def test_single_rank_disables_handshake_and_persistent_tail(self) -> None:
         """EP1 needs neither a peer event nor persistent signal storage."""
