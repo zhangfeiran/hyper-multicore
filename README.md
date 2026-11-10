@@ -39,6 +39,8 @@ torchrun --standalone --nproc-per-node=2 mega_moe_minimal.py --dispatch-mode pus
 并输出形状、native 构建身份及耗时。通过 `--warmup` 和 `--iterations` 可增加采样次数。
 完整网络接入与训练对照见 [examples 指南](examples/README.md)，包括
 [MoE](examples/moe/README.md) 和 [MHC](examples/mhc/README.md)。
+LongCat Flash 零专家的独立接入、精度与组件性能验证见
+[LongCat 示例](examples/longcat_flash/README.md)，无需 HyperParallel。
 
 应用程序可直接导入公共组件：
 

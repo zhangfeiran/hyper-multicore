@@ -46,6 +46,8 @@ backward and prints its shape, native build identity and elapsed time.
 Use `--warmup` and `--iterations` to increase sampling. The [examples guide](examples/README.md)
 provides complete [MoE](examples/moe/README.md) and [MHC](examples/mhc/README.md)
 network integration and training comparisons.
+The [LongCat Flash example](examples/longcat_flash/README.md) covers standalone identity experts,
+precision and component benchmarks without HyperParallel.
 
 Applications import the public components directly:
 
