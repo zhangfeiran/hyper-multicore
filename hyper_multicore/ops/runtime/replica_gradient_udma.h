@@ -16,8 +16,8 @@
 #ifndef HYPER_MULTICORE_REPLICA_GRADIENT_UDMA_H
 #define HYPER_MULTICORE_REPLICA_GRADIENT_UDMA_H
 
-#include "runtime/runtime_config.hpp"
-#include "runtime/replica_gradient.h"
+#include "runtime_config.hpp"
+#include "replica_gradient.h"
 #include "shmem.h"
 
 namespace MulticoreRuntime {
