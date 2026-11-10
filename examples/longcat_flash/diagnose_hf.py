@@ -87,14 +87,19 @@ def native_and_mega(args: object, data: dict, expected_hf: dict, records: list) 
         start_shmem_lifetime()
 
 
-def main() -> None:
-    """Write the full HF diagnostic while gating only same-semantics comparisons."""
-    args = arguments()
+def _validate_configuration(args: object) -> None:
+    """Restrict the literal HF reference to the original-width single-rank fixture."""
     if (args.check, args.ep, args.real, args.zero, args.hidden, args.intermediate, args.top_k) != (
             "accuracy", 1, 8, 4, 6144, 2048, 12):
         raise ValueError("HF diagnosis requires EP1/E8/Z4/H6144/I2048/TopK12; only tokens can be reduced")
     if args.replica_slots or args.route_fixture != "router":
         raise ValueError("HF diagnosis uses the fixed router fixture and does not enable replicas")
+
+
+def main() -> None:
+    """Write the full HF diagnostic while gating only same-semantics comparisons."""
+    args = arguments()
+    _validate_configuration(args)
     output = args.output / "rank0.json"
     if output.exists():
         raise FileExistsError(f"Use a fresh diagnostic output directory: {output}")
@@ -116,7 +121,10 @@ def main() -> None:
     state = shmem.debug_state()
     passed = all(row["strict_pass"] for row in records if row["primary"])
     passed = passed and not runtime_environment["hyper_parallel_loaded"] and state["state"] == "Uninitialized"
-    report = {"status": "PASS" if passed else "FAIL", "rank": 0, "transformers": transformers.__version__,
+    hf_strict = all(row["strict_pass"] for row in records if not row["primary"])
+    report = {"primary_status": "PASS" if passed else "FAIL",
+              "hf_strict_status": "PASS" if hf_strict else "FAIL", "rank": 0,
+              "transformers": transformers.__version__,
               "hf_source": str(Path(transformers.__file__).resolve()), "gate": STRICT_GATE, "records": records,
               "shape": {key: getattr(args, key) for key in ("ep", "tokens", "hidden", "intermediate",
                                                            "real", "zero", "top_k")},
@@ -125,6 +133,8 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     dist.destroy_process_group()
+    print(f"Primary: {report['primary_status']}; HF strict diagnostics: {report['hf_strict_status']}; "
+          f"report: {output}", flush=True)
     if not passed:
         raise RuntimeError("HF repeat or same-semantics native/MegaMoE comparison failed")
 
