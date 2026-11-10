@@ -25,6 +25,12 @@ constexpr int kMaximumTopK = 8;
 constexpr int kTileRows = 128;
 constexpr int kStrideAlignment = 64;
 constexpr int kMaximumStride = 576;
+
+template <AscendC::HardEvent Event>
+__aicore__ inline void SyncCountPipe() {
+  AscendC::SetFlag<Event>(EVENT_ID0);
+  AscendC::WaitFlag<Event>(EVENT_ID0);
+}
 }  // namespace
 
 inline __gm__ struct OpSystemRunCfg g_opSystemRunCfg{0};
@@ -37,8 +43,9 @@ __global__ __aicore__ void replica_count_partials(GM_ADDR input, GM_ADDR partial
   pipe.InitBuffer(count_buffer, kMaximumStride * sizeof(int64_t));
   auto tile = tile_buffer.Get<int64_t>();
   auto memory = reinterpret_cast<__ubuf__ int64_t *>(tile.GetPhyAddr());
-  auto counts = reinterpret_cast<__ubuf__ int64_t *>(count_buffer.Get<int64_t>().GetPhyAddr());
-  for (int expert = 0; expert <= experts; ++expert) counts[expert] = 0;
+  auto local_counts = count_buffer.Get<int64_t>();
+  auto counts = reinterpret_cast<__ubuf__ int64_t *>(local_counts.GetPhyAddr());
+  for (int expert = 0; expert < stride; ++expert) counts[expert] = 0;
   const int64_t per_block = (rows + kBlocks - 1) / kBlocks;
   const int64_t first = AscendC::GetBlockIdx() * per_block;
   const int64_t last = rows < first + per_block ? rows : first + per_block;
@@ -47,43 +54,52 @@ __global__ __aicore__ void replica_count_partials(GM_ADDR input, GM_ADDR partial
   output.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(partials));
   for (int64_t offset = first; offset < last; offset += kTileRows) {
     const int length = last - offset < kTileRows ? static_cast<int>(last - offset) : kTileRows;
-    AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID0);
-    AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID0);
+    SyncCountPipe<AscendC::HardEvent::S_MTE2>();
     AscendC::DataCopyExtParams copy{1, static_cast<uint32_t>(length * top_k * sizeof(int64_t)), 0, 0, 0};
     AscendC::DataCopyPadExtParams<int64_t> padding{false, 0, 0, 0};
     AscendC::DataCopyPad(tile, source[offset * top_k], copy, padding);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+    SyncCountPipe<AscendC::HardEvent::MTE2_S>();
     for (int row = 0; row < length; ++row) hot::CountRow(memory + row * top_k, counts, top_k, experts);
   }
-  // Each producer owns cache-line-aligned partials; no scalar writeback shares a line with another core.
+  // Each producer owns an aligned row, so it can publish its complete partial histogram with one copy.
   const int base = AscendC::GetBlockIdx() * stride;
-  for (int expert = 0; expert <= experts; ++expert) output.SetValue(base + expert, counts[expert]);
-  AscendC::DataCacheCleanAndInvalid<int64_t, AscendC::CacheLine::ENTIRE_DATA_CACHE, AscendC::DcciDst::CACHELINE_OUT>(
-    output);
+  SyncCountPipe<AscendC::HardEvent::S_MTE3>();
+  AscendC::DataCopy(output[base], local_counts, stride);
+  SyncCountPipe<AscendC::HardEvent::MTE3_S>();
 }
 
 __global__ __aicore__ void replica_count_merge(GM_ADDR partials, GM_ADDR result, int experts, int stride) {
+  constexpr int kColumns = kStrideAlignment;
+  constexpr int kTileBytes = kColumns * sizeof(int64_t);
+  const int first = AscendC::GetBlockIdx() * kColumns;
+  const int remaining = experts + 1 - first;
+  const int length = remaining < kColumns ? remaining : kColumns;
   AscendC::TPipe pipe;
-  AscendC::TBuf<AscendC::TPosition::VECCALC> buffer;
-  pipe.InitBuffer(buffer, kBlocks * kMaximumStride * sizeof(int64_t));
+  AscendC::TBuf<AscendC::TPosition::VECCALC> buffer, reduced_buffer;
+  pipe.InitBuffer(buffer, kBlocks * kTileBytes);
+  pipe.InitBuffer(reduced_buffer, kTileBytes);
   auto local = buffer.Get<int64_t>();
+  auto reduced = reduced_buffer.Get<int64_t>();
   AscendC::GlobalTensor<int64_t> source, output;
   source.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(partials));
   output.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(result));
-  AscendC::DataCopyExtParams copy{1, static_cast<uint32_t>(kBlocks * stride * sizeof(int64_t)), 0, 0, 0};
+  // A strided copy gathers the same columns from every partial into this core's UB.
+  AscendC::DataCopyExtParams copy{kBlocks, kTileBytes, static_cast<uint32_t>((stride - kColumns) * sizeof(int64_t)),
+                                 0, 0};
   AscendC::DataCopyPadExtParams<int64_t> padding{false, 0, 0, 0};
-  AscendC::DataCopyPad(local, source, copy, padding);
-  AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
-  AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+  AscendC::DataCopyPad(local, source[first], copy, padding);
+  SyncCountPipe<AscendC::HardEvent::MTE2_S>();
   auto memory = reinterpret_cast<__ubuf__ int64_t *>(local.GetPhyAddr());
-  for (int expert = 0; expert <= experts; ++expert) {
+  auto sums = reinterpret_cast<__ubuf__ int64_t *>(reduced.GetPhyAddr());
+  for (int column = 0; column < length; ++column) {
     int64_t value = 0;
-    for (int block = 0; block < kBlocks; ++block) value += memory[block * stride + expert];
-    output.SetValue(expert, expert == experts ? static_cast<int64_t>(value != 0) : value);
+    for (int block = 0; block < kBlocks; ++block) value += memory[block * kColumns + column];
+    sums[column] = first + column == experts ? static_cast<int64_t>(value != 0) : value;
   }
-  AscendC::DataCacheCleanAndInvalid<int64_t, AscendC::CacheLine::ENTIRE_DATA_CACHE, AscendC::DcciDst::CACHELINE_OUT>(
-    output);
+  AscendC::DataCopyExtParams write{1, static_cast<uint32_t>(length * sizeof(int64_t)), 0, 0, 0};
+  SyncCountPipe<AscendC::HardEvent::S_MTE3>();
+  AscendC::DataCopyPad(output[first], reduced, write);
+  SyncCountPipe<AscendC::HardEvent::MTE3_S>();
 }
 
 extern "C" int launch_replica_counts(void *stream, void *input, void *partials, void *result, int64_t rows, int top_k,
@@ -96,8 +112,8 @@ extern "C" int launch_replica_counts(void *stream, void *input, void *partials, 
                                                        rows, top_k, experts, stride);
   const int status = aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
   if (status) return status;
-  replica_count_merge<<<1, nullptr, stream>>>(static_cast<uint8_t *>(partials), static_cast<uint8_t *>(result), experts,
-                                              stride);
+  replica_count_merge<<<stride / kStrideAlignment, nullptr, stream>>>(static_cast<uint8_t *>(partials),
+                                                                     static_cast<uint8_t *>(result), experts, stride);
   return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
 }
 
