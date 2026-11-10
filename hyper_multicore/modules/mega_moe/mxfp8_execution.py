@@ -454,12 +454,19 @@ class MXFP8Execution:
             plan: Current graph and owner/guest output geometry.
             weights: Current physical roots supplying matrix dimensions.
             device: Device receiving fresh FP32 partials.
-            route: Optional exact CPU replica quotas; absent quotas retain full clearing.
+            route: Optional exact CPU replica quotas; B0 can delegate empty outputs to TN.
 
         Returns:
             Fresh first and second projection partials, ready for their TN producers.
         """
         owners = plan.spec.local_experts
+        if getattr(plan.spec, "mx_skip_gradient_zero", False):
+            if plan.spec.replica_slots_per_rank or route is not None or plan.backward.host.kernel_gradients:
+                raise ValueError("MX device empty-expert clearing requires B0 output ownership.")
+            # The graph clears PREZEROED_OUTPUT so zero-K TN tasks initialize
+            # cold experts. Nonempty complete-K tasks overwrite every output.
+            return tuple(torch.empty((owners, *weight.logical_shape[1:]), dtype=torch.float32, device=device)
+                         for weight in weights)
         if plan.backward.host.kernel_gradients:
             owners -= plan.spec.replica_slots_per_rank
         cpu_plan = route is not None and isinstance(route.plan, ExpertExecutionPlan)

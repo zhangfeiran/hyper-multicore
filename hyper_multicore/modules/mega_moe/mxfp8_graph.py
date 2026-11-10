@@ -146,6 +146,7 @@ class _GmmStage:
     w_scale: int
     workers: int
     records: list
+    prezeroed_output: bool = True
     home_experts: int = 0
     guest_data_position: int = 0
     guest_scale_position: int = 0
@@ -182,7 +183,7 @@ class _GmmStage:
                         output_dtype=MX_GMM_OUTPUT_FP32 if self.layout == "TN" else 0,
                     )
                 )
-                if self.layout == "TN":
+                if self.layout == "TN" and self.prezeroed_output:
                     self.records[-1].flags |= _MX_GMM_PREZEROED_OUTPUT
         _fill_compute_stage(cfg, op, tsv, MX_GMM_TASK_TYPE, self.workers, False, indices)
         if self.home_experts and self.layout != "TN":
@@ -313,13 +314,14 @@ def _buffer_specs(spec: MegaMoeSpec, forward: bool) -> dict[int, TensorSpec]:
 
 def _apply_mx_poll_policy(cfg: Any, policy: str) -> None:
     """Use queue roles because transport descriptor core tags do not define scheduling."""
-    if policy not in ("0", "fast"):
-        raise ValueError("mx_poll_policy must be exactly 0 or fast.")
+    if policy not in ("0", "fast", "pr7"):
+        raise ValueError("mx_poll_policy must be exactly 0, fast or pr7.")
     if policy == "0":
         return
     seen = set()
     for indices, count, interval in zip(
-        (cfg.cube_task_indices, cfg.vector_task_indices), cfg.task_index_num[:2], (10, 30)
+        (cfg.cube_task_indices, cfg.vector_task_indices), cfg.task_index_num[:2],
+        (5, 5) if policy == "pr7" else (10, 30)
     ):
         for task_id in indices[:count]:
             if task_id in seen:
@@ -333,6 +335,10 @@ def _apply_mx_poll_policy(cfg: Any, policy: str) -> None:
 def _validate_mx_options(spec: MegaMoeSpec, forward: bool, row_only: bool, expert_window: int) -> bool:
     """Validate precision and queues, returning the independent backward dependency policy."""
     b0_backward_dag = _b0_backward_dag_enabled(spec)
+    if not isinstance(spec.mx_skip_gradient_zero, bool):
+        raise ValueError("MX gradient initialization mode must be a boolean.")
+    if spec.mx_skip_gradient_zero and spec.replica_slots_per_rank:
+        raise ValueError("MX device empty-expert clearing requires B0 output ownership.")
     if row_only and not forward:
         raise ValueError("Row-only SwiGLU is valid only for a forward without saved backward state.")
     if spec.dispatch_mode != "push" or spec.swiglu_limit is not None:
@@ -649,7 +655,8 @@ def build_mxfp8_runtime(
             specs,
             inputs + [glist, gtable],
             [output],
-            _GmmStage(layout, *dims, *scales, cubes, gmms, **guest_positions),
+            _GmmStage(layout, *dims, *scales, cubes, gmms,
+                      prezeroed_output=not spec.mx_skip_gradient_zero, **guest_positions),
             cubes,
         )
 
