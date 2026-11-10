@@ -155,7 +155,27 @@ class ReplicaRoute:
     plan_reused: bool = False
     plan_bypassed: bool = False
     _host_counts: tuple[tuple[int, ...], ...] | None = None
+    device_plan: Any | None = None
 
+
+class _RejectedQuotaMemo:
+    """Keep one exact CPU-only rejection after fresh count and capacity agreement."""
+
+    def __init__(self) -> None:
+        """Start without reusable rejection evidence or retained device storage."""
+        self.signature: tuple[Any, ...] | None = None
+        self.hits = 0
+
+    def contains(self, signature: tuple[Any, ...]) -> bool:
+        """Reuse only the complete pure-search inputs, never invocation metadata.
+
+        Args:
+            signature: Exact topology, expert totals, loads, capacity and benefit-policy inputs.
+        """
+        if self.signature != signature:
+            return False
+        self.hits += 1
+        return True
 
 class _RecomputedReplicaPlans:
     """Retain immutable CPU plans and home-decision evidence for one invocation."""
@@ -225,7 +245,7 @@ def _plan_signature(config, group, rank, options):
     return signature
 
 
-def _plan_replica_route(
+def _plan_replica_route_default(
     counts: Any, config: ExpertReplicaConfig, group: object, rank: int,
     _route_cache: _ReplicaRouteCache | None = None, **options: Any
 ) -> tuple[ExpertExecutionPlan, bool]:
@@ -423,7 +443,7 @@ def _source_count_payload(ids, config, trusted, header):
         payload = _replica_count_payload(ids.to(torch.int64), config.num_experts)
     else:
         if trusted.shape != (config.num_experts,) or trusted.device != ids.device:
-            raise ValueError("Trusted counts must match the logical experts and route device")
+            raise ValueError("Trusted replica counts must match the logical experts and route device")
         if trusted.dtype not in (torch.int32, torch.int64):
             raise ValueError("Trusted replica counts must be an integer histogram")
         payload = torch.cat((trusted.to(torch.int64), trusted.new_zeros(1, dtype=torch.int64)))
@@ -508,7 +528,7 @@ def _prepare_severe_skew_counts(gathered, config, minimum_load_reduction, minimu
     return replace(gathered, host_counts=_read_gathered_host_counts(gathered.counts))
 
 
-def prepare_replica_route(
+def _prepare_default_replica_route(
     topk_ids: torch.Tensor,
     config: ExpertReplicaConfig,
     group: object = None,
@@ -845,3 +865,48 @@ def _mapped_replica_route(plan, rank, group, topk_ids, summary, reused, route_ca
         plan_reused=reused,
         _host_counts=plan.dispatch_counts,
     )
+
+
+def _plan_replica_route(counts, config, group, rank, _route_cache=None, _complete_experts=False, **options):
+    """Select the calibrated planner only for policies that need its extra contract."""
+    cost = options.pop("cost_model", None)
+    adaptive = options.pop("adaptive", bool(config.replica_slots_per_rank))
+    nodes = options.pop("_rank_nodes", options.pop("rank_nodes", ()))
+    credit = options.pop("_replica_transfer_row_credit", options.pop("transfer_row_credit", 0))
+    if cost is not None or _complete_experts or not adaptive:
+        from . import _a5_routing  # pylint: disable=import-outside-toplevel
+        return _a5_routing._plan_replica_route(
+            counts.tolist() if isinstance(counts, np.ndarray) else counts, config, group, rank,
+            _complete_experts=_complete_experts, cost_model=cost, adaptive=adaptive,
+            _rank_nodes=nodes, _replica_transfer_row_credit=credit, **options)
+    return _plan_replica_route_default(counts, config, group, rank, _route_cache,
+                                       rank_nodes=nodes, transfer_row_credit=credit, **options)
+
+
+def prepare_replica_route(
+    topk_ids, config, group=None, *, target_load=None, minimum_replica_rows=0, planner_backend="cpu",
+    compact_home=False, minimum_load_reduction=0.0, minimum_saved_rows=0, dynamic_header=None,
+    max_local_num_tokens=None, receive_capacity=None, _auto_capacity_factor=None, _capacity_budget=None,
+    _rank_nodes=(), _cost_model=None, _trusted_counts=None, _gathered_counts=None,
+    _replica_transfer_row_credit=0, _route_cache=None, _rejected_quota_memo=None,
+    _count_header_cache=None, _complete_experts=False,
+):
+    """Keep the target fast route while retaining A5 device and calibrated policies."""
+    from .device import validate_planner_backend  # pylint: disable=import-outside-toplevel
+    validate_planner_backend(planner_backend, minimum_replica_rows, _cost_model)
+    common = dict(target_load=target_load, minimum_replica_rows=minimum_replica_rows, compact_home=compact_home,
+                  minimum_load_reduction=minimum_load_reduction, minimum_saved_rows=minimum_saved_rows,
+                  dynamic_header=dynamic_header, receive_capacity=receive_capacity,
+                  _auto_capacity_factor=_auto_capacity_factor, _capacity_budget=_capacity_budget,
+                  _rank_nodes=_rank_nodes, _trusted_counts=_trusted_counts, _gathered_counts=_gathered_counts,
+                  _replica_transfer_row_credit=_replica_transfer_row_credit)
+    if (planner_backend != "cpu" or _cost_model is not None or _complete_experts or
+            _count_header_cache is not None or _rejected_quota_memo is not None or max_local_num_tokens is not None):
+        from . import _a5_routing  # pylint: disable=import-outside-toplevel
+        if _gathered_counts is not None and isinstance(_gathered_counts.host_counts, np.ndarray):
+            common["_gathered_counts"] = replace(_gathered_counts, host_counts=_gathered_counts.host_counts.tolist())
+        return _a5_routing.prepare_replica_route(
+            topk_ids, config, group, planner_backend=planner_backend, max_local_num_tokens=max_local_num_tokens,
+            _cost_model=_cost_model, _rejected_quota_memo=_rejected_quota_memo,
+            _count_header_cache=_count_header_cache, _complete_experts=_complete_experts, **common)
+    return _prepare_default_replica_route(topk_ids, config, group, _route_cache=_route_cache, **common)

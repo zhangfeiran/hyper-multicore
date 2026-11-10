@@ -65,6 +65,7 @@ add_library(hyper_multicore_torch SHARED
     "${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities.o"
     csrc/replica_count_queue.cpp
     csrc/registration.cpp
+    csrc/mxfp8_task_graph.cpp
     csrc/registration_mhc.cpp
     csrc/mega_mhc.cpp
     csrc/mega_moe.cpp

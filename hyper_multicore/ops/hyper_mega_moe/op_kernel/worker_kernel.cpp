@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -18,12 +18,21 @@
 #include "kernel_operator.h"
 #include "swi_glu/swi_glu.cpp"
 #include "grouped_matmul/grouped_matmul.cpp"
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+#include "bf16_gmm/cgmct_worker.h"
+#include "bf16_gmm/blaze_worker.h"
+#include "bf16_gmm/shared_worker.h"
+#endif
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/empty_dispatch.h"
 #include "runtime/worker_kernel.h"
 #include "common/mega_moe/transport.h"
 #include "common/mega_moe/task_options.h"
 #include "common/mega_moe/routing_probabilities.h"
+#include "runtime/bf16_clamp.h"
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+#include "runtime/indexed_pull.h"
+#endif
 
 using namespace AscendC;
 
@@ -37,6 +46,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
 
   // input_list layout for hyper_mega_moe (forward):
   //   [23] = tiling params  [24] = all_event_counters  [25] = diagnostic_buffer  [16] = gmm_workspace
+  static constexpr uint32_t SHARED_PTRS_IDX = 26;
   static constexpr uint32_t TILING_IDX   = 23;
   static constexpr uint32_t EVENT_IDX    = 24;
   static constexpr uint32_t DIAGNOSTIC_IDX = 25;
@@ -52,6 +62,24 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   static constexpr int64_t GMM_MATMUL_M_FIELDS_BYTES =
     offsetof(TCubeTiling, singleCoreM) + sizeof(int32_t) - offsetof(TCubeTiling, M);
 
+  __aicore__ inline void PrepareIngressThresholds() {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    TaskDesc first;
+    getTaskDesc(this->runtimeConfigPtr, &first, 0);
+    if (first.task_type == TaskType::TASK_MOE_TOKEN_GET && first.extra_value_1 == 6) { return; }
+    if (first.task_type != TaskType::TASK_MOE_OWNER_GET && first.task_type != TaskType::TASK_MOE_TOKEN_GET) { return; }
+    uint32_t local_experts = getExtraValueFromTiling(input_list[TILING_IDX], 2) /
+                             getExtraValueFromTiling(input_list[TILING_IDX], 1);
+    // The host patched this image on the launch stream. Expected values remain
+    // constant for this invocation; invalidate read-only per-core cache entries.
+    for (uint32_t expert = 0; expert < local_experts; ++expert) {
+      DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+        this->all_event_num_triggers[first.trigger_event + expert]);
+    }
+    PipeBarrier<PIPE_ALL>();
+#endif
+  }
+
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
     if (!IsMoeTaskOptionsValid(task_desc, WORKSPACE_IDX)) AscendC::Trap();
     switch (task_desc.task_type) {
@@ -60,9 +88,51 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       case TaskType::TASK_MATMUL:
         ExecuteMatmul(task_desc);
         break;
-      case TaskType::TASK_GROUPED_MATMUL:
+      case TaskType::TASK_GROUPED_MATMUL: {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        const uint32_t variant = A5GmmVariant(task_desc);
+        if (task_desc.inputs[0].tensor_type == 2 || task_desc.outputs[0].data_type != sizeof(bfloat16_t)) {
+          ExecuteGroupedMatmul(task_desc);
+          break;
+        }
+        GM_ADDR resolved_inputs[SHARED_PTRS_IDX + 1];
+        GM_ADDR *gmm_inputs = A5ExpertInputs(task_desc, resolved_inputs);
+        if (task_desc.extra_value_2 == MulticoreBf16::TILE_READY_TAG &&
+            (variant != 2 || task_desc.outputs[0].input_position != 7 ||
+             task_desc.extra_value_0 == 0 || task_desc.extra_value_0 > 16 ||
+             task_desc.dependent_event != EVENT_INVALID_ID ||
+             !AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value)) {
+          AscendC::Trap();
+        }
+        if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+          if (variant == 1) {
+            MulticoreBf16::ExecuteCgmctTask(task_desc, gmm_inputs, this->core_num);
+          } else if (variant == 2) {
+            if (task_desc.extra_value_2 == MulticoreBf16::TILE_READY_TAG) {
+              if (task_desc.outputs[0].input_position != 7 || task_desc.extra_value_0 == 0 ||
+                  task_desc.extra_value_0 > 16) { AscendC::Trap(); }
+              uint64_t tokens = getExtraValueFromTiling(input_list[TILING_IDX], 4);
+              uint64_t experts = getExtraValueFromTiling(input_list[TILING_IDX], 2);
+              uint64_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
+              uint64_t top_k = task_desc.extra_value_0;
+              auto *table = reinterpret_cast<__gm__ int32_t *>(
+                  input_list[16] + MulticoreBf16::InputTileTableOffset(tokens, top_k, experts));
+              MulticoreBf16::ExecuteBlazeTask<false, true>(
+                  task_desc, gmm_inputs, this->core_num, table, MulticoreBf16::InputTileStride(tokens, top_k, ep));
+            } else {
+              MulticoreBf16::ExecuteBlazeTask(task_desc, gmm_inputs, this->core_num);
+            }
+          } else {
+            ExecuteGroupedMatmul(task_desc);
+          }
+        } else {
+          ExecuteGroupedMatmul(task_desc);
+        }
+#else
         ExecuteGroupedMatmul(task_desc);
+#endif
         break;
+      }
       case TaskType::TASK_SWI_GLU:
         ExecuteSwiglu(task_desc);
         break;
@@ -72,8 +142,25 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       case TaskType::TASK_SAVE_DISPATCH:
         ExecuteSaveDispatch(task_desc);
         break;
+      case TaskType::TASK_MOE_TOKEN_GET:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        ExecuteTokenPull<DTYPE_DISPATCH_TARGET>(task_desc, input_list, TILING_IDX);
+#else
+        AscendC::Trap();
+#endif
+        break;
       case TaskType::TASK_SHMEM_GET_MEM:
+      case TaskType::TASK_MOE_OWNER_GET:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        if (task_desc.extra_value_0 == 16 && task_desc.inputs[1].dim[3] != 0) {
+          ExecuteIndexedPull<DTYPE_DISPATCH_TARGET>(task_desc, input_list, TILING_IDX);
+        } else {
+          ExecuteMoeShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc, input_list, input_list[TILING_IDX]);
+        }
+#else
+        if (task_desc.task_type == TaskType::TASK_MOE_OWNER_GET) { AscendC::Trap(); }
         ExecuteMoeShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc, input_list, input_list[TILING_IDX]);
+#endif
         break;
       default:
         break;
@@ -81,12 +168,41 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
  private:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+  __aicore__ inline uint32_t A5GmmVariant(const TaskDesc &task) {
+    if (task.extra_value_2 == 0x4D54494C) { return 2; }
+    return (task.extra_value_2 & 0xFFFF0000U) == 0x41350000U ? task.extra_value_2 & 0xFFFFU : 0;
+  }
+
+  __aicore__ inline GM_ADDR *A5ExpertInputs(const TaskDesc &task, GM_ADDR *resolved) {
+    if (this->home_experts_ == 0) { return input_list; }
+    const uint32_t expert = task.task_index / this->core_num;
+    GlobalTensor<int64_t> groups;
+    groups.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[2].input_position]));
+    const int64_t rows = groups.GetValue(expert) - (expert == 0 ? 0 : groups.GetValue(expert - 1));
+    if (rows == 0) { return input_list; }
+    for (uint32_t index = 0; index <= SHARED_PTRS_IDX; ++index) { resolved[index] = input_list[index]; }
+    const uint32_t position = task.inputs[1].input_position;
+    const int64_t matrix_bytes = static_cast<int64_t>(task.inputs[1].dim[1]) *
+                                 task.inputs[1].dim[2] * task.inputs[1].data_type;
+    const uint32_t projection = (position == 5 || position == 11) ? 0 : 1;
+    GM_ADDR weight = this->GetExpertMatrix(position, expert, matrix_bytes, projection);
+    // The dense A5 helper adds its physical expert offset after resolving the base.
+    resolved[position] = reinterpret_cast<GM_ADDR>(reinterpret_cast<uint64_t>(weight) - expert * matrix_bytes);
+    return resolved;
+  }
+#endif
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
     union {
       uint32_t bits;
       float value;
     } encoded = {};
     encoded.bits = task_desc.extra_value_0;
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+      return Bf16ClampLimit(encoded.value);
+    }
+#endif
     return encoded.value;
   }
 
@@ -110,6 +226,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
   __aicore__ inline void ExecuteSwiglu(const TaskDesc &task_desc) {
+    if (task_desc.inputs[0].tensor_type == 2) {
+      swi_glu(SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.outputs[0]), nullptr,
+              input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
+              GetSwiGluClampLimit(task_desc));
+      return;
+    }
+
     if (GetSwiGluTaskIteration(task_desc) == SwiGluTaskIteration::TILED) {
       ExecuteSwigluLegacy(task_desc);
       return;
@@ -239,7 +362,33 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     return groups.GetValue(batched ? experts - 1 : expert);
   }
 
+  __aicore__ inline void ExecuteSharedGroupedMatmul(const TaskDesc &task_desc) {
+    GM_ADDR tiling_address =
+      input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset + 2016 * AscendC::GetBlockIdx();
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+      if (task_desc.extra_value_0 == MulticoreBf16::SHARED_BLAZE_TAG &&
+          task_desc.outputs[0].data_type == sizeof(bfloat16_t)) {
+        MulticoreBf16::ExecuteSharedBlazeTask(
+          task_desc, SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.inputs[1]),
+          SharedTensorAddress(task_desc.outputs[0]), tiling_address, task_desc.task_index, this->core_num);
+        return;
+      }
+    }
+#endif
+    grouped_matmul(SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.inputs[1]), nullptr, nullptr,
+                   nullptr, nullptr, nullptr, SharedTensorAddress(task_desc.inputs[2]), nullptr,
+                   SharedTensorAddress(task_desc.outputs[0]),
+                   reinterpret_cast<GM_ADDR>(reinterpret_cast<__gm__ uint64_t *>(input_list[SHARED_PTRS_IDX])[7]),
+                   tiling_address, task_desc.inputs[0].transpose_flag == 1, task_desc.inputs[1].transpose_flag == 1);
+  }
+
   __aicore__ inline void ExecuteGroupedMatmul(TaskDesc task_desc) {
+    if (task_desc.inputs[0].tensor_type == 2) {
+      ExecuteSharedGroupedMatmul(task_desc);
+      return;
+    }
+
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
       DynamicData dynamic_data;
       getDynamicData(this->runtimeConfigPtr, &(dynamic_data));
@@ -425,5 +574,6 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
                                                 GM_ADDR *input_list) {
   MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
+  worker.PrepareIngressThresholds();
   worker.Process();
 }

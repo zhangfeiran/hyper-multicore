@@ -12,6 +12,8 @@
 #include <torch/library.h>
 
 TORCH_LIBRARY(hyper_multicore, m) {
+  m.def("mega_moe_indexed_backward_version() -> int", []() -> int64_t { return 1; });
+  m.def("mega_moe_shared_version() -> int", []() -> int64_t { return 4; });
   m.def("moe_token_permute_out(Tensor tokens, Tensor indices, Tensor(a!) output, Tensor(b!) mapping) "
         "-> (Tensor(a!), Tensor(b!))");
   m.def(
@@ -19,7 +21,7 @@ TORCH_LIBRARY(hyper_multicore, m) {
     "Tensor sorted_indices, Tensor probs, Tensor(a!) grad_permuted, Tensor(b!) grad_probs) "
     "-> (Tensor(a!), Tensor(b!))");
   m.def("mega_moe_compact_version() -> int", []() -> int64_t { return 1; });
-  m.def("mega_moe_transport_version() -> int", []() -> int64_t { return 1; });
+  m.def("mega_moe_transport_version() -> int", []() -> int64_t { return 7; });
   m.def("mega_moe_schedule_version() -> int", []() -> int64_t { return 3; });
   m.def("mega_moe_adaptive_gradient_version() -> int", []() -> int64_t { return 4; });
   m.def("mega_moe_local_gradient_version() -> int", []() -> int64_t { return 1; });
@@ -59,6 +61,8 @@ TORCH_LIBRARY(hyper_multicore, m) {
     "  Tensor runtime_config,"
     "  Tensor all_event_counters,"
     "  Tensor diagnostic_buffer,"
+    "  Tensor shared_ptrs,"
+    "  Tensor shared_runtime,"
     "  int rank_id,"
     "  int ep,"
     "  int expert_num,"
@@ -106,6 +110,8 @@ TORCH_LIBRARY(hyper_multicore, m) {
     "  Tensor runtime_config,"
     "  Tensor all_event_counters,"
     "  Tensor diagnostic_buffer,"
+    "  Tensor shared_ptrs,"
+    "  Tensor shared_runtime,"
     "  int rank_id,"
     "  int ep,"
     "  int expert_num,"

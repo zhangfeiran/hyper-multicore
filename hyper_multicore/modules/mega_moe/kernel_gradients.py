@@ -50,6 +50,17 @@ class _GradientBandReturn:
     rows: int
 
 
+@dataclass(frozen=True)
+class _UdmaGradientScratch:
+    """Borrow bounded per-helper banks and exclusive UDMA queue indices."""
+
+    scratch: torch.Tensor
+    chunk_elements: int
+    helpers: int = 4
+    qp_base: int = 16
+    peer_qps: tuple[tuple[int, ...], ...] = ()
+
+
 def _validate_gradient_pair(gradient: torch.Tensor, guest: torch.Tensor | None, *, local_bf16: bool = False) -> None:
     """Reject borrowed, cast-requiring or incompatible gradient storage."""
     expected = torch.bfloat16 if local_bf16 else torch.float32
@@ -77,6 +88,7 @@ def _matrix_record(
     bands: _GradientBandReturn | None = None,
     scratch: torch.Tensor | None = None,
     layout: OwnerGradientLayout | None = None,
+    udma: _UdmaGradientScratch | None = None,
 ) -> list[int]:
     """Encode one epoch with complete local producers before ordered peer reads."""
     home = route.plan.config.home_experts
@@ -111,6 +123,10 @@ def _matrix_record(
                 bands.owner.shape[1],
             )
         )
+    elif udma is not None:
+        values[0] = 9 if udma.peer_qps else 8
+        qp_field = 16 + len(incoming) * 3 + len(owned) * 4 if udma.peer_qps else udma.qp_base
+        values.extend((udma.scratch.data_ptr(), udma.chunk_elements, udma.helpers, qp_field))
     if layout is not None:
         values[0] = 13
         mapping_offset = 24 + len(incoming) * 3 + len(owned) * 4
@@ -123,6 +139,8 @@ def _matrix_record(
     if layout is not None:
         values.extend(layout.home_to_scratch)
         values.extend(layout.last_edges)
+    if udma is not None:
+        values.extend(qp for row in udma.peer_qps for qp in row)
     return values
 
 
@@ -162,6 +180,7 @@ def prepare_kernel_gradient_return(
     *,
     gradient_w13: torch.Tensor | None = None,
     guest_w13: torch.Tensor | None = None,
+    udma: _UdmaGradientScratch | None = None,
 ) -> KernelGradientReturn | None:
     """Encode proven projection fences and retain FP32 peer order and ACK leases."""
     pairs = _gradient_projection_pairs(plan, route, provider, gradient, guest, gradient_w13, guest_w13)
@@ -169,13 +188,15 @@ def prepare_kernel_gradient_return(
         return None
     local_bf16 = gradient.dtype == torch.bfloat16
     _validate_return_projections(plan, route, provider, pairs, local_bf16)
+    if udma is not None and (local_bf16 or getattr(provider, "gradient_bands", False)):
+        raise ValueError("UDMA projection gradients require FP32 and cannot share the band protocol")
     bands, completion = _prepare_gradient_storage(plan, provider, pairs)
     if local_bf16 and any(band is None for band in bands):
         raise ValueError("Local BF16 return cannot fall back to full-expert gradient publication")
     layout, scratch_resources = _prepare_owner_scratch(plan, route, pairs, local_bf16)
     records = [
         _matrix_record(route, provider, events, owner, replica, completion[index], bands[index],
-                       scratch_resources[index] if layout else None, layout)
+                       scratch_resources[index] if layout else None, layout, udma)
         for index, (events, owner, replica) in enumerate(pairs)
     ]
     values = records[0] if len(records) == 1 else [2, 3, 3 + len(records[0])] + records[0] + records[1]
@@ -187,7 +208,8 @@ def prepare_kernel_gradient_return(
     resources = tuple((band.owner for band in bands if band is not None))
     for tensor in (metadata, completion, *resources, *scratch_resources):
         tensor.record_stream(stream)
-    return KernelGradientReturn(metadata, completion, (1,) if len(records) == 1 else (1, 0), resources,
+    retained = resources + ((udma.scratch,) if udma is not None else ())
+    return KernelGradientReturn(metadata, completion, (1,) if len(records) == 1 else (1, 0), retained,
                                 scratch_resources)
 
 

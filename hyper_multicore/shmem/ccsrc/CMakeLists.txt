@@ -13,10 +13,7 @@
 # -----------------------------------------------------------------------------
 cmake_minimum_required(VERSION 3.18)
 project(hyper_multicore_shmem_torch LANGUAGES CXX)
-set(HP_SHMEM_SOC_TYPE "Ascend910B" CACHE STRING "SHMEM backend device generation")
-if(NOT HP_SHMEM_SOC_TYPE MATCHES "^(Ascend910B|Ascend950)$")
-    message(FATAL_ERROR "Unsupported SHMEM device generation: ${HP_SHMEM_SOC_TYPE}")
-endif()
+
 
 # Build the new SHMEM stack host side: the runtime static library
 # (runtime + CANN host adapter) and the pybind11 Torch binding module
@@ -25,6 +22,10 @@ endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(HP_SHMEM_SOC_TYPE "Ascend910B" CACHE STRING "SHMEM device generation")
+if(NOT HP_SHMEM_SOC_TYPE MATCHES "^(Ascend910B|Ascend950)$")
+    message(FATAL_ERROR "Unsupported SHMEM device generation: ${HP_SHMEM_SOC_TYPE}")
+endif()
 include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/hardening.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/torch_compat.cmake)
 include(CTest)

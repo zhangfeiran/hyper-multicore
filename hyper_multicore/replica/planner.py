@@ -181,3 +181,23 @@ def build_expert_replica_plan(
     ):
         copies = baseline
     return _materialize(counts, copies, config, capacity_limit, rank_nodes=nodes)
+
+
+# Keep the A5 calibrated and complete-search implementation isolated from the
+# target branch's production uncalibrated heuristic. Runtime adapters select
+# it explicitly when their policy requires it.
+from . import _calibrated_planner as _calibrated  # pylint: disable=wrong-import-position
+
+_build_expert_replica_plan = _calibrated._build_expert_replica_plan
+_complete_guest_search_enabled = _calibrated._complete_guest_search_enabled
+_projected_rank_nodes = _calibrated._projected_rank_nodes
+_improve_copies = _calibrated._improve_copies
+_balanced_edges = _calibrated._balanced_edges
+_bounded_copies = _calibrated._bounded_copies
+_uncalibrated_copies = _calibrated._uncalibrated_copies
+_QuotaSearchPrefix = _calibrated._QuotaSearchPrefix
+_prune_small_copies = _calibrated._prune_small_copies
+_fill_critical_guest_rows = _calibrated._fill_critical_guest_rows
+_quota_traffic = _calibrated._quota_traffic
+_adaptive_copies = _calibrated._adaptive_copies
+refine_replica_quotas = _calibrated.refine_replica_quotas

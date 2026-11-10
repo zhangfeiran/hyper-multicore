@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
+from copy import copy, deepcopy
+import struct
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -62,11 +63,11 @@ from hyper_multicore.modules.mega_moe.forward.tiling_tables import (
     get_up_proj_tiling_bytes,
 )
 from hyper_multicore.scheduler.config import (
-    FAST_DEPENDENCY_POLL_INTERVAL_US,
+    FAST_DEPENDENCY_POLL_INTERVAL_US, A5_GMM_KERNEL_TAG, TaskAiCoreType, TaskType, validate_runtime_config,
     TaskSplitValue,
 )
 from hyper_multicore.scheduler.runtime import serialize_runtime_config
-from hyper_multicore.scheduler.graph import ComputeGraph
+from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, SplitSpec, TensorSpec
 from hyper_multicore.torch import ops as multicore_ops
 
 from .diagnostics import _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
@@ -96,8 +97,13 @@ from .final_gradients import resolve_final_gradient_bf16
 from .inactive_tasks import RANK_LOCAL_GUEST_SUFFIX_SCHEDULE, GuestTaskPrefix, build_guest_task_prefixes
 from .inactive_tasks import replica_runtime_schedule
 from .replica_task_options import validate_replica_task_options
-from .spec import MegaMoeSpec
+from .spec import MegaMoeSpec, _route_metadata_rows, _supports_indexed_backward_pair
+from hyper_multicore.shmem._runtime import configured_udma_qp_count
+from .bf16_gmm_tiling import retile_a5_bf16
+from .shared import shared_tiling_bytes
+from .shared_schedule import bind_shared_diagnostic_graph
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
+from .udma_order import validate_udma_qp_owners
 
 
 @dataclass(frozen=True)
@@ -131,6 +137,10 @@ class MegaMoePlan:
 
     fwd_saved_dispatch_config: Any = None
     fwd_saved_task_prefixes: tuple[GuestTaskPrefix, ...] = ()
+    shared_forward_runtime: Any = None
+    shared_backward_runtime: Any = None
+    ingress_diagnostics: MegaKernelDiagnostics | None = None
+    row_credit_element_offset: int | None = None
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -166,10 +176,19 @@ class MegaMoePlan:
 record_plan_stream = MegaMoePlan.record_stream
 
 
+
+
 def _tensor_from_bytes(data: bytes, device: Any) -> torch.Tensor:
     """Copy serialized runtime data into a device uint8 tensor."""
     array = np.frombuffer(bytearray(data), dtype=np.uint8).copy()
     return torch.from_numpy(array).to(device=device, dtype=torch.uint8)
+
+
+def _gmm_tensor_from_bytes(data: bytes, spec: MegaMoeSpec, device: Any) -> torch.Tensor:
+    """Apply the qualified 32-Cube geometry without changing A3 tilings."""
+    if spec.num_cube_cores == 32:
+        data = retile_a5_bf16(data, spec.num_cube_cores)
+    return _tensor_from_bytes(data, device)
 
 
 def _resize_swiglu_tiling(data: bytes, num_cube_cores: int) -> bytes:
@@ -199,6 +218,14 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
         dispatch_mode=spec.dispatch_mode,
         communication_rows=spec._communication_rows,
     )
+
+
+def _resolve_a5_execution_spec(spec: MegaMoeSpec) -> MegaMoeSpec:
+    """Apply the shared-forward numerical policy to the actual plan rows."""
+    if (spec.num_cube_cores == 32 and spec.shared_intermediate_size
+            and spec.plan_tokens < 512 and spec.forward_shared_expert):
+        return replace(spec, forward_shared_expert=False)
+    return spec
 
 
 def _apply_gradient_order(spec, task_values, backward_data, backward_graph):
@@ -256,6 +283,8 @@ def _build_backward_runtime_graph(spec, task_values, weight_grad_dtype, compact)
         clamp_after_activation=spec.clamp_after_activation,
         apply_probs_before_fc2=spec.apply_probs_before_fc2,
         expert_weight_layout=spec.expert_weight_layout,
+        shared_intermediate_size=spec.shared_intermediate_size if spec.backward_shared_expert else 0,
+        indexed_backward=spec.backward_ingress_mode == "indexed",
     )
     if spec.replica_slots_per_rank:
         for operation in backward_graph.topological_sort():
@@ -299,19 +328,53 @@ def _build_runtime_artifacts(
         clamp_after_activation=spec.clamp_after_activation,
         apply_probs_before_fc2=spec.apply_probs_before_fc2,
         expert_weight_layout=spec.expert_weight_layout,
+        shared_intermediate_size=spec.shared_intermediate_size if spec.forward_shared_expert else 0,
     )
-    compact_requested = _compact_schedule_requested(spec)
+    compact_requested = (_compact_schedule_requested(spec) and not spec.shared_intermediate_size
+                         and spec.forward_ingress_mode == "legacy" and spec.backward_ingress_mode == "legacy")
     compact = compact_requested and compact_graph(
         forward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule)
     forward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(forward_graph)
-    forward_data = build_forward_config(forward_graph, task_values, spec.rank_id, spec.num_cube_cores)
+    forward_data = build_forward_config(
+        forward_graph,
+        task_values,
+        spec.rank_id,
+        spec.num_cube_cores,
+        shared_placement=spec.shared_placement,
+    )
+    if spec.forward_ingress_mode != "legacy":
+        if spec.num_cube_cores != 32 or spec.dispatch_mode != "pull" or spec.max_local_num_tokens is not None:
+            raise ValueError("Indexed ingress requires the static Ascend 950 pull plan")
+        for task in forward_data.all_tasks[:forward_data.task_num]:
+            if task.task_type == TaskType.TASK_SHMEM_GET_MEM:
+                task.extra_value_0 = 16
+                task.extra_value_1 = 3 if spec.forward_ingress_mode == "peer_dedup" else 1
+                task.inputs[1].dim[3] = spec.top_k
+            elif task.task_type == TaskType.TASK_GROUPED_MATMUL and task.inputs[0].tensor_type != 2:
+                # Blaze does not use the legacy GMM workspace tensor at port 16.
+                task.extra_value_2 = A5_GMM_KERNEL_TAG | 2
+    if spec.forward_ingress_mode == "peer_overlap":
+        _configure_owner_prefix(forward_data)
+    elif spec.forward_ingress_mode in ("peer_token", "peer_tile"):
+        _configure_token_prefix(forward_graph, forward_data, spec)
+        if spec.forward_ingress_mode == "peer_tile":
+            for task in forward_data.all_tasks[:forward_data.task_num]:
+                if task.task_type == TaskType.TASK_GROUPED_MATMUL and task.outputs[0].input_position == 7:
+                    task.dependent_event = 0xFFFFFFFF
+                    task.extra_value_0 = spec.top_k
+                    task.extra_value_2 = 0x4D54494C
+    if spec.forward_ingress_mode != "legacy":
+        validate_runtime_config(forward_data, task_values, spec.num_cube_cores)
+        _attach_route_metadata_input(forward_graph, spec)
+    task_values.shared_expert = False
     backward_graph = _build_backward_runtime_graph(spec, task_values, weight_grad_dtype, compact)
     backward_data = build_backward_config(
         backward_graph,
         task_values,
         spec.rank_id,
         spec.num_cube_cores,
+        shared_placement=spec.shared_placement,
     )
     policy = MegaMoeSchedulePolicy(
         vector_ready_queue=bool(compact),
@@ -329,6 +392,40 @@ def _build_runtime_artifacts(
     _apply_execution_policies(spec, task_values, forward_data, backward_data, backward_graph, overlap_w13)
     if spec.replica_slots_per_rank:
         backward_data.task_validator = validate_replica_task_options
+    if spec.backward_ingress_mode == "indexed":
+        if spec.num_cube_cores != 32 or not _supports_indexed_backward_pair(
+                spec.forward_ingress_mode, spec.dispatch_mode, spec.replica_slots_per_rank):
+            raise ValueError("Indexed backward requires an Ascend 950 indexed or B0 peer pull plan")
+        for task in backward_data.all_tasks[:backward_data.task_num]:
+            if task.task_type == TaskType.TASK_SHMEM_GET_MEM:
+                task.extra_value_0, task.extra_value_1 = 25, 8
+                task.inputs[1].dim[3] = spec.top_k
+            elif task.task_type == TaskType.TASK_GROUPED_MATMUL and task.inputs[0].tensor_type != 2:
+                task.extra_value_2 = A5_GMM_KERNEL_TAG | 3
+        validate_runtime_config(backward_data, task_values, spec.num_cube_cores)
+    if spec.shared_intermediate_size:
+        clamp = struct.unpack("<I", struct.pack("<f", spec.swiglu_limit or 0.0))[0]
+        for config in (forward_data, backward_data):
+            for task in config.all_tasks[:config.task_num]:
+                if task.inputs[0].tensor_type == 2 and task.task_type in (TaskType.TASK_SWI_GLU,
+                                                                       TaskType.TASK_SWI_GLU_GRAD):
+                    task.extra_value_0 = clamp
+    if spec.num_cube_cores == 32:
+        for direction, config in enumerate((forward_data, backward_data)):
+            for task in config.all_tasks[:config.task_num]:
+                if (task.task_type == TaskType.TASK_GROUPED_MATMUL and task.inputs[0].tensor_type != 2
+                        and task.extra_value_2 != 0x4D54494C):
+                    task.extra_value_2 = A5_GMM_KERNEL_TAG | (2 if direction == 0 else 3)
+                elif direction == 1 and task.task_type == TaskType.TASK_SHMEM_PUT_MEM_SIGNAL:
+                    task.extra_value_1 = 1
+    if spec.num_cube_cores == 32:
+        qp_count = configured_udma_qp_count()
+        if qp_count not in (16, 32):
+            raise ValueError("BF16 MegaMoE requires 16 or 32 UDMA QPs")
+        if qp_count != 32:
+            for config in (forward_data, backward_data):
+                validate_udma_qp_owners(config, ep_size=spec.ep_size, num_experts=spec.num_experts,
+                                        rank_id=spec.rank_id, qp_count=qp_count)
     return forward_graph, forward_data, backward_graph, backward_data
 
 
@@ -365,7 +462,13 @@ def _prepare_diagnostics(
             topology, num_cube_cores=spec.num_cube_cores, compact_queues=bool(forward_config.vector_ready_queue)
         ),
     }
-    if spec.apply_probs_before_fc2 or spec.batch_experts:
+    if spec.shared_intermediate_size and (spec.apply_probs_before_fc2 or spec.batch_experts):
+        def adapt_combined(graph, config):
+            return _adapt_mega_moe_diagnostic_graph(bind_shared_diagnostic_graph(graph, config), config)
+        options["graph_adapter"] = adapt_combined
+    elif spec.shared_intermediate_size:
+        options["graph_adapter"] = bind_shared_diagnostic_graph
+    elif spec.apply_probs_before_fc2 or spec.batch_experts:
         options["graph_adapter"] = _adapt_mega_moe_diagnostic_graph
     copies = (spec.ep_size - 1) * spec.replica_slots_per_rank
     groups = min(4, spec.num_cube_cores)
@@ -380,13 +483,17 @@ def _prepare_diagnostics(
     return (
         prepare_mega_kernel_diagnostics(
             forward_graph, forward_config,
-            parameter_count=PROBABILITY_POSITION_FORWARD + 1 if spec.apply_probs_before_fc2 else 16,
+            parameter_count=max(PROBABILITY_POSITION_FORWARD + 1 if spec.apply_probs_before_fc2 else 16,
+                                17 if spec.forward_ingress_mode != "legacy" else 16,
+                                28 if spec.shared_intermediate_size and spec.forward_shared_expert else 16),
             extra_aic_records=weight_records, **options
         ),
         prepare_mega_kernel_diagnostics(
             backward_graph,
             backward_config,
-            parameter_count=PROBABILITY_POSITION_BACKWARD + 1 if spec.apply_probs_before_fc2 else 20,
+            parameter_count=max(PROBABILITY_POSITION_BACKWARD + 1 if spec.apply_probs_before_fc2 else 20,
+                                26 if spec.backward_ingress_mode == "indexed" else 20,
+                                35 if spec.shared_intermediate_size and spec.backward_shared_expert else 20),
             extra_aiv_records=gradient_records,
             extra_aic_records=producer_records + weight_records,
             **options,
@@ -484,6 +591,128 @@ def _plan_gmm_options(spec: MegaMoeSpec, forward_config: Any) -> tuple[dict, dic
     return gmm_options, backward_gmm_options
 
 
+def _configure_owner_prefix(config: Any) -> None:
+    """Put every independent owner GET before every compute-dependent vector task."""
+    queued = [int(config.vector_task_indices[i]) for i in range(config.task_index_num[1])]
+    owners = [i for i in queued if config.all_tasks[i].task_type == TaskType.TASK_SHMEM_GET_MEM]
+    owner_set = set(owners)
+    for index in owners:
+        task = config.all_tasks[index]
+        task.task_type = TaskType.TASK_MOE_OWNER_GET
+        task.extra_value_1 = 4
+        task.dependent_event = 0xFFFFFFFF
+    for position, index in enumerate(owners + [i for i in queued if i not in owner_set]):
+        config.vector_task_indices[position] = index
+
+
+def _attach_route_metadata_input(graph: ComputeGraph, spec: MegaMoeSpec) -> None:
+    """Expose the complete port-16 binding without adding a Device task."""
+    rows = _route_metadata_rows(spec.routed_slots, spec.num_experts, spec.ep_size, spec.forward_ingress_mode)
+    metadata = TensorSpec("route_metadata_workspace", [rows, 16], param_position=16, dtype_size=1)
+    node = OperatorNode(
+        name="route_metadata", op_type=OpType.AIV_PIPELINE, inputs=[metadata], outputs=[],
+        param_positions=[16], split_value=1,
+        split_spec=SplitSpec(split_inputs=None, task_num_fn=lambda _: 0),
+        tiling_position=-1, fill_config=None,
+    )
+    graph.add_op(node)
+    if not (spec.shared_intermediate_size and spec.forward_shared_expert):
+        graph.add_edge(node, graph.get_op("dispatch"))
+    # A new predecessor would reorder the independent shared branch after task
+    # IDs have been assigned. This zero-task node only describes a Host binding.
+    source = graph.get_op("dispatch").inputs[1]
+    source.shape = [spec.local_num_tokens, spec.hidden_size]
+
+
+def _configure_token_prefix(graph: ComputeGraph, config: Any, spec: MegaMoeSpec) -> None:
+    """Compact canonical descriptors while preserving every math and Combine queue."""
+    dispatch = graph.get_op("dispatch")
+    old_dispatch_count = dispatch.task_num
+    token_jobs = spec.ep_size * (spec.local_num_tokens // spec.dispatch_split)
+    if token_jobs > old_dispatch_count or token_jobs == 0:
+        raise RuntimeError("Token dispatch exceeds the canonical descriptor reservation")
+    if any(bytes(event).strip(b"\0") for event in config.all_events):
+        raise RuntimeError("Token compaction cannot remap auxiliary EventDesc task references")
+    original = [type(task).from_buffer_copy(bytes(task)) for task in config.all_tasks[:config.task_num + 1]]
+    queues = [list(indices[:count]) for indices, count in zip(
+        (config.cube_task_indices, config.vector_task_indices, config.mix_task_indices), config.task_index_num[:3])]
+    event_base = original[0].trigger_event
+    for index in range(token_jobs):
+        task = original[index]
+        task.task_type = TaskType.TASK_MOE_TOKEN_GET
+        task.task_aicore_type = TaskAiCoreType.TASK_AICORE_VECTOR
+        task.task_index = index
+        task.task_split_num = token_jobs
+        task.task_split_value = spec.dispatch_split
+        task.trigger_event = event_base
+        task.dependent_event = 0xFFFFFFFF
+        task.extra_value_1 = 6 if spec.forward_ingress_mode == "peer_tile" else 5
+        config.all_tasks[index] = task
+    for index, task in enumerate(original[old_dispatch_count:], start=token_jobs):
+        config.all_tasks[index] = task
+    shift = old_dispatch_count - token_jobs
+    for kind, (indices, queued) in enumerate(zip(
+            (config.cube_task_indices, config.vector_task_indices, config.mix_task_indices), queues)):
+        retained = [int(index) - shift for index in queued if index >= old_dispatch_count]
+        if kind == 1:
+            retained = list(range(token_jobs)) + retained
+        config.task_index_num[kind] = len(retained)
+        for position, index in enumerate(retained):
+            indices[position] = index
+    config.task_num -= shift
+    dispatch.task_num = token_jobs
+    dispatch.diagnostic_name = "DispatchToken"
+    dispatch.split_spec = replace(dispatch.split_spec, task_num_fn=lambda topology: (
+        topology.ep * (topology.per_expert_seq_to_other // spec.dispatch_split)))
+
+
+def _ingress_graph(forward_graph: ComputeGraph) -> ComputeGraph:
+    """Describe only the tasks actually scheduled by the independent prepass."""
+    graph = ComputeGraph()
+    metadata = copy(forward_graph.get_op("route_metadata"))
+    metadata.predecessors = []
+    metadata.successors = []
+    graph.add_op(metadata)
+    dispatch = copy(forward_graph.get_op("dispatch"))
+    dispatch.predecessors = []
+    dispatch.successors = []
+    dispatch.diagnostic_name = "DispatchDedup"
+    graph.add_op(dispatch).add_edge(metadata, dispatch)
+    return graph
+
+
+def _row_credit_element_offset(config: Any, spec: MegaMoeSpec) -> int | None:
+    """Resolve the device INT32 threshold slice from actual Up-projection dependencies."""
+    if spec.forward_ingress_mode not in ("peer_overlap", "peer_token"):
+        return None
+    start = int(config.all_tasks[0].trigger_event)
+    for task in config.all_tasks[:config.task_num]:
+        if task.task_type == TaskType.TASK_GROUPED_MATMUL and task.outputs[0].input_position == 7:
+            expert = task.task_index // spec.num_cube_cores
+            if task.dependent_event != start + expert:
+                raise RuntimeError("Owner row-credit events do not match the Up projection")
+    return type(config).all_event_num_triggers.offset // 4 + start
+
+
+def _build_ingress_config(forward_config: Any) -> Any:
+    """Queue only independent owner GETs; rely on outer all-worker/peer completion."""
+    config = type(forward_config).from_buffer_copy(bytes(forward_config))
+    task_ids = [int(config.vector_task_indices[index]) for index in range(config.task_index_num[1])]
+    gets = [index for index in task_ids if config.all_tasks[index].task_type == TaskType.TASK_SHMEM_GET_MEM]
+    config.task_num = len(gets)
+    config.task_index_num[0] = 0
+    config.task_index_num[1] = len(gets)
+    config.all_event_num_triggers[0] = len(gets)
+    for position, index in enumerate(gets):
+        config.vector_task_indices[position] = index
+        task = config.all_tasks[index]
+        task.dependent_event = 0xFFFFFFFF
+        # Dummy 0 is never waited on. No per-expert credit is published here.
+        task.trigger_event = 0
+        task.extra_value_1 = 2
+    return config
+
+
 def build_mega_moe_plan(
     spec: MegaMoeSpec, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
 ) -> MegaMoePlan:
@@ -497,6 +726,10 @@ def build_mega_moe_plan(
     Returns:
         Rank-local forward and backward runtime resources.
     """
+    spec = _resolve_a5_execution_spec(spec)
+    if spec.apply_probs_before_fc2 and (spec.forward_ingress_mode != "legacy" or spec.backward_ingress_mode == "indexed"
+                                         or spec.shared_intermediate_size):
+        raise ValueError("Pre-FC2 probability input is not yet qualified with indexed routing or shared experts")
     if weight_grad_dtype not in (None, torch.float32):
         raise ValueError("Partial expert gradients support only the native dtype or FP32")
     if spec._batch_empty_combine and (not _soc_name(torch.device(device)).startswith("Ascend910_93")):
@@ -524,11 +757,27 @@ def build_mega_moe_plan(
     fwd_diagnostics, bwd_diagnostics = _prepare_diagnostics(
         spec, forward_graph, forward_config, backward_graph, backward_config, device
     )
+    ingress_diagnostics = None
+    if spec.forward_ingress_mode == "peer_dedup":
+        topology = _build_task_values(spec)
+        topology.rank_id = spec.rank_id
+        ingress_diagnostics = prepare_mega_kernel_diagnostics(
+            _ingress_graph(forward_graph), _build_ingress_config(forward_config), parameter_count=17,
+            kernel_name="mega_moe_ingress", device=device,
+            rank=dist.get_rank() if dist.is_initialized() else spec.rank_id,
+            **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
+        )
     gmm_options, backward_gmm_options = _plan_gmm_options(spec, forward_config)
     prefix_options = _physical_prefix_options(spec)
     return MegaMoePlan(
         spec=spec,
         weight_grad_dtype=weight_grad_dtype,
+        ingress_diagnostics=ingress_diagnostics,
+        shared_forward_runtime=(_tensor_from_bytes(shared_tiling_bytes(spec, backward=False), device)
+                                if spec.shared_intermediate_size and spec.forward_shared_expert else None),
+        shared_backward_runtime=(_tensor_from_bytes(shared_tiling_bytes(spec, backward=True), device)
+                                 if spec.shared_intermediate_size and spec.backward_shared_expert else None),
+        row_credit_element_offset=_row_credit_element_offset(forward_config, spec),
         **saved_options,
         fwd_task_prefixes=(
             build_guest_task_prefixes(forward_config, **prefix_options) if spec.replica_slots_per_rank else ()
@@ -547,8 +796,8 @@ def build_mega_moe_plan(
         bwd_runtime_no_replica_reuse_dispatch=original_reuse if fallback else False,
         forward_graph=forward_graph,
         fwd_diagnostics=fwd_diagnostics,
-        up_proj_tiling=_tensor_from_bytes(
-            get_up_proj_tiling_bytes(forward_graph.get_op("up_proj").split_value, **gmm_options), device
+        up_proj_tiling=_gmm_tensor_from_bytes(
+            get_up_proj_tiling_bytes(forward_graph.get_op("up_proj").split_value, **gmm_options), spec, device
         ),
         swiglu_tiling=_tensor_from_bytes(
             _resize_swiglu_tiling(
@@ -559,25 +808,30 @@ def build_mega_moe_plan(
             ),
             device,
         ),
-        down_proj_tiling=_tensor_from_bytes(
-            get_down_proj_tiling_bytes(forward_graph.get_op("down_proj").split_value, **gmm_options), device
+        down_proj_tiling=_gmm_tensor_from_bytes(
+            get_down_proj_tiling_bytes(forward_graph.get_op("down_proj").split_value, **gmm_options),
+            spec, device,
         ),
         backward_graph=backward_graph,
         bwd_diagnostics=bwd_diagnostics,
         bwd_diagnostics_no_replica=fallback,
-        act_grad_tiling=_tensor_from_bytes(
-            get_act_grad_tiling_bytes(backward_graph.get_op("act_grad").split_value, **backward_gmm_options), device
+        act_grad_tiling=_gmm_tensor_from_bytes(
+            get_act_grad_tiling_bytes(backward_graph.get_op("act_grad").split_value, **backward_gmm_options),
+            spec, device,
         ),
-        gate_grad_tiling=_tensor_from_bytes(
-            get_gate_grad_tiling_bytes(backward_graph.get_op("gate_grad").split_value, **backward_gmm_options), device
+        gate_grad_tiling=_gmm_tensor_from_bytes(
+            get_gate_grad_tiling_bytes(backward_graph.get_op("gate_grad").split_value, **backward_gmm_options),
+            spec, device,
         ),
-        w1_grad_tiling=_tensor_from_bytes(
+        w1_grad_tiling=_gmm_tensor_from_bytes(
             get_w1_grad_tiling_bytes(backward_graph.get_op("w1_grad").split_value,
-                                        expert_weight_layout=spec.expert_weight_layout, **backward_gmm_options), device
+                                    expert_weight_layout=spec.expert_weight_layout, **backward_gmm_options),
+            spec, device,
         ),
-        w2_grad_tiling=_tensor_from_bytes(
+        w2_grad_tiling=_gmm_tensor_from_bytes(
             get_w2_grad_tiling_bytes(backward_graph.get_op("w2_grad").split_value,
-                                        expert_weight_layout=spec.expert_weight_layout, **backward_gmm_options), device
+                                    expert_weight_layout=spec.expert_weight_layout, **backward_gmm_options),
+            spec, device,
         ),
         swiglu_grad_tiling=_tensor_from_bytes(
             _resize_swiglu_tiling(

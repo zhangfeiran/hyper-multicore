@@ -85,7 +85,7 @@ def _expert_events_join_readers(
         elif act_first and task.outputs[0].input_position == _WEIGHT2_GRAD:
             late_reads[expert].append(task)
     for task in vector_tasks:
-        if task.task_type != TaskType.TASK_SWI_GLU_GRAD:
+        if task.task_type != TaskType.TASK_SWI_GLU_GRAD or task.inputs[0].tensor_type == 2:
             continue
         if task.task_split_num < num_experts or task.task_split_num % num_experts:
             return False

@@ -70,6 +70,16 @@ npu_op_kernel_sources(ascendc_kernels
     SOC_SERIES ${ASCEND_COMPUTE_UNIT}
 )
 
+if(ASCEND_COMPUTE_UNIT STREQUAL "ascend950")
+    npu_op_kernel_options(ascendc_kernels PanguMxfp8TaskGraph OPTIONS
+        -I${HP_MULTICORE_SOURCE_ROOT}/pangu_mxfp8_task_graph/op_kernel
+        -I${HP_MULTICORE_SOURCE_ROOT}/pangu_mxfp8_task_graph/op_kernel/cgmct/utils)
+    npu_op_kernel_sources(ascendc_kernels
+        OP_TYPE PanguMxfp8TaskGraph
+        KERNEL_DIR ./pangu_mxfp8_task_graph/op_kernel
+        KERNEL_FILE pangu_mxfp8_task_graph.cpp
+        SOC_SERIES ${ASCEND_COMPUTE_UNIT})
+endif()
 
 npu_op_package_add(${package_name}
     LIBRARY ascendc_kernels

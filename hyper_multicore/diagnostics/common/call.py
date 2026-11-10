@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +39,7 @@ class LaunchContext:
     parameters: Sequence[Any]
     direction: str
     fallback_event_counters: Any
+    tags: Mapping[str, str] | None = None
 
     def ordinary_arguments(self) -> LaunchArguments:
         """Reuse the original runtime and counters without allocating device storage."""

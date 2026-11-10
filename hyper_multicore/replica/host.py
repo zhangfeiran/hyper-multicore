@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Optional exact integer primitives for the no-table replica planner."""
+"""Optional CPU primitives preserving exact planner and calibration policy."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from types import ModuleType
 @lru_cache(maxsize=1)
 def _native_backend() -> ModuleType | None:
     """Load a prebuilt CPython extension without initializing Torch or CANN."""
-    if os.environ.get("HYPER_MULTICORE_REPLICA_HOST_NATIVE", "1") == "0":
+    if os.environ.get("HYPER_MULTICORE_REPLICA_HOST_NATIVE", os.environ.get("HYPER_PARALLEL_REPLICA_HOST_NATIVE", "1")) == "0":
         return None
     suffix = sysconfig.get_config_var("EXT_SUFFIX")
     path = Path(__file__).parent / "_host_kernel" / f"_replica_host{suffix}"
@@ -70,3 +70,21 @@ def _materialize_dispatch(
     if module is None or not hasattr(module, "materialize_dispatch"):
         return None
     return module.materialize_dispatch(counts, copies, home, budget, nodes)
+
+
+def _rank_compute(
+    experts: dict[int, int], source: tuple[int, ...] | None, home: int, rank: int,
+    durations: dict[int, tuple[float, float]], forward: tuple, backward: tuple,
+) -> tuple[float, float, int] | None:
+    """Accumulate home/guest bins in insertion order using the original FP64 math."""
+    module = _native_backend()
+    return None if module is None or not hasattr(module, "rank_compute") else module.rank_compute(experts, source, home, rank, durations, forward, backward)
+
+
+def _ordered_compute(
+    experts: dict[int, int], home: int, rank: int,
+    compute: tuple, owner: tuple, enabled: bool,
+) -> tuple[float, tuple[tuple[int, float], ...]] | None:
+    """Interpolate immutable rows and sum owned experts in insertion order."""
+    module = _native_backend()
+    return None if module is None or not hasattr(module, "ordered_compute") else module.ordered_compute(experts, home, rank, compute, owner, enabled)

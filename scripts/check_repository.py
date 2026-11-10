@@ -22,6 +22,16 @@ import re
 import runpy
 
 ROOT = Path(__file__).absolute().parents[1]
+_LEGACY_ENVIRONMENT = {
+    "HYPER_PARALLEL_MX_B0_BACKWARD_DAG", "HYPER_PARALLEL_MX_GRADIENT_UDMA",
+    "HYPER_PARALLEL_REPLICA_CALIBRATION_DIR", "HYPER_PARALLEL_REPLICA_COMPLETE_GUEST_SEARCH",
+    "HYPER_PARALLEL_REPLICA_COST_MODEL", "HYPER_PARALLEL_REPLICA_HOST_NATIVE",
+    "HYPER_PARALLEL_REPLICA_METADATA_REUSE", "HYPER_PARALLEL_REPLICA_PROJECTED_GUEST_SEARCH",
+    "HYPER_PARALLEL_REPLICA_WEIGHT_RESIDENCY", "HYPER_PARALLEL_SHMEM_",
+    "HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", "HYPER_PARALLEL_SHMEM_DATA_ENGINE",
+    "HYPER_PARALLEL_SHMEM_FIXED_HEAP_REPACK", "HYPER_PARALLEL_SHMEM_HEAP_SIZE",
+    "HYPER_PARALLEL_SHMEM_TIMEOUT_SEC", "HYPER_PARALLEL_SHMEM_UDMA_QP_NUM",
+}
 
 
 def main() -> None:
@@ -65,19 +75,24 @@ def main() -> None:
         }:
             source = path.read_text(encoding="utf-8")
             old_name = "hyper" + "_parallel"
-            pattern = rf"{old_name}[/\\]|{old_name}::|{old_name.upper()}_|torch\.ops\.{old_name}"
+            pattern = rf"{old_name}[/\\]|{old_name}::|torch\.ops\.{old_name}"
             if re.search(pattern, source):
                 failures.append(f"Old executable identity/path: {path}")
+            legacy_names = set(re.findall(rf"{old_name.upper()}_[A-Z0-9_]+", source))
+            unsupported = legacy_names - _LEGACY_ENVIRONMENT
+            if unsupported:
+                failures.append(f"Unsupported legacy identifiers in {path}: {sorted(unsupported)}")
     dependency_helpers = runpy.run_path(str(ROOT / "hyper_multicore/_build/prepare_dependencies.py"))
     dependencies = dependency_helpers["load_dependency_locks"]()
     patches = 0
     for dependency in dependencies.values():
         for revision in dependency_helpers["dependency_revisions"](dependency).values():
-            for patch in revision.get("patches", []):
-                patches += 1
-                path = ROOT / patch["path"]
-                if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != patch["sha256"]:
-                    failures.append(f"Locked patch missing or changed: {path}")
+            for key in ("patches", "mxfp8_patches"):
+                for patch in revision.get(key, []):
+                    patches += 1
+                    path = ROOT / patch["path"]
+                    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != patch["sha256"]:
+                        failures.append(f"Locked patch missing or changed: {path}")
     if failures:
         raise SystemExit("\n".join(failures))
     print(json.dumps({"python_files_parsed": checked, "locked_patches_verified": patches,

@@ -26,7 +26,8 @@ __aicore__ inline bool IsGradientBandProtocol(uint64_t protocol) {
 }
 
 __aicore__ inline uint32_t GradientRecordHeaderWords(__gm__ const uint64_t *record) {
-  return record[0] == 13 ? 24 : (IsGradientBandProtocol(record[0]) ? 18 : 12);
+  return record[0] == 13 ? 24 : (IsGradientBandProtocol(record[0]) ? 18 :
+                                  ((record[0] == 8 || record[0] == 9) ? 16 : 12));
 }
 
 __aicore__ inline uint32_t GradientScratchIndex(__gm__ const uint64_t *record, uint32_t expert) {

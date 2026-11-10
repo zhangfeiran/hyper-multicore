@@ -230,6 +230,7 @@ def signal(remote_signal: torch.Tensor, value: int, target_pe: int, *, operation
         remote_signal: Contiguous symmetric Tensor view containing one ``int32`` element.
         value: Signed 32-bit update value.
         target_pe: Destination in CANN Root WORLD coordinates.
+        use_sdma: Use ACL stream copies to directly mapped peers; reject unmapped peers.
         operation: Exactly ``"set"`` or ``"add"``.
 
     Raises:

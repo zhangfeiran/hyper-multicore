@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU contracts and deterministic heuristic planning for bounded expert replicas."""
+"""Shared bounded expert replication, independent of execution backend."""
 
 from .capacity import ExpertReplicaConfig
+from .cost import ExpertReplicaCostModel
+from .device import DeviceExpertExecutionPlan, build_device_expert_replica_plan
 from .plan import ExpertExecutionPlan, ExpertReplicaTransfer
 from .planner import build_expert_replica_plan
 
-__all__ = ["ExpertReplicaConfig", "ExpertExecutionPlan", "ExpertReplicaTransfer", "build_expert_replica_plan"]
+__all__ = ["ExpertReplicaCostModel", "ExpertReplicaConfig", "ExpertExecutionPlan", "ExpertReplicaTransfer",
+           "build_expert_replica_plan", "DeviceExpertExecutionPlan", "build_device_expert_replica_plan"]

@@ -260,6 +260,28 @@
             -2
           ],
           "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "shared_ptrs",
+          "index": 23,
+          "dtype": "uint8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "shared_runtime",
+          "index": 24,
+          "dtype": "uint8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
         }
       ],
       "outputs": [

@@ -296,8 +296,16 @@ class TestMegaMoeExperts(unittest.TestCase):
                 """Change one peer agreement field while preserving all unrelated metadata."""
                 self.assertIs(kwargs["group"], resources.spec.ep_group)
                 if kind == "layout":
-                    self.assertEqual(value[2], "EOI")
-                    peer = (value[0], value[1], "EIO", *value[3:])
+                    if isinstance(value[2], str):
+                        self.assertEqual(value[2], "EOI")
+                        peer = (value[0], value[1], "EIO", *value[3:])
+                    else:
+                        peer_specification = list(value[2][0])
+                        layout_index = peer_specification.index("EOI")
+                        peer_specification[layout_index] = "EIO"
+                        peer = list(value)
+                        peer[2] = (tuple(peer_specification),)
+                        peer = tuple(peer)
                 else:
                     peer = ("dynamic_tokens_v1", *value[1:]) if kind == "wire" else ("different",)
                 output[:] = [value, peer]

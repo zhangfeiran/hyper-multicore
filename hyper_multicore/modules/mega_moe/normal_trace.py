@@ -278,16 +278,16 @@ def capture_forward_tasks(capacity: int = 1024) -> Iterator[ForwardTaskTrace]:
 
 
 def launch_normal_forward(
-    parameters: tuple, attributes: tuple[int, ...], *, num_workers: int | None = None
+    parameters: tuple, attributes: tuple[int, ...], *, num_workers: int | None = None, **kernel_options: Any
 ) -> None:
     """Use the original wrapper unless an explicit scoped ordinary trace is active."""
     session = _current_trace()
     if session is None:
-        multicore_ops.mega_moe(*parameters, *attributes)
+        multicore_ops.mega_moe(*parameters, *attributes, **kernel_options)
         return
     capture = session.prepare(parameters, attributes, num_workers=num_workers)
     multicore_ops.mega_moe_with_diagnostic_buffer(
-        *parameters[:-2], capture.runtime_config, parameters[-1], capture.buffer, *attributes,
+        *parameters[:-2], capture.runtime_config, parameters[-1], capture.buffer, *attributes, **kernel_options,
     )
 
 

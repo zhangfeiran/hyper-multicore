@@ -183,6 +183,9 @@ class TestMegaMoeFunction(unittest.TestCase):
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
         context.plan.spec.apply_probs_before_fc2 = False
+        context.plan.spec.replica_slots_per_rank = 0
+        context.replica_route = None
+        context.workspace.replica_provider = None
         execution = function_module._BackwardExecution(
             dispatch=torch.ones(1),
             grad_x=torch.ones(1),
@@ -345,7 +348,9 @@ class TestMegaMoeFunction(unittest.TestCase):
         plan.bwd_diagnostics = MegaKernelDiagnostics(runtime)
         plan.fwd_runtime_config = plan.bwd_runtime_config = None
         workspace = Mock(
+            replica_inbox=None,
             replica_provider=None,
+            replica_runtime_images={},
             expert_capacity=128,
             expert_buffer=torch.empty(128, 4),
             routed_buffer=torch.empty(8 if vary_tokens else 4, 4),

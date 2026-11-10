@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any
 from weakref import ReferenceType, ref
 
@@ -111,6 +112,11 @@ class _ReplicaWeightCache:
 
     def prepare(self, weights: tuple[torch.Tensor, ...], route: ReplicaRoute) -> _WeightCopies:
         """Check current owner values and invalidate every slot being reassigned."""
+        enabled = os.environ.get('HYPER_PARALLEL_REPLICA_WEIGHT_RESIDENCY', '1')
+        if enabled not in ('0', '1'):
+            raise ValueError('HYPER_PARALLEL_REPLICA_WEIGHT_RESIDENCY must be 0 or 1')
+        if enabled == '0':
+            self.clear()
         snapshot = _WeightSnapshot.capture(weights)
         reused, updates, required = set(), [], set()
         home = route.plan.config.home_experts

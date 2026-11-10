@@ -35,8 +35,9 @@
 #include "l1_tensor_dump.h"
 #include "vector_ready_queue.h"
 
-
+#include "get_mem.h"
 #include "replica_gradient.h"
+#include "replica_gradient_udma.h"
 #include "gradient_band.h"
 #include "gradient_band_observer.h"
 
@@ -74,6 +75,8 @@ template <typename Derived, VectorWorkerPolicy WorkerPolicy = VectorWorkerPolicy
           RuntimeStorageBoundsPolicy StorageBoundsPolicy = RuntimeStorageBoundsPolicy::NATIVE_TILING>
 class KernelWorkerBase {
  public:
+  static constexpr uint32_t SHARED_PTRS_IDX = 0xFFFFFFFF;
+
   __aicore__ inline KernelWorkerBase() {}
 
   static constexpr uint32_t PROFILE_DESC_WAIT_DEPENDENCY = 0x10000;
@@ -129,8 +132,15 @@ class KernelWorkerBase {
     // for operators whose sixth field is not the AIC count (for example mHC).
     this->vector_num = getNumWorkers(this->runtimeConfigPtr);
     this->core_num = this->vector_num / 2;
+    if constexpr (Derived::SHARED_PTRS_IDX != 0xFFFFFFFF) {
+      if (replica_gradient_config_ == nullptr &&
+          input_list[Derived::SHARED_PTRS_IDX] != input_list[Derived::EVENT_IDX] &&
+          reinterpret_cast<__gm__ uint64_t *>(input_list[Derived::SHARED_PTRS_IDX])[0] == 1) {
+        shared_vector_count_ = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 4) / 128;
+      }
+    }
     const auto header = reinterpret_cast<__gm__ RuntimeHeader *>(runtimeConfigPtr);
-    ready_queue_ = header->vector_ready_queue == 1 &&
+    ready_queue_ = shared_vector_count_ == 0 && header->vector_ready_queue == 1 &&
                    getDiagnosticMode(runtimeConfigPtr) == DiagnosticMode::NORMAL;
     // Guest bands are published by Cube producers. Ranks without owner merges
     // can use every AIV, then retain their guest buffers until the owner ACKs.
@@ -226,6 +236,8 @@ class KernelWorkerBase {
           AscendC::Trap();
         }
         replica_gradient_config_ = reinterpret_cast<GM_ADDR>(extension[9]);
+        auto config = reinterpret_cast<__gm__ uint64_t *>(replica_gradient_config_);
+        replica_udma_legacy_qp_bank_ = config[0] == 8 || (config[0] == 2 && config[config[1]] == 8);
       }
     }
   }
@@ -248,6 +260,7 @@ class KernelWorkerBase {
   CycleTraceRecorder *replica_trace_ = nullptr;
   uint32_t replica_trace_task_ = 0;
   GM_ADDR replica_gradient_config_ = nullptr;
+  bool replica_udma_legacy_qp_bank_ = false;
 
   __aicore__ inline void CompleteGuestBandGradients() {
 #ifndef HMC_RUNTIME_CUBE
@@ -298,13 +311,19 @@ class KernelWorkerBase {
     const int32_t rank = config[1], slots = config[2], epoch = config[3];
     const int64_t elements = config[4];
     const int32_t incoming_count = config[10], owned_count = config[11];
-    if ((config[0] != 1 && !IsGradientBandProtocol(config[0])) || rank < 0 || rank >= ep || slots <= 0 ||
+    if ((config[0] != 1 && config[0] != 8 && config[0] != 9 && !IsGradientBandProtocol(config[0])) || rank < 0 || rank >= ep || slots <= 0 ||
         epoch <= 0 || elements <= 0 || incoming_count < 0 || incoming_count > slots ||
         owned_count < 0 || owned_count > ep * slots || (config[0] == 11 && owned_count != 0)) {
       AscendC::Trap();
     }
     if (config[0] == 13) {
       ValidateFinalGradient(config);
+    }
+    if (config[0] == 8 || config[0] == 9) {
+      ValidateReplicaGradientUdmaLayout(reinterpret_cast<GM_ADDR>(config[12]), config[13], config[14]);
+      if (core_num != 4) AscendC::Trap();
+      const uint64_t qp_field = config[0] == 8 ? 16 : 16 + incoming_count * 3 + owned_count * 4;
+      if (config[15] != qp_field) AscendC::Trap();
     }
   }
 
@@ -368,8 +387,15 @@ class KernelWorkerBase {
       WaitForDependency(owned[index * 4 + 3]);
       WaitReplicaCompletion(ready + (peer * slots + slot) * DATA_CACHE_LINE_SIZE, epoch);
       const uint64_t start = profiling ? trace.Now() : 0;
-      AddReplicaGradient(output + owner * elements * sizeof(float), guest + slot * elements * sizeof(float),
-                          elements, peer, worker, core_num);
+      if (config[0] == 8 || config[0] == 9) {
+        const uint64_t qp = config[0] == 8 ? config[15] + worker : config[config[15] + peer * 4 + worker];
+        if (qp >= 32) AscendC::Trap();
+        AddReplicaGradientUdma(output + owner * elements * sizeof(float), guest + slot * elements * sizeof(float),
+            elements, peer, worker, core_num, reinterpret_cast<GM_ADDR>(config[12]), config[13], qp);
+      } else {
+        AddReplicaGradient(output + owner * elements * sizeof(float), guest + slot * elements * sizeof(float),
+                            elements, peer, worker, core_num);
+      }
       if (profiling) {
         trace.Record(profile_desc, 0, peer, rank * (home_experts_ + slots) + owner, start, trace.Now());
       }
@@ -646,6 +672,14 @@ class KernelWorkerBase {
     }
   }
 
+  __aicore__ inline GM_ADDR SharedTensorAddress(const TensorDesc &desc) {
+    GM_ADDR address = input_list[desc.input_position];
+    if (desc.tensor_type == 2) {
+      address = reinterpret_cast<GM_ADDR>(reinterpret_cast<__gm__ uint64_t *>(address)[desc.dynamic_dim + 1]);
+    }
+    return address + desc.base_ptr_offset * desc.data_type;
+  }
+
   // Share the compute call site across diagnostics. Replicating the entire
   // inlined task dispatcher for each mode exceeds the AIV scalar stack limit.
   __aicore__ inline void ProcessTasks(DiagnosticMode mode, CycleTraceRecorder &recorder) {
@@ -660,12 +694,22 @@ class KernelWorkerBase {
     }
     uint32_t block_idx = GetVectorScheduleIndex();
     if (block_idx == INVALID_VECTOR_SCHEDULE_INDEX) return;
-    const uint32_t count = this->vector_task_num;
+    uint32_t count = this->vector_task_num;
+    if (shared_vector_count_ != 0) {
+      count = this->worker_id_ % 2 == 0 ? this->vector_task_num - 1
+                                        : this->vector_task_num - shared_vector_count_ - 1;
+    }
     const uint32_t stride = this->active_vector_num;
 #endif
     for (; block_idx < count; block_idx += stride) {
       ExecuteTask(GetTaskIndex(block_idx), mode, recorder);
     }
+#ifndef HMC_RUNTIME_CUBE
+    if (shared_vector_count_ != 0 && this->worker_id_ % 2 == 1 &&
+        this->worker_id_ / 2 == (this->vector_task_num - 1) % this->core_num) {
+      ExecuteTask(GetTaskIndex(this->vector_task_num - 1), mode, recorder);
+    }
+#endif
   }
 
   __aicore__ inline bool IsQueuedTaskReady(TaskId task_id) {
@@ -832,6 +876,9 @@ class KernelWorkerBase {
     if constexpr (WorkerPolicy == VectorWorkerPolicy::ALL) {
       return this->worker_id_ < this->active_vector_num ? this->worker_id_ : INVALID_VECTOR_SCHEDULE_INDEX;
     }
+    if (shared_vector_count_ != 0 && this->worker_id_ % 2 == 0) {
+      return this->vector_task_num - shared_vector_count_ - 1 + this->worker_id_ / 2;
+    }
     return this->worker_id_ % 2 == 0 ? INVALID_VECTOR_SCHEDULE_INDEX : this->worker_id_ / 2;
   }
 
@@ -870,7 +917,7 @@ class KernelWorkerBase {
     AscendC::SetAtomicNone();
 #else
     localSet.SetValue(0, 1);
-    for (int32_t i = 1; i < EXP_TOKEN_COUNT_FLAG_CNT; ++i) {
+    for (uint32_t i = 1; i < EXP_TOKEN_COUNT_FLAG_CNT; ++i) {
       localSet.SetValue(i, 0);
     }
     AscendC::SetAtomicAdd<int32_t>();
@@ -922,7 +969,7 @@ class KernelWorkerBase {
     const uint32_t owner_id = profile ? getTaskProfileOwnerId(this->runtimeConfigPtr, task_id) : 0;
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
       const uint64_t start = profile ? recorder.Now() : 0;
-      WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
+      WaitForDependency(task_desc.dependent_event, TaskDependencyPollInterval(task_desc));
       if (profile) {
         recorder.Record(Derived::PROFILE_DESC_WAIT_DEPENDENCY, task_id, task_desc.task_index, owner_id,
                         start, recorder.Now());
@@ -948,7 +995,9 @@ class KernelWorkerBase {
       PipeBarrier<PIPE_ALL>();
       CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_AFTER);
     }
-    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
+    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL &&
+        task_desc.task_type != TaskType::TASK_MOE_OWNER_GET &&
+        task_desc.task_type != TaskType::TASK_MOE_TOKEN_GET) {
       const uint64_t start = profile ? recorder.Now() : 0;
       TriggerProducerEvent(task_desc);
       TriggerEvent(task_desc.trigger_event);
@@ -958,6 +1007,18 @@ class KernelWorkerBase {
       }
     }
     RecordNormalTrace(task_id, task_desc, selected, observed, computed);
+  }
+
+  __aicore__ inline uint32_t TaskDependencyPollInterval(const TaskDesc &task) {
+    // Tagged GMM metadata selects the compute kernel, not an event polling delay.
+    constexpr uint32_t a5_gmm_kernel_tag = 0x41350000;
+    constexpr uint32_t peer_tile_gmm_tag = 0x4D54494C;
+    if (task.task_type == TaskType::TASK_GROUPED_MATMUL &&
+        ((task.extra_value_2 & 0xFFFF0000U) == a5_gmm_kernel_tag ||
+         task.extra_value_2 == peer_tile_gmm_tag)) {
+      return 0;
+    }
+    return task.extra_value_2;
   }
 
   __aicore__ inline void WaitForDependency(uint32_t event_index, uint32_t poll_interval_us = 0) {
@@ -1020,6 +1081,7 @@ class KernelWorkerBase {
     }
   }
 
+  uint32_t shared_vector_count_ = 0;
   bool pull_protocol_ = false;
   bool ready_queue_ = false;
   bool ready_queue_all_ = false;

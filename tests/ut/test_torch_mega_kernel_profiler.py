@@ -365,6 +365,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
                 "rank": 2,
                 "deviceId": 0,
                 "anchorCycle": 1000,
+                "cycleFrequencyMHz": 50.0,
                 "recordCount": 1,
                 "droppedRecordCount": 0,
             },

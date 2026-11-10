@@ -14,11 +14,18 @@
 # ============================================================================
 """MoE-FFN backward compute graph."""
 
+from __future__ import annotations
+
 from typing import Optional
 
 from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
 from hyper_multicore.modules.mega_moe.probability import declare_probability_dataflow
 from hyper_multicore.modules.mega_moe.task_options import validate_task_options
+from hyper_multicore.modules.mega_moe.shared_schedule import add_shared_graph
+from hyper_multicore.modules.mega_moe.indexed_backward import (
+    BACKWARD_METADATA_PREFIX_ROWS, ROUTE_GRAD_TOKEN_SPLIT, RouteWeightGradFillConfig,
+    reject_indirect_gradient_dump,
+)
 from hyper_multicore.scheduler.config import TaskSplitValue
 from hyper_multicore.scheduler.graph import (
     ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType,
@@ -249,8 +256,10 @@ def build_backward_graph(tsv: TaskSplitValue, *,
                          num_cube_cores:    int = DEFAULT_CORE_SPEC.num_cube_cores,
                          swiglu_limit:      Optional[float] = None,
                          expert_weight_layout: str = "EIO",
-                        clamp_after_activation: bool = False,
-                        apply_probs_before_fc2: bool = False) -> ComputeGraph:
+                         clamp_after_activation: bool = False,
+                         apply_probs_before_fc2: bool = False,
+                         shared_intermediate_size: int = 0,
+                         indexed_backward: bool = False) -> ComputeGraph:
     """Build the MoE-FFN backward DAG.
 
     Execution order:
@@ -319,4 +328,25 @@ def build_backward_graph(tsv: TaskSplitValue, *,
     if apply_probs_before_fc2:
         declare_probability_dataflow(graph, tsv.ep * tsv.per_rank_seq,
                                      backward=True, pull=tsv.dispatch_mode == "pull")
+    if shared_intermediate_size:
+        add_shared_graph(graph, tsv, hidden_size, shared_intermediate_size, num_cube_cores,
+                         backward=True)
+    if indexed_backward:
+        source = TensorSpec("original_dy", [tsv.per_expert_seq_to_other, hidden_size], param_position=2)
+        metadata = TensorSpec("backward_routes", [BACKWARD_METADATA_PREFIX_ROWS +
+                              tsv.per_expert_seq_to_other * tsv.top_k, 4], param_position=25, dtype_size=4)
+        output = TensorSpec("route_weight_grad", [tsv.per_expert_seq_to_other, tsv.top_k],
+                            param_position=25, dtype_size=4)
+        node = OperatorNode(
+            name="route_weight_grad", op_type=OpType.MOE_ROUTE_GRAD, diagnostic_name="RouteWeightGrad",
+            inputs=[source, metadata], outputs=[output], param_positions=[2, 25, 25],
+            split_value=ROUTE_GRAD_TOKEN_SPLIT,
+            split_spec=SplitSpec(split_inputs=None, split_output_dims=[0], task_num_fn=lambda values: (
+                (values.per_expert_seq_to_other + ROUTE_GRAD_TOKEN_SPLIT - 1) // ROUTE_GRAD_TOKEN_SPLIT)),
+            tiling_position=-1, fill_config=RouteWeightGradFillConfig(),
+            diagnostic_view_resolver=reject_indirect_gradient_dump,
+        )
+        # Keep independent source-local jobs after the original vector schedule;
+        # their fill config does not alter expert events or the termination join.
+        graph.add_op(node).add_edge(w1_grad, node).add_edge(w2_grad, node).add_edge(combine, node)
     return graph

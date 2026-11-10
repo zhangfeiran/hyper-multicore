@@ -1,0 +1,210 @@
+--- a/src/host/bootstrap/config_store/store_tcp_config_server.h
++++ b/src/host/bootstrap/config_store/store_tcp_config_server.h
+@@ -78,6 +78,7 @@
+ 
+     Result Startup(const AcclinkTlsOption &tlsOption) noexcept;
+     void Shutdown(bool afterFork = false) noexcept;
++    Result WaitForClientsToDisconnect(uint32_t rankSize, int64_t timeoutMs) noexcept;
+ 
+ private:
+     Result ReceiveMessageHandler(const shm::acc::AccTcpRequestContext &context) noexcept;
+@@ -122,6 +123,10 @@
+     int32_t sockFd_;
+     uint16_t magic_;
+     std::mutex mutex_;
++    std::mutex linksMutex_;
++    std::condition_variable linksClosed_;
++    std::unordered_set<uint32_t> activeLinks_;
++    std::unordered_set<uint64_t> connectedRanks_;
+ };
+ using AccStoreServerPtr = SmRef<AccStoreServer>;
+ }  // namespace store
+--- a/src/host/bootstrap/config_store/store_tcp_config_server.cpp
++++ b/src/host/bootstrap/config_store/store_tcp_config_server.cpp
+@@ -173,6 +173,11 @@
+ Result AccStoreServer::LinkConnectedHandler(const shm::acc::AccConnReq &req,
+                                             const shm::acc::AccTcpLinkComplexPtr &link) noexcept
+ {
++    {
++        std::lock_guard<std::mutex> guard(linksMutex_);
++        activeLinks_.insert(link->Id());
++        connectedRanks_.insert(req.rankId);
++    }
+     SHM_LOG_INFO("new link connected, linkId: " << link->Id() << ", rank: " << req.rankId
+         << ", server_magic=" << magic_ << ", remote_magic=" << req.magic);
+     return ACLSHMEM_SUCCESS;
+@@ -181,6 +186,28 @@
+ Result AccStoreServer::LinkBrokenHandler(const shm::acc::AccTcpLinkComplexPtr &link) noexcept
+ {
+     SHM_LOG_INFO("link broken, linkId: " << link->Id());
++    {
++        std::lock_guard<std::mutex> guard(linksMutex_);
++        activeLinks_.erase(link->Id());
++    }
++    linksClosed_.notify_all();
++    return ACLSHMEM_SUCCESS;
++}
++
++Result AccStoreServer::WaitForClientsToDisconnect(uint32_t rankSize, int64_t timeoutMs) noexcept
++{
++    if (rankSize == 0 || timeoutMs <= 0) {
++        return SM_INVALID_PARAM;
++    }
++    std::unique_lock<std::mutex> guard(linksMutex_);
++    const bool disconnected = linksClosed_.wait_for(guard, std::chrono::milliseconds(timeoutMs), [&]() {
++        return connectedRanks_.size() == rankSize && activeLinks_.empty();
++    });
++    if (!disconnected) {
++        SHM_LOG_ERROR("Timed out waiting for bootstrap clients to disconnect: expected=" << rankSize
++            << ", connected=" << connectedRanks_.size() << ", active=" << activeLinks_.size());
++        return StoreErrorCode::TIMEOUT;
++    }
+     return ACLSHMEM_SUCCESS;
+ }
+ 
+@@ -563,4 +590,4 @@
+     }
+ }
+ }  // namespace store
+-}  // namespace shm
+\ No newline at end of file
++}  // namespace shm
+--- a/src/host/bootstrap/config_store/store_tcp_config.h
++++ b/src/host/bootstrap/config_store/store_tcp_config.h
+@@ -43,6 +43,7 @@
+ 
+     Result Startup(const AcclinkTlsOption &tlsOption, int reconnectRetryTimes = -1) noexcept;
+     void Shutdown(bool afterFork = false) noexcept;
++    Result ShutdownCollectively(uint32_t rankSize, int64_t timeoutMs) noexcept;
+ 
+     Result Set(const std::string &key, const std::vector<uint8_t> &value) noexcept override;
+     Result Add(const std::string &key, int64_t increment, int64_t &value) noexcept override;
+--- a/src/host/bootstrap/config_store/store_tcp_config.cpp
++++ b/src/host/bootstrap/config_store/store_tcp_config.cpp
+@@ -227,6 +227,23 @@
+     return SM_OK;
+ }
+ 
++Result TcpConfigStore::ShutdownCollectively(uint32_t rankSize, int64_t timeoutMs) noexcept
++{
++    if (rankSize == 0 || timeoutMs <= 0) {
++        return SM_INVALID_PARAM;
++    }
++    // A disconnected client has consumed its final barrier response and needs no further server progress.
++    accClientLink_ = nullptr;
++    if (accClient_ != nullptr) {
++        accClient_->Stop();
++        accClient_ = nullptr;
++    }
++    if (accServer_ != nullptr) {
++        return accServer_->WaitForClientsToDisconnect(rankSize, timeoutMs);
++    }
++    return SM_OK;
++}
++
+ void TcpConfigStore::Shutdown(bool afterFork) noexcept
+ {
+     accClientLink_ = nullptr;
+@@ -598,4 +615,4 @@
+     return SM_OK;
+ }
+ }  // namespace store
+-}  // namespace shm
+\ No newline at end of file
++}  // namespace shm
+--- a/src/host/bootstrap/shmemi_bootstrap_config_store.cpp
++++ b/src/host/bootstrap/shmemi_bootstrap_config_store.cpp
+@@ -24,6 +24,7 @@
+ 
+ #include "store_op.h"
+ #include "store_net_group_engine.h"
++#include "store_tcp_config.h"
+ #include "store_factory.h"
+ #include "sotre_net.h"
+ #include "store_net_common.h"
+@@ -143,6 +144,17 @@
+     auto state = static_cast<ConfigStoreState*>(handle->bootstrap_state);
+     if (!state) return ACLSHMEM_INNER_ERROR;
+ 
++    int status = ACLSHMEM_SUCCESS;
++    // The concrete store is created by StoreFactory as a TcpConfigStore for this bootstrap session.
++    if (state->store_ != nullptr) {
++        auto* store = static_cast<shm::store::TcpConfigStore*>(state->store_.Get());
++        const auto ret = store->ShutdownCollectively(handle->npes, static_cast<int64_t>(handle->timeControlOut) * 1000);
++        if (ret != ACLSHMEM_SUCCESS) {
++            SHM_LOG_ERROR("Bootstrap client shutdown failed, ret=" << ret);
++            status = ret == shm::store::StoreErrorCode::TIMEOUT ? ACLSHMEM_TIMEOUT_ERROR : ACLSHMEM_SMEM_ERROR;
++        }
++    }
++
+     // DestroyStore will destroy global resource, only do this when all stores are finalized.
+     if (state->store_ != nullptr) {
+         if (g_store_ref == 0) {
+@@ -156,8 +168,9 @@
+     state->group_engine_ = nullptr;
+     state->store_ = nullptr;
+     delete state;
+-
+-    return ACLSHMEM_SUCCESS;
++    handle->bootstrap_state = nullptr;
++
++    return status;
+ }
+ 
+ static int config_store_bootstrap_allgather(const void *in, void *out, int len, aclshmemi_bootstrap_handle_t *handle) {
+@@ -359,4 +372,4 @@
+ 
+     SHM_LOG_INFO("pe " << handle->mype << ": bootstrap plugin initialized successfully");
+     return ACLSHMEM_SUCCESS;
+-}
+\ No newline at end of file
++}
+--- a/src/host/init/bootstrap/shmemi_bootstrap.h
++++ b/src/host/init/bootstrap/shmemi_bootstrap.h
+@@ -21,11 +21,11 @@
+ 
+ int32_t aclshmemi_bootstrap_init(int flags, aclshmemx_init_attr_t *attr);
+ 
+-void aclshmemi_bootstrap_finalize();
++int32_t aclshmemi_bootstrap_finalize();
+ 
+ int aclshmemi_bootstrap_plugin_init(void *mpi_comm, aclshmemi_bootstrap_handle_t *handle);
+ 
+ #ifdef __cplusplus
+ }
+ #endif
+-#endif
+\ No newline at end of file
++#endif
+--- a/src/host/init/bootstrap/shmemi_bootstrap.cpp
++++ b/src/host/init/bootstrap/shmemi_bootstrap.cpp
+@@ -355,11 +355,12 @@
+     return status;
+ }
+ 
+-void aclshmemi_bootstrap_finalize() {
++int32_t aclshmemi_bootstrap_finalize() {
+     if (!g_boot_handle.is_bootstraped) {
+-        return;
+-    }
+-    g_boot_handle.finalize(&g_boot_handle);
++        return ACLSHMEM_SUCCESS;
++    }
++    const int32_t status = g_boot_handle.finalize(&g_boot_handle);
+     g_boot_handle.is_bootstraped = false;
+     safe_dlclose(&plugin_hdl);
+-}
+\ No newline at end of file
++    return status;
++}
+--- a/src/host/init/shmem_init.cpp
++++ b/src/host/init/shmem_init.cpp
+@@ -1355,7 +1355,7 @@
+     // Synchronize all ranks before destroying the store, so that no rank
+     // can start the next init while another rank's store is still alive.
+     recordCleanupStatus(aclshmemi_control_barrier_all(), "finalize control barrier");
+-    aclshmemi_bootstrap_finalize();
++    recordCleanupStatus(aclshmemi_bootstrap_finalize(), "finalize bootstrap");
+ 
+     // Only when the process has no instance, release init_manager.
+     g_init_manager_count--;

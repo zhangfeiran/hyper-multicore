@@ -41,6 +41,7 @@ class OpType(Enum):
     MHC_INPUT_MIX = "mhc_input_mix"
     MHC_PIPELINE = "mhc_pipeline"
     RMS_NORM = "rms_norm"
+    MOE_ROUTE_GRAD = "moe_route_grad"
 
 
 @dataclass

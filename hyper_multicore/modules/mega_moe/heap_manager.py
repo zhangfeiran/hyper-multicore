@@ -49,6 +49,13 @@ def _round_heap_bytes(value: int) -> int:
     return (value + _HEAP_GRANULARITY_BYTES - 1) // _HEAP_GRANULARITY_BYTES * _HEAP_GRANULARITY_BYTES
 
 
+def _configured_heap_size(current: str | None, legacy: str | None) -> str | None:
+    """Accept the legacy setting while rejecting ambiguous heap budgets."""
+    if current is not None and legacy is not None and current != legacy:
+        raise ValueError("Conflicting HYPER_MULTICORE_SHMEM_HEAP_SIZE and HYPER_PARALLEL_SHMEM_HEAP_SIZE")
+    return current if current is not None else legacy
+
+
 @dataclass(frozen=True)
 class _WorkspaceLayout:
     """One reservation's bytes, collective identity and receive capacity."""
@@ -191,11 +198,13 @@ class _HeapManager:
             layouts = [entry.layout for entry in self.entries]
             try:
                 configured = os.getenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE")
+                legacy_configured = os.getenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE")
+                effective = configured if configured is not None else legacy_configured
                 if not self._configured:
                     self._run_and_check_consistency(
-                        lambda: self._configure(configured),
+                        lambda: self._configure(_configured_heap_size(configured, legacy_configured)),
                         stage="Configuration",
-                        value=(configured, str(self.dtype), tuple(layouts)),
+                        value=(effective, str(self.dtype), tuple(layouts)),
                     )
                     self._configured = True
                 else:
@@ -385,6 +394,7 @@ class _HeapManager:
             fixed = _workspace_layout(entry.layout_specification(), self.dtype, 0, token_capacity).required_bytes
             other = sum((item.layout.required_bytes for item in self.entries if item is not entry))
             row_bytes = spec.hidden_size * self.element_size
+            # Source growth cannot reclaim an already committed receive buffer.
             self._budget(_round_heap_bytes(fixed + other + entry.layout.receive_capacity * row_bytes))
             available = max(0, (self.heap_limit - other - fixed) // row_bytes)
             allowance = available // 128 * 128
@@ -648,10 +658,14 @@ class _HeapManager:
             ) from error
 
         try:
-            result = shmem._restart(
+            runtime_options = {}
+            if os.environ.get("HYPER_PARALLEL_SHMEM_FIXED_HEAP_REPACK") == "1":
+                runtime_options["allow_existing_runtime"] = self.heap_limit is not None
+            result = shmem._restart(  # pylint: disable=protected-access
                 heap_size_bytes=heap_bytes,
                 replacements=replacements,
                 preflight_hook=lambda: self._restart_preflight(layouts, replacements, bindings, agreement),
+                **runtime_options,
             )
         except Exception:
             if not _lifecycle._runtime_is_healthy():

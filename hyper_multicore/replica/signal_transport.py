@@ -25,6 +25,7 @@ from typing import Any, Iterator
 import torch
 
 from ._metadata import _async_device_bytes
+from ._observer import _get_replica_observer
 from .capacity import _integer
 from .pool import ReplicaPool, ReplicaPrefetch
 from .residency import _ReplicaWeightCache
@@ -144,6 +145,8 @@ class SignalReplicaTransport:
         if self.storage_slots > slots:
             raise ValueError("Replica matrix storage cannot exceed the signal slot count")
         self.runtime, self.storage, self.slots, self.ep_size = (runtime, storage, slots, ep_size)
+        state = runtime.debug_state() if hasattr(runtime, "debug_state") else {}
+        self._use_sdma = state.get("device_model") != "ascend_950"
         self.pool = self.signals = self.projection_signals = None
         self.gradient_bands = gradient_bands
         self._gradient_band_storage = {}
@@ -325,7 +328,11 @@ class SignalReplicaTransport:
         home = route.plan.config.home_experts
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("Concurrent signal replica leases are unsupported")
+        observer = _get_replica_observer()
+        observation = None
         try:
+            if observer is not None:
+                observation = observer.begin_lease(route, backward, id(self))
             self._last_weight_copy_counts = (0, 0)
             self._bind(weights)
             active_slots = (
@@ -340,7 +347,8 @@ class SignalReplicaTransport:
                 backward=backward, active_slots=active_slots, _overwrite_gradients=_overwrite_gradients
             ):
                 if self._saved_generation_is_resident(backward, overlap, reuse_generation):
-
+                    if observer is not None:
+                        observer.event("WeightGenerationReuse", reuse_hit=True, epoch=self._resident_ready[1])
                     yield ReplicaPrefetch(
                         self.pool,
                         self.pool.wait_weights,
@@ -348,6 +356,8 @@ class SignalReplicaTransport:
                         weight_generation=self._resident_generation,
                     )
                 else:
+                    if observer is not None:
+                        observer.event("WeightGenerationReuse", reuse_hit=False)
                     self._resident_generation = self._resident_ready = None
                     with self._overlapped_prefetch(weights, route, backward=backward) as prefetched:
                         if overlap:
@@ -363,7 +373,11 @@ class SignalReplicaTransport:
             self._resident_generation = self._resident_ready = None
             raise
         finally:
-            self._lock.release()
+            try:
+                if observer is not None:
+                    observer.end_lease(observation)
+            finally:
+                self._lock.release()
 
     def _copy_projections(
         self,
@@ -375,6 +389,8 @@ class SignalReplicaTransport:
         home: int,
         backend: Any,
         streams: dict,
+        epoch: int,
+        observer: Any,
     ) -> None:
         """Publish a fresh projection epoch after each copied or resident payload."""
         for item in outgoing:
@@ -386,14 +402,25 @@ class SignalReplicaTransport:
                     if (item.target_rank, item.target_slot) not in copies.reused:
                         source = sources[item.owner_slot][index]
                         source.record_stream(stream)
-                        self.runtime.put(self.pool.weights[index][slot], source, item.target_rank, use_sdma=True)
-                    self.runtime.put(self.projection_signals[index, slot, :1], value, item.target_rank, use_sdma=True)
+                        stamp = (observer.begin("WeightPrefetchSubmit", epoch=epoch, projection="W13" if index == 0 else "W2",
+                                                expert=item.logical_expert, peer=item.target_rank, physical_slot=item.target_slot,
+                                                bytes=source.numel() * source.element_size()) if observer is not None else None)
+                        self.runtime.put(self.pool.weights[index][slot], source, item.target_rank, use_sdma=self._use_sdma)
+                        if observer is not None:
+                            observer.end(stamp)
+                    elif observer is not None:
+                        observer.event("WeightPayloadReuse", epoch=epoch, reuse_hit=True, projection="W13" if index == 0 else "W2",
+                                       expert=item.logical_expert, peer=item.target_rank, physical_slot=item.target_slot, bytes=0)
+                    self.runtime.put(self.projection_signals[index, slot, :1], value, item.target_rank, use_sdma=self._use_sdma)
 
     @contextmanager
     def _overlapped_prefetch(
         self, weights: tuple[torch.Tensor, ...], route: ReplicaRoute, *, backward: bool = False
     ) -> Iterator[ReplicaPrefetch]:
         epoch = self._advance(reserve=2 if backward else 0)
+        observer = _get_replica_observer()
+        if observer is not None:
+            observer.event("WeightEpoch", epoch=epoch, backward=backward)
         home = route.plan.config.home_experts
         incoming, outgoing = _transfer_edges(route)
         copies = self._weight_cache.prepare(weights, route)
@@ -402,25 +429,43 @@ class SignalReplicaTransport:
         for item in incoming:
             self._publish(0, route.rank, item.target_slot - home, item.owner_rank, epoch)
         for item in outgoing:
+            stamp = (observer.begin("CreditWaitSubmit", epoch=epoch, peer=item.target_rank, physical_slot=item.target_slot)
+                     if observer is not None else None)
             self._wait(0, item.target_rank, item.target_slot - home, epoch)
+            if observer is not None:
+                observer.end(stamp)
         sources = {
             slot: tuple((weight[slot].contiguous() for weight in weights)) for slot in copies.required_owner_slots
         }
 
         def _wait(matrix_index):
             for item in incoming:
+                stamp = (observer.begin("WeightConsumerWaitSubmit", epoch=epoch, projection="W13" if matrix_index == 0 else "W2",
+                                        expert=item.logical_expert, peer=item.owner_rank, physical_slot=item.target_slot)
+                         if observer is not None else None)
                 self.runtime.wait_signal(
                     self.projection_signals[matrix_index, item.target_slot - home, :1], epoch, comparison="ge"
                 )
+                if observer is not None:
+                    observer.end(stamp)
 
         order = tuple(range(len(weights)))
         if backward:
             order = order[::-1]
         peers = sorted({item.target_rank for item in outgoing})
         with self._copy_streams(peers, self._streams, weights[0].device) as (backend, streams):
-            self._copy_projections(outgoing, copies, sources, value, order, home, backend, streams)
+            self._copy_projections(outgoing, copies, sources, value, order, home, backend, streams, epoch, observer)
             ready = (tuple((signal.data_ptr() for signal in self.projection_signals)), epoch)
             prefetched = ReplicaPrefetch(self.pool, _wait, projection_ready=ready)
+            copy_done = []
+            if not self._use_sdma:
+                caller = backend.current_stream(weights[0].device)
+                for stream in streams.values():
+                    done = backend.Event()
+                    done.record(stream)
+                    caller.wait_event(done)
+                    copy_done.append(done)
+                prefetched.wait_weights()
             try:
                 yield prefetched
             finally:
@@ -492,7 +537,7 @@ class SignalReplicaTransport:
                         for item in owned:
                             slot = item.target_slot - home
                             self._wait(3, item.target_rank, slot, epoch)
-                            self.runtime.get(scratch, guest[slot], item.target_rank, use_sdma=True)
+                            self.runtime.get(scratch, guest[slot], item.target_rank, use_sdma=self._use_sdma)
                             output[item.owner_slot].add_(scratch)
             for item in owned:
                 self._publish(4, route.rank, item.target_slot - home, item.target_rank, epoch)

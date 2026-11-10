@@ -34,6 +34,7 @@ struct InitOptions {
   runtime::DataEngine data_engine;
   std::string_view effective_bootstrap_endpoint;
   std::string_view unique_id{};
+  uint32_t udma_qp_num = 32U;
 };
 
 namespace host {

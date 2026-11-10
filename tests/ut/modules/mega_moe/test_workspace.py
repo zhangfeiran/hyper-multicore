@@ -59,7 +59,8 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                 workspace = MegaMoeWorkspace(shared=False)
                 with (patch.object(workspace_module.shmem, "empty",
                                    side_effect=lambda shape, **kw: torch.empty(shape, dtype=kw["dtype"])),
-                      patch.object(workspace_module.shmem, "host_barrier")):
+                      patch.object(workspace_module.shmem, "host_barrier"),
+                      patch.object(workspace_module.shmem, "debug_state", return_value={"device_model": "ascend_910"})):
                     workspace._allocate_replica_storage(SimpleNamespace(**physical))
                     shapes = ((12288, 256), (256, 6144)) if layout == "EOI" else ((256, 12288), (6144, 256))
                     weights = tuple(torch.empty((2, *shape), dtype=torch.bfloat16) for shape in shapes)
@@ -215,6 +216,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             receive_capacity=128,
             routed_slots=256,
             hidden_size=16,
+            top_k=2,
             ep_size=64,
             num_experts=1024,
             dispatch_mode="push",

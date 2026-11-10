@@ -28,6 +28,7 @@ struct ConfigInput {
   std::optional<std::string> heap_size;
   std::optional<std::string> timeout;
   std::optional<std::string> data_engine;
+  std::optional<std::string> udma_qp_num;
   std::optional<std::string> bootstrap_endpoint_base;
 };
 
@@ -115,6 +116,16 @@ Result<Config> ParseConfig(const ConfigInput &input) {
                                                  std::string(data_engine) + "'"));
   }
   config.data_engine = data_engine == "mte_udma" ? DataEngine::MteUdma : DataEngine::Mte;
+  if (input.udma_qp_num.has_value()) {
+    const std::string &value = *input.udma_qp_num;
+    if (value != "1" && value != "8" && value != "16" && value != "32") {
+      return Result<Config>::Failure(InvalidConfig(std::string(kUdmaQpNumEnv) + " must be 1, 8, 16 or 32"));
+    }
+    config.udma_qp_num = static_cast<uint32_t>(std::stoul(value));
+  }
+  if (config.udma_qp_num != 32U && config.data_engine != DataEngine::MteUdma) {
+    return Result<Config>::Failure(InvalidConfig("A reduced UDMA QP bank requires mte_udma"));
+  }
 
   const std::string_view endpoint = input.bootstrap_endpoint_base.has_value()
                                       ? std::string_view(*input.bootstrap_endpoint_base)
@@ -132,10 +143,20 @@ Result<Config> ParseConfig(const ConfigInput &input) {
 
 Result<Config> LoadConfigFromEnvironment() {
   ConfigInput input;
-  input.heap_size = ReadEnvironment(kHeapSizeEnv);
-  input.timeout = ReadEnvironment(kTimeoutEnv);
-  input.data_engine = ReadEnvironment(kDataEngineEnv);
-  input.bootstrap_endpoint_base = ReadEnvironment(kBootstrapEndpointEnv);
+  const std::pair<std::string_view, std::optional<std::string> *> fields[] = {
+    {kHeapSizeEnv, &input.heap_size}, {kTimeoutEnv, &input.timeout},
+    {kDataEngineEnv, &input.data_engine}, {kUdmaQpNumEnv, &input.udma_qp_num},
+    {kBootstrapEndpointEnv, &input.bootstrap_endpoint_base},
+  };
+  for (const auto &[name, field] : fields) {
+    auto current = ReadEnvironment(name);
+    const std::string legacy_name = "HYPER_PARALLEL_" + std::string(name.substr(sizeof("HYPER_MULTICORE_") - 1));
+    auto legacy = ReadEnvironment(legacy_name);
+    if (current && legacy && *current != *legacy) {
+      return Result<Config>::Failure(InvalidConfig("Conflicting " + std::string(name) + " and " + legacy_name));
+    }
+    *field = current ? std::move(current) : std::move(legacy);
+  }
   return ParseConfig(input);
 }
 

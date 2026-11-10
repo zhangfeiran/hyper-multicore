@@ -48,8 +48,8 @@ def _runtime_config(task_capacity: int = 16) -> RuntimeConfigC:
     return allocate_runtime_config(task_capacity)
 
 
-def _three_record_task() -> TaskDescC:
-    """Create a task with a dependency and completion event."""
+def _grouped_matmul_task() -> TaskDescC:
+    """Create a task reserving dependency, compute, trigger and guest-weight wait records."""
     task = TaskDescC()
     task.task_type = TaskType.TASK_GROUPED_MATMUL
     task.dependent_event = 0
@@ -188,18 +188,19 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
     def test_layout_rounds_busiest_workers_to_sixteen_records(self):
         """Mirror Device round-robin assignment for AIC and AIV independently."""
         for workers, aic_records, aic_capacity, buffer_size in (
-            (48, 18, 32, 53760), (64, 12, 16, 55296),
+            (48, 26, 32, 53760), (64, 18, 32, 71680),
         ):
             with self.subTest(workers=workers):
                 runtime_config = allocate_runtime_config(128, num_workers=workers)
-                runtime_config.all_tasks[0] = _three_record_task()
+                runtime_config.all_tasks[0] = _grouped_matmul_task()
                 runtime_config.task_index_num[0] = 121
                 runtime_config.task_index_num[1] = 24
 
                 layout = _calculate_profile_layout(runtime_config)
 
                 self.assertEqual(layout.aic_required_records, aic_records)
-                self.assertEqual(layout.aiv_required_records, 3)
+                # Both queues also emit WorkerTasksComplete and WorkerComplete.
+                self.assertEqual(layout.aiv_required_records, 6)
                 self.assertEqual(layout.aic_record_capacity, aic_capacity)
                 self.assertEqual(layout.aiv_record_capacity, 16)
                 self.assertEqual(layout.cube_slot_count, workers // 2)
@@ -210,13 +211,13 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         """Allocate the complete trace when a long schedule exceeds 256 records."""
         runtime_config = _runtime_config(2048)
         runtime_config.num_workers = 48
-        runtime_config.all_tasks[0] = _three_record_task()
+        runtime_config.all_tasks[0] = _grouped_matmul_task()
         runtime_config.task_index_num[0] = 2041
 
         layout = _calculate_profile_layout(runtime_config)
 
-        self.assertEqual(layout.aic_required_records, 258)
-        self.assertEqual(layout.aic_record_capacity, 272)
+        self.assertEqual(layout.aic_required_records, 346)
+        self.assertEqual(layout.aic_record_capacity, 352)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

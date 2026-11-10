@@ -14,9 +14,12 @@
 # ============================================================================
 """MoE-FFN forward compute graph."""
 
+from __future__ import annotations
+
 from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
 from hyper_multicore.modules.mega_moe.probability import declare_probability_dataflow
 from hyper_multicore.modules.mega_moe.task_options import validate_task_options
+from hyper_multicore.modules.mega_moe.shared_schedule import add_shared_graph
 from hyper_multicore.scheduler.config import TaskSplitValue
 from hyper_multicore.scheduler.graph import (
     ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType,
@@ -185,7 +188,8 @@ def build_forward_graph(tsv: TaskSplitValue, *,
                         swiglu_limit:      float | None = None,
                         expert_weight_layout: str = "EIO",
                         clamp_after_activation: bool = False,
-                        apply_probs_before_fc2: bool = False) -> ComputeGraph:
+                        apply_probs_before_fc2: bool = False,
+                        shared_intermediate_size: int = 0) -> ComputeGraph:
     """Build the MoE-FFN forward DAG: dispatch -> up_proj -> swiglu -> down_proj -> combine.
 
     Operator execution order and param_positions (C++ memory slots):
@@ -234,4 +238,7 @@ def build_forward_graph(tsv: TaskSplitValue, *,
     if apply_probs_before_fc2:
         declare_probability_dataflow(graph, tsv.ep * tsv.per_rank_seq,
                                      backward=False, pull=tsv.dispatch_mode == "pull")
+    if shared_intermediate_size:
+        add_shared_graph(graph, tsv, hidden_size, shared_intermediate_size, num_cube_cores,
+                         backward=False)
     return graph

@@ -28,6 +28,8 @@ from hyper_multicore._loader import load_torch_npu
 
 from .capacity import ExpertReplicaConfig
 from .communication import differentiable_all_to_all_single
+from .cost import ExpertReplicaCostModel
+from .device import build_device_expert_replica_plan, validate_planner_backend
 from .routing import ReplicaRoute, _gather_replica_counts, _plan_replica_route, stable_expert_order
 from .transport import prefetch_weights, return_gradients
 
@@ -212,16 +214,14 @@ class NativeReplicaDispatch:
     recv_order: torch.Tensor
 
 
-def dispatch_native_replicas(
-    inputs: tuple,
-    config: ExpertReplicaConfig,
-    group: object,
-    *,
-    minimum_replica_rows: int = 0,
-    minimum_load_reduction: float = 0.0,
-    minimum_saved_rows: int = 0,
-    _rank_nodes: tuple[int, ...] = (),
-) -> tuple[tuple, NativeReplicaDispatch]:
+def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
+                             group: object,
+                             *, minimum_replica_rows: int = 0,
+                             planner_backend: str = "cpu",
+                             minimum_load_reduction: float = 0.0,
+                             minimum_saved_rows: int = 0,
+                             _rank_nodes: tuple[int, ...] = (),
+                             _cost_model: ExpertReplicaCostModel | None = None) -> tuple[tuple, NativeReplicaDispatch]:
     """Dispatch existing native expert-major inputs through shared replicas.
 
     Args:
@@ -229,47 +229,53 @@ def dispatch_native_replicas(
         config: Logical expert topology and per-rank replica budget.
         group: EP process group.
         minimum_replica_rows: Minimum useful row count for a guest copy.
+        planner_backend: CPU or device placement implementation.
         minimum_load_reduction: Required receive-peak reduction for optional copies.
         minimum_saved_rows: Required absolute receive-peak reduction for optional copies.
 
     Returns:
         Dispatched inputs and invocation-owned inverse metadata for combine.
     """
+    validate_planner_backend(planner_backend, minimum_replica_rows, _cost_model)
     values, counts = inputs[:2]
     rank = dist.get_rank(group)
     payload = counts.to(torch.int64).contiguous()
     gathered = _gather_replica_counts(payload, config.ep_size, group)
     width = config.slots_per_rank
-    host = gathered.cpu().tolist()
-    plan, _ = _plan_replica_route(
-        host,
-        config,
-        group,
-        rank,
-        minimum_replica_rows=minimum_replica_rows,
-        minimum_load_reduction=minimum_load_reduction,
-        minimum_saved_rows=minimum_saved_rows,
-        rank_nodes=_rank_nodes,
-    )
-    runs = sorted(
-        (expert, slot, plan.dispatch_counts[rank][slot])
-        for slot, expert in enumerate(plan.physical_to_logical)
-        if expert >= 0
-    )
-    slots = torch.tensor([slot for _, slot, _ in runs], device=values.device)
-    repeats = torch.tensor([count for _, _, count in runs], device=values.device)
-    send_splits = [sum(plan.dispatch_counts[rank][peer * width : (peer + 1) * width]) for peer in range(config.ep_size)]
-    received = [row[rank * width : (rank + 1) * width] for row in plan.dispatch_counts]
-    recv_splits = [sum(row) for row in received]
-    recv_counts = torch.tensor(received, dtype=torch.int64, device=values.device)
-    device_counts = torch.tensor(plan.dispatch_counts, device=values.device)
+    device_plan = None
+    if planner_backend == "device":
+        device_plan = build_device_expert_replica_plan(gathered, config,
+                                                       minimum_replica_rows=minimum_replica_rows,
+                                                       minimum_load_reduction=minimum_load_reduction,
+                                                       minimum_saved_rows=minimum_saved_rows)
+        plan = device_plan.host_summary()
+        slots, repeats = device_plan.source_runs(rank)
+        send_splits = list(plan.rank_splits[rank])
+        recv_splits = [row[rank] for row in plan.rank_splits]
+        device_counts = device_plan.dispatch_counts
+        recv_counts = device_counts[:, rank * width:(rank + 1) * width].contiguous()
+    else:
+        host = gathered.cpu().tolist()
+        plan, _ = _plan_replica_route(host, config, group, rank, adaptive=bool(config.replica_slots_per_rank),
+            minimum_replica_rows=minimum_replica_rows, cost_model=_cost_model,
+            minimum_load_reduction=minimum_load_reduction, minimum_saved_rows=minimum_saved_rows,
+            _rank_nodes=_rank_nodes)
+        runs = sorted((expert, slot, plan.dispatch_counts[rank][slot])
+                      for slot, expert in enumerate(plan.physical_to_logical) if expert >= 0)
+        slots = torch.tensor([slot for _, slot, _ in runs], device=values.device)
+        repeats = torch.tensor([count for _, _, count in runs], device=values.device)
+        send_splits = [sum(plan.dispatch_counts[rank][peer * width:(peer + 1) * width])
+                       for peer in range(config.ep_size)]
+        received = [row[rank * width:(rank + 1) * width] for row in plan.dispatch_counts]
+        recv_splits = [sum(row) for row in received]
+        recv_counts = torch.tensor(received, dtype=torch.int64, device=values.device)
+        device_counts = torch.tensor(plan.dispatch_counts, device=values.device)
     physical_ids = torch.repeat_interleave(slots, repeats, output_size=values.shape[0])
     send_order = stable_expert_order(physical_ids, config.physical_experts)
     recv_ids = torch.arange(width, device=values.device).repeat(config.ep_size)
-    recv_order = stable_expert_order(
-        torch.repeat_interleave(recv_ids, recv_counts.flatten(), output_size=sum(recv_splits)), width
-    )
-    route = ReplicaRoute(plan, physical_ids, device_counts, rank, group)
+    recv_order = stable_expert_order(torch.repeat_interleave(
+        recv_ids, recv_counts.flatten(), output_size=sum(recv_splits)), width)
+    route = ReplicaRoute(plan, physical_ids, device_counts, rank, group, device_plan=device_plan)
     state = NativeReplicaDispatch(route, send_splits, recv_splits, send_order, recv_order)
     routed = differentiable_all_to_all_single(values[send_order], send_splits, recv_splits, group)[recv_order]
     result = (routed, recv_counts.sum(0))

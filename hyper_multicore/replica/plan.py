@@ -22,6 +22,7 @@ from functools import cached_property
 from itertools import chain
 
 from .capacity import ExpertReplicaConfig, _integer
+from .host import _column_totals
 
 
 def _destination_counts_from_dispatch(
@@ -31,7 +32,8 @@ def _destination_counts_from_dispatch(
     width = config.slots_per_rank
     if any(len(row) != config.physical_experts for row in dispatch):
         raise ValueError("dispatch row does not match physical expert count")
-    totals = tuple(map(sum, zip(*dispatch)))
+    columns = _column_totals(dispatch)
+    totals = tuple(columns) if columns is not None else tuple(map(sum, zip(*dispatch)))
     return tuple(totals[rank * width:(rank + 1) * width] for rank in range(config.ep_size))
 
 

@@ -144,6 +144,11 @@ def validate_wheel_metadata(archive, metadata_path, info):
 
 def validate_wheel_payload(archive, names, payload, info):
     """Check complete native membership, resource hashes and assembled identity bytes."""
+    host_extensions = [name for name in names
+                       if name.startswith("hyper_multicore/replica/_host_kernel/_replica_host")
+                       and name.endswith(".so")]
+    if len(host_extensions) != 1:
+        raise ValueError("Wheel must contain exactly one native replica host extension")
     expected = {"hyper_multicore/" + n for n in info["payload_sha256"]}
     actual = {
         n

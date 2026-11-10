@@ -21,8 +21,6 @@
 #include "cann/log.h"
 #include "shmem.h"
 
-#define HP_SHMEM_UDMA_QP_NUM 1U
-
 namespace hyper_multicore::shmem::cann::host {
 namespace {
 
@@ -246,7 +244,11 @@ runtime::Status initialize(const InitOptions &options) {
   }
 
   if (options.data_engine == runtime::DataEngine::MteUdma) {
-    const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, HP_SHMEM_UDMA_QP_NUM);
+    if (options.udma_qp_num != 1U && options.udma_qp_num != 8U &&
+        options.udma_qp_num != 16U && options.udma_qp_num != 32U) {
+      return InvalidArgument("UDMA QP count must be 1, 8, 16 or 32");
+    }
+    const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, options.udma_qp_num);
     if (qp_status != ACLSHMEM_SUCCESS) {
       return CannFailure("aclshmemx_set_qp_num", qp_status);
     }
@@ -255,7 +257,7 @@ runtime::Status initialize(const InitOptions &options) {
     if (get_status != ACLSHMEM_SUCCESS) {
       return CannFailure("aclshmemx_get_qp_num", get_status);
     }
-    if (actual_qps != HP_SHMEM_UDMA_QP_NUM) {
+    if (actual_qps != options.udma_qp_num) {
       return InvalidArgument("UDMA QP count does not match the requested configuration");
     }
   }

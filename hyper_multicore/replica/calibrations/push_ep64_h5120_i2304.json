@@ -1,0 +1,252 @@
+{
+  "selector": {
+    "soc_name": "Ascend910_9392",
+    "num_experts": 384,
+    "top_k": 6
+  },
+  "model": {
+    "calibration_version": 2,
+    "backend": "push",
+    "hidden_size": 5120,
+    "intermediate_size": 2304,
+    "ep_size": 64,
+    "transport": "shmem_signal_kernel_gradient_bands",
+    "forward_ms": [
+      [
+        0,
+        0.0
+      ],
+      [
+        1,
+        0.567362742717982
+      ],
+      [
+        16,
+        0.567961334796426
+      ],
+      [
+        32,
+        0.5681521211162488
+      ],
+      [
+        64,
+        0.5681521211162488
+      ],
+      [
+        128,
+        0.5681521211162488
+      ],
+      [
+        256,
+        0.6280089441316483
+      ],
+      [
+        512,
+        0.6891774230958295
+      ],
+      [
+        1024,
+        0.8802236892793684
+      ],
+      [
+        2048,
+        1.253201405216913
+      ],
+      [
+        4096,
+        1.9459107600584615
+      ],
+      [
+        8192,
+        3.04457763104792
+      ],
+      [
+        16384,
+        5.851132634313937
+      ],
+      [
+        32768,
+        11.3373935864538
+      ],
+      [
+        65536,
+        22.17992084689328
+      ],
+      [
+        98304,
+        32.927033483960386
+      ],
+      [
+        131072,
+        43.81615791818758
+      ]
+    ],
+    "backward_ms": [
+      [
+        0,
+        0.0
+      ],
+      [
+        1,
+        0.4312602066204419
+      ],
+      [
+        16,
+        0.4312602066204419
+      ],
+      [
+        32,
+        0.4318689911684698
+      ],
+      [
+        64,
+        0.4318689911684698
+      ],
+      [
+        128,
+        0.43278216799051156
+      ],
+      [
+        256,
+        0.5451278219240702
+      ],
+      [
+        512,
+        0.7003236064313169
+      ],
+      [
+        1024,
+        0.7093446865520933
+      ],
+      [
+        2048,
+        1.0447074908456926
+      ],
+      [
+        4096,
+        1.8630924079558027
+      ],
+      [
+        8192,
+        3.384900198287189
+      ],
+      [
+        16384,
+        6.9976850561161505
+      ],
+      [
+        32768,
+        17.19253360831891
+      ],
+      [
+        65536,
+        36.09383827607354
+      ],
+      [
+        98304,
+        53.8976911899021
+      ],
+      [
+        131072,
+        72.33539950632728
+      ]
+    ],
+    "weight_ms": 0.9387899935245514,
+    "gradient_ms": 0.8195963357186286,
+    "token_ms_per_row": 0.0,
+    "minimum_gain_ms": 8.761733503637185,
+    "schedule": "fixed_queue_gradient_bands_v1",
+    "gradient_dtype": "float32",
+    "forward_repeats": 2,
+    "replica_overhead_ms": 15.873526100083616,
+    "quota_search_budget_ms": 81.8866603076458,
+    "planner_overhead_ms": 9.595690295100212,
+    "backward_weight_ms": 0,
+    "minimum_replica_gain_ms": 8.761733503637185,
+    "weight_fanout_ms": [
+      [
+        0,
+        0.0,
+        0.0
+      ],
+      [
+        1,
+        0.7749300003051758,
+        0.9387899935245514
+      ],
+      [
+        2,
+        1.1787800192832947,
+        1.5012900233268738
+      ],
+      [
+        4,
+        2.2345000505447388,
+        2.5799500942230225
+      ],
+      [
+        8,
+        4.378319978713989,
+        4.754580020904541
+      ]
+    ],
+    "intra_node_weight_ms": 0.7749300003051758,
+    "inter_node_weight_ms": 0.9387899935245514
+  },
+  "provenance": {
+    "compute_and_schedule_source": "EP64 H5120/I2304 E384 TopK6 decoder checkpoint profiles",
+    "scope": "Advisory calibration for the measured shape and device; no performance guarantee",
+    "backward_weight_policy": "Checkpoint resident-generation reuse",
+    "gradient_scope": "Exposed residual, not physical transfer time",
+    "weight_fanout_calibration": {
+      "run_id": "replica-contention-ep64-20261026-001",
+      "analysis_sha256": "19c3892f6adfa3f7d0248b1d39f04b9b4e1bc7150a01a923151ee8dd157b0658",
+      "measurement_soc": "Ascend910_9382",
+      "shared_soc_names": [
+        "Ascend910_9382",
+        "Ascend910_9392"
+      ],
+      "shared_soc_policy": "User-authorized common compute calibration; no clock correction applied",
+      "reduction": "Maximum of the four per-EP-group/owner-count medians for each knot and link class",
+      "source_experts_per_owner": 1,
+      "mixed_links": "Weighted endpoints; no additional overlap credit",
+      "unsupported_fanout": "Retain linear per-edge cost above the last knot",
+      "backward_weight_curve_changed": false,
+      "gradient_costs_changed": false
+    },
+    "end_to_end_incremental_residual": {
+      "source_run": "dsv41-text8-ep64-step-sweep-20261031-001",
+      "baseline_sha256": "b5537086df3e13238af065fce85d959be471630ec46f4e3b9edb6ff01d81b7c3",
+      "source_sha256": {
+        "audit.json": "389a49d77730e511311108f09b4359eda6e8ff6b2dad1e41c6a336d988f0cbd3",
+        "derived.json": "7c31c666d985ec7e82e70546d3097f327a9d4b8440775acd0fb44b28d4d57fa6",
+        "model-replay.json": "824fc2054955ef8d12b94775303603349cd86fe7b8e73409709c60fb81b9b948"
+      },
+      "estimator": "Median residual per forward over alpha 2, 1 and 0.5",
+      "before_ms": 4.492789030544756,
+      "added_ms": 11.38073706953886,
+      "after_ms": 15.873526100083616,
+      "observations": [
+        {
+          "profile": "2",
+          "predicted_saved_ms_8_layers": 7.126827093006398,
+          "measured_saved_ms_step": -174.96496601961536,
+          "residual_ms_per_forward": 11.38073706953886
+        },
+        {
+          "profile": "1",
+          "predicted_saved_ms_8_layers": 116.54217338680228,
+          "measured_saved_ms_step": -85.27670148760097,
+          "residual_ms_per_forward": 12.613679679650204
+        },
+        {
+          "profile": "0.5",
+          "predicted_saved_ms_8_layers": 231.41617166829678,
+          "measured_saved_ms_step": 65.85161294788146,
+          "residual_ms_per_forward": 10.347784920025958
+        }
+      ],
+      "scope": "Median old-plan model minus end-to-end saving, divided by 8 layers and 2 forwards; advisory net residual, not CPU or communication attribution; new-plan NPU performance remains unvalidated"
+    }
+  }
+}
