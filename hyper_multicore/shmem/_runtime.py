@@ -22,6 +22,7 @@ __all__ = [
 ]
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from typing import Any, Final
@@ -36,6 +37,31 @@ from hyper_multicore._native_manifest import resource_path
 _NATIVE_MODULE: Final = "hyper_multicore_shmem_torch"
 
 _native: Any | None = None
+
+
+def _configured_shmem_setting(name: str, default: str) -> str:
+    """Read both supported names and reject conflicting Runtime settings."""
+    current_name = f"HYPER_MULTICORE_SHMEM_{name}"
+    legacy_name = f"HYPER_PARALLEL_SHMEM_{name}"
+    current, legacy = os.environ.get(current_name), os.environ.get(legacy_name)
+    if current is not None and legacy is not None and current != legacy:
+        raise ValueError(f"Conflicting {current_name} and {legacy_name}")
+    return current if current is not None else legacy if legacy is not None else default
+
+
+def configured_data_engine() -> str:
+    """Return the selected process-wide data engine."""
+    return _configured_shmem_setting("DATA_ENGINE", "mte")
+
+
+def configured_udma_qp_count() -> int:
+    """Read the configured process-wide UDMA bank size before resource binding."""
+    value = _configured_shmem_setting("UDMA_QP_NUM", "32")
+    if value not in ("1", "8", "16", "32"):
+        raise ValueError("HYPER_PARALLEL_SHMEM_UDMA_QP_NUM must be 1, 8, 16 or 32")
+    if value != "32" and configured_data_engine() != "mte_udma":
+        raise ValueError("A reduced UDMA QP bank requires mte_udma")
+    return int(value)
 
 
 def _load_native() -> Any:

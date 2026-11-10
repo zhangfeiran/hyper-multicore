@@ -1,0 +1,49 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Immutable EP-rank node identities independent of rank numbering and device count."""
+
+from collections.abc import Sequence
+from pathlib import Path
+import socket
+
+
+def _local_node_identity() -> str:
+    """Prefer a kernel boot identity shared by containers on the same machine."""
+    try:
+        identity = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip()
+    except OSError:
+        identity = ''
+    return identity or socket.gethostname()
+
+
+def _node_ids(identities: Sequence[str]) -> tuple[int, ...]:
+    """Assign node labels in EP-rank order without assuming contiguous rank groups."""
+    labels = {}
+    result = []
+    for identity in identities:
+        if not isinstance(identity, str) or not identity:
+            raise ValueError('Replica topology requires a nonempty node identity for every EP rank')
+        if identity not in labels:
+            labels[identity] = len(labels)
+        result.append(labels[identity])
+    return tuple(result)
+
+
+def _validate_rank_nodes(nodes: Sequence[int], size: int) -> tuple[int, ...]:
+    """Freeze optional node labels and reject malformed process-group topology."""
+    frozen = tuple(nodes)
+    if frozen and (len(frozen) != size or any(type(node) is not int or node < 0 for node in frozen)):
+        raise ValueError('Replica rank_nodes must contain one nonnegative integer node label per EP rank')
+    return frozen

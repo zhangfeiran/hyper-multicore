@@ -233,7 +233,7 @@ def _validate_vendor_resources(root: Path, soc_list: list[str], host_arch: str) 
     if (
         not isinstance(soc_list, list)
         or not soc_list
-        or any(soc not in {"ascend910b", "ascend910_93"} for soc in soc_list)
+        or any(soc not in {"ascend910b", "ascend910_93", "ascend950"} for soc in soc_list)
     ):
         raise RuntimeError(f"Missing or unsupported payload SoC list: {soc_list}")
     if host_arch not in {"aarch64", "x86_64"}:
@@ -247,7 +247,8 @@ def _validate_vendor_resources(root: Path, soc_list: list[str], host_arch: str) 
     for soc in soc_list:
         indexes = [vendor / f"kernel/config/{soc}/binary_info_config.json"]
         required = [*host_libraries, vendor / f"config/{soc}/aic-{soc}-ops-info.json", *indexes]
-        for operator in _VENDOR_OPERATORS:
+        operators = _VENDOR_OPERATORS + (("pangu_mxfp8_task_graph",) if soc == "ascend950" else ())
+        for operator in operators:
             index = vendor / f"kernel/config/{soc}/{operator}.json"
             required.append(index)
             indexes.append(index)
@@ -261,6 +262,21 @@ def _validate_vendor_resources(root: Path, soc_list: list[str], host_arch: str) 
         for path in required:
             if not path.is_file() or path.stat().st_size == 0:
                 raise RuntimeError(f"Missing or empty native payload resource: {path.relative_to(root)}")
+    if "ascend950" in soc_list:
+        receipt_path = root / "lib/capabilities/mxfp8_window.json"
+        if not receipt_path.is_file():
+            raise RuntimeError(f"Missing native payload resource: {receipt_path.relative_to(root)}")
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            expected = "PanguMxfp8TaskGraph_ed65f2bbd39f9cc68999acec5148f3f8.o"
+            binary = vendor / "kernel/ascend950/pangu_mxfp8_task_graph" / expected
+            metadata = json.loads(binary.with_suffix(".json").read_text(encoding="utf-8"))
+            if (receipt.get("schema") != 7 or receipt.get("object") != expected
+                    or not isinstance(receipt.get("features"), list)
+                    or receipt.get("sha256") != _sha256(binary) or metadata.get("sha256") != _sha256(binary)):
+                raise ValueError("MXFP8 capability receipt or kernel metadata does not match the object")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"Invalid MXFP8 native payload: {error}") from error
 
 
 def validate_payload(root: Path, info: dict) -> None:

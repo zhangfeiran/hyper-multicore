@@ -49,6 +49,8 @@ REG_OP(HyperMegaMoeGrad)
   .INPUT(runtime_config, TensorType({ge::DT_UINT8, ge::DT_UINT8}))
   .INPUT(all_event_counters, TensorType({ge::DT_UINT8, ge::DT_UINT8}))
   .INPUT(diagnostic_buffer, TensorType({ge::DT_UINT8, ge::DT_UINT8}))
+  .INPUT(shared_ptrs, TensorType({ge::DT_UINT8, ge::DT_UINT8}))
+  .INPUT(shared_runtime, TensorType({ge::DT_UINT8, ge::DT_UINT8}))
   .OUTPUT(dispatch_target, TensorType({ge::DT_FLOAT16, ge::DT_BF16}))
   .OUTPUT(hidden_dw, TensorType({ge::DT_FLOAT16, ge::DT_BF16}))
   .OUTPUT(y, TensorType({ge::DT_FLOAT16, ge::DT_BF16}))  // act_grad_y

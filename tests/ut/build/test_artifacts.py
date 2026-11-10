@@ -46,9 +46,15 @@ def _payload_fixture(root, socs=("ascend910b",)):
         binaries = {}
         resources.extend((f"{base}/config/{soc}/aic-{soc}-ops-info.json",
                           f"{base}/kernel/config/{soc}/binary_info_config.json"))
-        for operator in ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_mega_mhc", "hyper_mega_mhc_grad",
-                         "hyper_mega_gate_route", "hyper_mega_gate_route_grad"):
-            variants = ("kernel", "alternative") if operator == "hyper_mega_moe" else ("kernel",)
+        operators = ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_mega_mhc", "hyper_mega_mhc_grad",
+                     "hyper_mega_gate_route", "hyper_mega_gate_route_grad")
+        if soc == "ascend950":
+            operators += ("pangu_mxfp8_task_graph",)
+        for operator in operators:
+            if operator == "pangu_mxfp8_task_graph":
+                variants = ("PanguMxfp8TaskGraph_ed65f2bbd39f9cc68999acec5148f3f8",)
+            else:
+                variants = ("kernel", "alternative") if operator == "hyper_mega_moe" else ("kernel",)
             binary_list, bin_list = [], []
             for variant in variants:
                 relative = f"{soc}/{operator}/{variant}"
@@ -65,6 +71,16 @@ def _payload_fixture(root, socs=("ascend910b",)):
         path.write_bytes(b"{}" if path.suffix == ".json" else b"fixture")
     for relative, contents in indexes.items():
         (root / relative).write_text(json.dumps(contents), encoding="utf-8")
+    if "ascend950" in socs:
+        name = "PanguMxfp8TaskGraph_ed65f2bbd39f9cc68999acec5148f3f8"
+        binary = root / base / "kernel/ascend950/pangu_mxfp8_task_graph" / (name + ".o")
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        binary.with_suffix(".json").write_text(json.dumps({"sha256": digest}), encoding="utf-8")
+        receipt = root / "lib/capabilities/mxfp8_window.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({"schema": 7, "object": name + ".o", "sha256": digest, "features": []}),
+                           encoding="utf-8")
+        resources.append(str(receipt.relative_to(root)))
     variant = {"id": "fixture", "torch_release": "2.12.0", "pta_release": "2.12.0", "torch_version": "2.12.0+cpu",
                "pta_version": "2.12.0", "torch_cxx11_abi": True, "torch_so": "adapters/fixture/libhyper_multicore_torch.so",
                "shmem_so": "adapters/fixture/hyper_multicore_shmem_torch.so"}
@@ -79,6 +95,20 @@ def _payload_fixture(root, socs=("ascend910b",)):
 
 class TestArtifacts(unittest.TestCase):
     """Keep PTA labels and required native inputs explicit."""
+
+    def test_a5_payload_requires_matching_mxfp8_receipt(self):
+        """Regenerated payload hashes cannot hide a missing or mismatched MX kernel receipt."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            info = _payload_fixture(root, ("ascend950",))
+            HELPER.validate_payload(root, info)
+            receipt = root / "lib/capabilities/mxfp8_window.json"
+            payload = json.loads(receipt.read_text())
+            payload["sha256"] = "0" * 64
+            receipt.write_text(json.dumps(payload), encoding="utf-8")
+            info["payload_sha256"] = HELPER._payload_hashes(root)
+            with self.assertRaisesRegex(RuntimeError, "Invalid MXFP8 native payload"):
+                HELPER.validate_payload(root, info)
 
     def test_pta_version_and_post_release(self):
         """PTA supplies the complete public label, not the Torch version."""

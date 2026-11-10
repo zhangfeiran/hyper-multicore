@@ -43,6 +43,7 @@ _HOST_ELF_PATHS = {
 }
 _HOST_IDENTITY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _HOST_SOC_PRIORITY = {
+    "ascend950": 0,
     "ascend910_93": 0,
     "ascend910b": 1,
 }

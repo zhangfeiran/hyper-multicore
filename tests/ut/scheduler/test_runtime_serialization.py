@@ -145,10 +145,10 @@ class TestRuntimeSerialization(unittest.TestCase):
                 graph = graph_builder(values, hidden_size=128, intermediate_size=128, num_cube_cores=20)
                 graph.propagate_splits(values)
                 cfg = config_builder(graph, values, 63, 20)
-                self.assertEqual(len(cfg.all_event_num_triggers), 1104)
-                self.assertEqual(len(cfg.all_events), 1104)
+                self.assertEqual(len(cfg.all_event_num_triggers), 1120)
+                self.assertEqual(len(cfg.all_events), 1120)
                 image = serialize_runtime_config(cfg)
-                self.assertEqual(struct.unpack_from("<I", image, 12)[0], 1104)
+                self.assertEqual(struct.unpack_from("<I", image, 12)[0], 1120)
 
     def test_expert_scratch_bounds_are_checked_before_allocation_or_copy(self) -> None:
         """Reject overflow and metadata whose lists exceed the host allocation."""
@@ -399,7 +399,7 @@ class TestRuntimeCppReader(unittest.TestCase):
     def test_ready_header_and_persistent_storage_bounds(self) -> None:
         """Read ready metadata without tags and bound the persistent tail."""
         for ep_size, experts, events, mode in ((2, 4, 1024, "push"), (2, 4, 1024, "pull"),
-                                                (64, 1024, 1104, "push"), (64, 1024, 1104, "pull")):
+                                                (64, 1024, 1120, "push"), (64, 1024, 1120, "pull")):
             with self.subTest(ep_size=ep_size):
                 cfg = allocate_runtime_config(17, events)
                 cfg.task_num = 17

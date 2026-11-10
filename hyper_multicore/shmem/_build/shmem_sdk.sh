@@ -10,6 +10,27 @@
 # -----------------------------------------------------------------------------------------------------------
 # Private SHMEM SDK preparation for Multicore builds.
 
+function hp_shmem_soc_type() {
+    local selected_type="" requested_soc soc_type
+    local -a requested_socs=()
+    IFS=',' read -r -a requested_socs <<< "$1"
+    for requested_soc in "${requested_socs[@]}"; do
+        requested_soc="${requested_soc//[[:space:]]/}"
+        case "${requested_soc}" in
+            ascend910b|ascend910_93) soc_type=Ascend910B ;;
+            ascend950) soc_type=Ascend950 ;;
+            *) echo "ERROR: Unsupported SHMEM SoC '${requested_soc}'." >&2; return 10 ;;
+        esac
+        if [[ -n "${selected_type}" && "${selected_type}" != "${soc_type}" ]]; then
+            echo "ERROR: Prepare separate SHMEM SDKs for the requested device generations." >&2
+            return 10
+        fi
+        selected_type=${soc_type}
+    done
+    [[ -n "${selected_type}" ]] || return 10
+    printf '%s\n' "${selected_type}"
+}
+
 function hp_prepare_shmem_sdk() {
     local project_root=$1
     local soc_list=$2
@@ -20,13 +41,18 @@ function hp_prepare_shmem_sdk() {
     local locked_commit
     local prepared_dependency
     local wrapper="${project_root}/hyper_multicore/shmem/cmake/shmem_wrapper"
-    local requested_soc
-    local -a requested_socs=()
+    local soc_type
+    soc_type=$(hp_shmem_soc_type "${soc_list}") || return $?
 
     if [[ -z "${ASCEND_HOME_PATH:-}" || ! -d "${ASCEND_HOME_PATH}" ]]; then
         echo "HP_NATIVE_REASON_CODE=CANN_ENV_NOT_CONFIGURED"
         echo "ERROR: ASCEND_HOME_PATH must identify the selected CANN installation." >&2
         echo "       Source the required CANN set_env.sh before invoking the native build." >&2
+        return 3
+    fi
+    if [[ "${soc_type}" == Ascend950 && ! -s "${ASCEND_HOME_PATH}/lib64/libhcomm.so" ]]; then
+        echo "HP_NATIVE_REASON_CODE=A5_HCOMM_LIBRARY_NOT_FOUND"
+        echo "ERROR: Ascend950 SHMEM requires lib64/libhcomm.so in the selected CANN installation." >&2
         return 3
     fi
     local cann_version_file="${ASCEND_HOME_PATH}/opp/version.info"
@@ -69,10 +95,13 @@ import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
-    lock = json.load(source)["components"]["multicore"]["shmem"]
-encoded = json.dumps(lock, sort_keys=True, separators=(",", ":")).encode()
+    components = json.load(source)["components"]["multicore"]
+inputs = {"shmem": components["shmem"]}
+if sys.argv[2] == "Ascend950":
+    inputs["nlohmann_json"] = components["nlohmann_json"]
+encoded = json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
 print(hashlib.sha256(encoded).hexdigest())
-' "${project_root}/hyper_multicore/_build/dependencies.lock.json"); then
+' "${project_root}/hyper_multicore/_build/dependencies.lock.json" "${soc_type}"); then
         echo "HP_NATIVE_REASON_CODE=SHMEM_LOCK_INVALID"
         echo "ERROR: Cannot read the locked SHMEM dependency contract." >&2
         return 4
@@ -80,7 +109,8 @@ print(hashlib.sha256(encoded).hexdigest())
     toolchain_key=$(
         {
             printf '%s\n' \
-                "schema=2" \
+                "schema=3" \
+                "soc_type=${soc_type}" \
                 "cann_root=${cann_root}" \
                 "bisheng=${bisheng_path}" \
                 "host_arch=${host_arch}" \
@@ -98,6 +128,9 @@ print(hashlib.sha256(encoded).hexdigest())
             sha256sum "${project_root}/hyper_multicore/cmake/hardening.cmake" \
                 "${project_root}/hyper_multicore/shmem/cmake/shmem_wrapper/CMakeLists.txt" \
                 "${project_root}/hyper_multicore/shmem/_build/shmem_sdk.sh"
+            if [[ "${soc_type}" == Ascend950 ]]; then
+                sha256sum "${ASCEND_HOME_PATH}/lib64/libhcomm.so"
+            fi
         } | sha256sum | awk '{print substr($1, 1, 16)}'
     )
     if [[ ! "${toolchain_key}" =~ ^[0-9a-f]{16}$ ]]; then
@@ -109,25 +142,6 @@ print(hashlib.sha256(encoded).hexdigest())
     source_dir="${work_root}/shmem-source"
     build_dir="${work_root}/shmem"
     install_root="${work_root}/shmem-install"
-
-    IFS=',' read -r -a requested_socs <<< "${soc_list}"
-    for requested_soc in "${requested_socs[@]}"; do
-        requested_soc="${requested_soc//[[:space:]]/}"
-        case "${requested_soc}" in
-            ascend910b|ascend910_93)
-                ;;
-            ascend950)
-                echo "HP_NATIVE_REASON_CODE=SOC_SOURCE_NOT_SUPPORTED"
-                echo "ERROR: The locked SHMEM source does not support ascend950 in this build." >&2
-                return 10
-                ;;
-            *)
-                echo "HP_NATIVE_REASON_CODE=UNSUPPORTED_SOC_SELECTION"
-                echo "ERROR: Unsupported SoC '${requested_soc}' in --soc-list=${soc_list}." >&2
-                return 10
-                ;;
-        esac
-    done
 
     if ! prepared_dependency=$("${python_bin}" "${project_root}/hyper_multicore/_build/prepare_dependencies.py" \
         --dependency shmem); then
@@ -185,12 +199,25 @@ PY
     fi
     rm -rf "${install_root}"
 
+    if [[ "${soc_type}" == Ascend950 ]]; then
+        local json_dependency json_source json_commit
+        json_dependency=$("${python_bin}" "${project_root}/hyper_multicore/_build/prepare_dependencies.py" \
+            --dependency nlohmann_json) || return $?
+        json_source=$("${python_bin}" -c 'import json,sys; print(json.loads(sys.argv[1])["nlohmann_json"]["source_dir"])' \
+            "${json_dependency}") || return 6
+        json_commit=$("${python_bin}" -c 'import json,sys; print(json.loads(sys.argv[1])["nlohmann_json"]["commit"])' \
+            "${json_dependency}") || return 6
+        mkdir -p "${source_dir}/3rdparty/json/single_include/nlohmann"
+        git -C "${json_source}" show "${json_commit}:single_include/nlohmann/json.hpp" > \
+            "${source_dir}/3rdparty/json/single_include/nlohmann/json.hpp" || return 6
+    fi
+
     echo "INFO: preparing pinned CANN SHMEM SDK"
     echo "  locked source: ${locked_source_dir}"
     echo "  isolated source: ${source_dir}"
     echo "  CANN toolchain: ${cann_root} (${bisheng_path})"
     echo "  host toolchain: ${host_arch} (${gcc_path}, ${gxx_path})"
-    echo "  soc family: Ascend910B (used by ascend910b and ascend910_93)"
+    echo "  soc family: ${soc_type}"
     echo "  install root: ${install_root}"
 
     cmake -S "${wrapper}" \
@@ -201,12 +228,14 @@ PY
         -DUSE_UNIT_TEST=OFF \
         -DUSE_EXAMPLES=OFF \
         -DBUILD_PYTHON=OFF \
+        -DACLSHMEM_RDMA_SUPPORT=OFF \
         -DCMAKE_DISABLE_FIND_PACKAGE_MPI=TRUE \
-        -DSOC_TYPE=Ascend910B
+        -DSOC_TYPE="${soc_type}"
     cmake --build "${build_dir}" --parallel "${native_jobs}"
     cmake --install "${build_dir}" --prefix "${install_root}/shmem"
 
     HP_SHMEM_INSTALL_ROOT="${install_root}"
     HP_SHMEM_TOOLCHAIN_KEY="${toolchain_key}"
-    export HP_SHMEM_INSTALL_ROOT HP_SHMEM_TOOLCHAIN_KEY
+    HP_SHMEM_SOC_TYPE="${soc_type}"
+    export HP_SHMEM_INSTALL_ROOT HP_SHMEM_TOOLCHAIN_KEY HP_SHMEM_SOC_TYPE
 }

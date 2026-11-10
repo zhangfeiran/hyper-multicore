@@ -51,6 +51,7 @@ from hyper_multicore.scheduler.config import (
     init_task_split_value,
     validate_runtime_config,
 )
+from hyper_multicore.modules.mega_moe.shared_schedule import reorder_shared_tasks
 from hyper_multicore.scheduler.graph import ComputeGraph
 from hyper_multicore.scheduler.runtime import serialize_runtime_config
 from hyper_multicore.scheduler.scheduler import revise_task_queue
@@ -88,7 +89,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
-                          num_cube_cores: int = 24) -> RuntimeConfigC:
+                          num_cube_cores: int = 24, *, shared_placement: str = "tail") -> RuntimeConfigC:
     """Build RuntimeConfig for a single rank.
 
     Args:
@@ -100,7 +101,7 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     Returns:
         Validated runtime image including transport handshakes and profiler metadata.
     """
-    cfg = allocate_graph_config(graph, tsv)
+    cfg = allocate_graph_config(graph, tsv, num_cube_cores)
     cfg.num_workers    = 2 * num_cube_cores   # NUM_WORKERS_VECTOR = 2 × NUM_WORKERS_CUBE
 
     init_task_split_value(tsv)
@@ -117,7 +118,11 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     swiglu_op   = graph.get_op("swiglu")
     combine_op  = graph.get_op("combine")
     add_terminate(cfg, tsv, combine_op.task_num // tsv.ep * tsv.ep)
-    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_op.task_num, combine_op.task_num)
+    if any(op.name.startswith("shared_") for op in graph.topological_sort()):
+        reorder_shared_tasks(cfg, graph, tsv, num_cube_cores,
+                             backward=False, placement=shared_placement)
+    else:
+        revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_op.task_num, combine_op.task_num)
     add_dynamic_data(cfg, tsv, dynamic_input_position=6)
 
     cfg.task_num = task_num_all

@@ -103,6 +103,9 @@ enum class TaskType : uint32_t {
   TASK_GATE_GRAD_ADD_SELECTED = 139,
   TASK_GATE_GRAD_ZEROS = 140,
   TASK_SHMEM_GET_MEM = 141,
+  TASK_MOE_OWNER_GET = 142,
+  TASK_MOE_TOKEN_GET = 143,
+  TASK_MOE_ROUTE_GRAD = 144,
 };
 
 enum class EventType : uint32_t {
@@ -164,7 +167,7 @@ struct TaskDesc {
   uint32_t task_split_num;
   uint32_t task_split_value;
   uint32_t extra_value_0;
-  uint32_t extra_value_1;
+  uint32_t extra_value_1;  // GMM: optional producer completion event; zero disables it.
   uint32_t extra_value_2;
   uint32_t profile_desc_id;
   uint32_t profile_owner_id;
@@ -197,6 +200,11 @@ __aicore__ inline uint32_t getTaskNum(__gm__ uint8_t *tiling) { return (*(__gm__
 
 __aicore__ inline uint32_t getNumWorkers(__gm__ uint8_t *tiling) {
   return (*(__gm__ uint32_t *)(tiling + UINT32_T_SIZE));
+}
+
+__aicore__ inline uint32_t getCubeWorkerCapacity(__gm__ uint8_t *tiling) {
+  const uint32_t workers = (static_cast<uint64_t>(getNumWorkers(tiling)) + 1) / 2;
+  return workers > NUM_WORKERS_CUBE ? workers : NUM_WORKERS_CUBE;
 }
 
 __aicore__ inline uint32_t getRuntimeTaskCapacity(__gm__ uint8_t *tiling) {
@@ -403,7 +411,8 @@ __aicore__ inline uint64_t getGroupedMatmulGroupListStride(__gm__ uint8_t *tilin
 }
 
 __aicore__ inline uint64_t getGroupedMatmulGroupListBytes(__gm__ uint8_t *tiling) {
-  const uint64_t bytes = NUM_WORKERS_CUBE * getGroupedMatmulGroupListStride(tiling) + GROUP_LIST_CACHE_LINE_BYTES;
+  const uint64_t bytes = getCubeWorkerCapacity(tiling) * getGroupedMatmulGroupListStride(tiling) +
+                         GROUP_LIST_CACHE_LINE_BYTES;
   const uint64_t minimum = MIN_GROUP_LIST_CAPACITY * INT64_T_SIZE;
   return bytes > minimum ? bytes : minimum;
 }

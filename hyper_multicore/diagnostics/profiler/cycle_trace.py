@@ -36,7 +36,8 @@ from hyper_multicore.scheduler.config import (
 )
 from hyper_multicore.diagnostics.common.graph import _scheduled_task_ids
 from hyper_multicore.diagnostics.common.runtime import DiagnosticMode, PreparedDiagnosticRuntime
-
+from hyper_multicore.scheduler.runtime import runtime_cube_worker_capacity
+from hyper_multicore.scheduler.planned_queue import PLANNED_QUEUE_TAG
 
 CUBE_SLOT_COUNT = NUM_WORKERS_CUBE
 VECTOR_SLOT_COUNT = NUM_WORKERS_VECTOR
@@ -52,16 +53,24 @@ MAX_PROFILE_BUFFER_BYTES = CORE_SLOT_COUNT * MAX_CORE_STRIDE_BYTES
 INVALID_OWNER_ID = 0xFFFFFFFF
 TASK_TYPE_DESC_BASE = 0x20000
 GRAPH_STAGE_DESC_BASE = 0x30000
+# GetSystemCycle uses the fixed system counter, not the variable AI Core clock.
 _SYSTEM_COUNTER_FREQUENCY_MHZ = {
     "ascend910b": 50.0,
     "ascend910c": 50.0,
     "ascend910_93": 50.0,
+    "ascend950": 1000.0,
 }
 
 DEFAULT_STAGE_NAMES = {
     0x10000: "WaitDependency",
     0x10006: "TerminateTask",
     0x10007: "TriggerEvent",
+    0x10008: "ReplicaW2Return",
+    0x10009: "ReplicaW13Return",
+    0x1000A: "ReplicaW13WeightReadyWait",
+    0x1000B: "ReplicaW2WeightReadyWait",
+    0x1001E: "WorkerTasksComplete",
+    0x1001F: "WorkerComplete",
 }
 TASK_TYPE_NAMES = {
     0: "Terminate",
@@ -128,6 +137,7 @@ class _ProfileLayout:
     aiv_required_records: int
     aic_record_capacity: int
     aiv_record_capacity: int
+    cube_slot_count: int = CUBE_SLOT_COUNT
 
     @property
     def buffer_size(self) -> int:
@@ -135,6 +145,7 @@ class _ProfileLayout:
         return _profile_buffer_bytes_for_capacities(
             self.aic_record_capacity,
             self.aiv_record_capacity,
+            self.cube_slot_count,
         )
 
 
@@ -151,6 +162,7 @@ class _CycleTraceConfig:
     stage_names: Mapping[int, str]
     soc_name: str
     task_stage_names: Mapping[int, str] | None = None
+    cube_slot_count: int = CUBE_SLOT_COUNT
 
 
 def _get_soc_name(device_id: int | None) -> str:
@@ -189,10 +201,12 @@ def _validate_runtime_config(runtime_config: RuntimeConfigC) -> None:
         raise TypeError(f"runtime_config must be RuntimeConfigC, got {type(runtime_config).__name__}")
 
 
-def _profile_buffer_bytes_for_capacities(aic_record_capacity: int, aiv_record_capacity: int) -> int:
+def _profile_buffer_bytes_for_capacities(
+    aic_record_capacity: int, aiv_record_capacity: int, cube_slot_count: int = CUBE_SLOT_COUNT,
+) -> int:
     aic_stride = CORE_HEADER.size + aic_record_capacity * PROFILE_RECORD.size
     aiv_stride = CORE_HEADER.size + aiv_record_capacity * PROFILE_RECORD.size
-    return CUBE_SLOT_COUNT * aic_stride + VECTOR_SLOT_COUNT * aiv_stride
+    return cube_slot_count * aic_stride + 2 * cube_slot_count * aiv_stride
 
 
 def _round_up_record_capacity(required_records: int) -> int:
@@ -205,8 +219,8 @@ def _round_up_record_capacity(required_records: int) -> int:
 
 
 def _records_for_task(task_desc: TaskDescC) -> int:
-    """Mirror the wait, compute, and trigger records emitted by ExecuteTaskProfiled()."""
-    record_count = 1
+    """Bound dependency, compute, trigger and optional guest-weight wait records."""
+    record_count = 1 + int(task_desc.task_type == TaskType.TASK_GROUPED_MATMUL)
     if task_desc.dependent_event != EVENT_INVALID_ID:
         record_count += 1
     if task_desc.task_type != TaskType.TASK_SHMEM_PUT_MEM_SIGNAL:
@@ -243,11 +257,8 @@ def _calculate_aiv_pipeline_profile_layout(
 ) -> _ProfileLayout:
     """Size AIV slots for workers that each execute the complete stage sequence."""
     worker_capacity = int(runtime_config.num_workers)
-    if not 0 < worker_capacity <= VECTOR_SLOT_COUNT:
-        raise ValueError(
-            "AIV pipeline worker capacity must be in "
-            f"[1, {VECTOR_SLOT_COUNT}], got {worker_capacity}"
-        )
+    if worker_capacity <= 0:
+        raise ValueError(f"AIV pipeline worker capacity must be positive, got {worker_capacity}")
     scheduled_task_count = int(runtime_config.task_index_num[1])
     if not 0 <= scheduled_task_count <= len(runtime_config.vector_task_indices):
         raise ValueError(f"scheduled task count is outside RuntimeConfig capacity: {scheduled_task_count}")
@@ -265,18 +276,18 @@ def _calculate_aiv_pipeline_profile_layout(
         aiv_required_records=required_records,
         aic_record_capacity=0,
         aiv_record_capacity=_round_up_record_capacity(required_records),
+        cube_slot_count=runtime_cube_worker_capacity(worker_capacity),
     )
 
 
 def _calculate_event_driven_profile_layout(
-    runtime_config: RuntimeConfigC, vector_worker_stride: int = 2,
+    runtime_config: RuntimeConfigC, vector_worker_stride: int = 2, *,
+    replica_gradient_records: int = 0, producer_records: int = 0,
 ) -> _ProfileLayout:
     """Size AIC/AIV slots for event-driven task queues using the busiest worker."""
     num_workers = int(runtime_config.num_workers)
-    if num_workers < 0 or num_workers % 2 != 0 or num_workers > VECTOR_SLOT_COUNT:
-        raise ValueError(
-            f"RuntimeConfig.num_workers must be an even value in [0, {VECTOR_SLOT_COUNT}], got {num_workers}"
-        )
+    if num_workers < 0 or num_workers % 2 != 0:
+        raise ValueError(f"RuntimeConfig.num_workers must be a nonnegative even value, got {num_workers}")
     active_worker_count = num_workers // 2
     aic_required_records = _max_worker_record_count(
         runtime_config,
@@ -290,31 +301,64 @@ def _calculate_event_driven_profile_layout(
         int(runtime_config.task_index_num[1]),
         num_workers // vector_worker_stride,
     )
+    if int(runtime_config.task_index_num[3]) == PLANNED_QUEUE_TAG:
+        scheduled = int(runtime_config.task_index_num[1])
+        if len(runtime_config.mix_task_indices) < num_workers + 1:
+            raise ValueError("planned vector queue offsets exceed RuntimeConfig capacity")
+        offsets = [int(runtime_config.mix_task_indices[worker]) for worker in range(num_workers + 1)]
+        if (offsets[0] != 0 or offsets[-1] != scheduled
+                or any(start < 0 or start > end or end > scheduled
+                       for start, end in zip(offsets, offsets[1:]))):
+            raise ValueError("planned vector queue offsets must cover the scheduled tasks monotonically")
+        # Planned workers consume contiguous CSR slices rather than round-robin indices.
+        aiv_required_records = max((
+            sum(_records_for_task(runtime_config.all_tasks[runtime_config.vector_task_indices[position]])
+                for position in range(start, end))
+            for start, end in zip(offsets, offsets[1:])
+        ), default=0)
+    # Reserved gradient workers bypass the task queue and record both projections.
+    aic_required_records += producer_records + 2
+    aiv_required_records = max(aiv_required_records, replica_gradient_records) + 2
     return _ProfileLayout(
         aic_required_records=aic_required_records,
         aiv_required_records=aiv_required_records,
         aic_record_capacity=_round_up_record_capacity(aic_required_records),
         aiv_record_capacity=_round_up_record_capacity(aiv_required_records),
+        cube_slot_count=runtime_cube_worker_capacity(num_workers),
     )
 
 
 def _calculate_profile_layout(
-    runtime_config: RuntimeConfigC, metadata: _ProfileMetadata | None = None,
+    runtime_config: RuntimeConfigC, metadata: _ProfileMetadata | None = None, *,
+    replica_gradient_records: int = 0, producer_records: int = 0,
 ) -> _ProfileLayout:
     """Select the profile layout algorithm for the configured task execution mode."""
     _validate_runtime_config(runtime_config)
+    if (isinstance(replica_gradient_records, bool) or not isinstance(replica_gradient_records, int)
+            or replica_gradient_records < 0):
+        raise ValueError("replica_gradient_records must be a nonnegative integer")
+    if isinstance(producer_records, bool) or not isinstance(producer_records, int) or producer_records < 0:
+        raise ValueError("producer_records must be a nonnegative integer")
     if metadata is None:
         metadata = _ProfileMetadata("MegaKernel", "Owner", {}, {}, _TaskExecutionMode.EVENT_DRIVEN)
     if metadata.execution_mode is _TaskExecutionMode.AIV_PIPELINE:
         return _calculate_aiv_pipeline_profile_layout(runtime_config)
     if metadata.execution_mode is _TaskExecutionMode.EVENT_DRIVEN:
-        return _calculate_event_driven_profile_layout(runtime_config, metadata.vector_worker_stride)
+        return _calculate_event_driven_profile_layout(
+            runtime_config, metadata.vector_worker_stride,
+            replica_gradient_records=replica_gradient_records, producer_records=producer_records,
+        )
     raise ValueError(f"unsupported task execution mode: {metadata.execution_mode!r}")
 
 
-def _configure_profile_layout(runtime_config: RuntimeConfigC, metadata: _ProfileMetadata) -> _ProfileLayout:
+def _configure_profile_layout(
+    runtime_config: RuntimeConfigC, metadata: _ProfileMetadata, *,
+    replica_gradient_records: int = 0, producer_records: int = 0,
+) -> _ProfileLayout:
     """Calculate and serialize the bounded AIC/AIV record capacities."""
-    layout = _calculate_profile_layout(runtime_config, metadata)
+    layout = _calculate_profile_layout(
+        runtime_config, metadata, replica_gradient_records=replica_gradient_records, producer_records=producer_records,
+    )
     runtime_config.aic_profile_record_capacity = layout.aic_record_capacity
     runtime_config.aiv_profile_record_capacity = layout.aiv_record_capacity
     return layout
@@ -369,7 +413,9 @@ class _PreparedProfileRuntime:
             self._metadata.task_stage_names, _TaskExecutionMode(runtime.spec.execution_mode),
             runtime.spec.vector_worker_stride,
         )
-        self._layout = _configure_profile_layout(runtime_config, self._metadata)
+        self._layout = _configure_profile_layout(
+            runtime_config, self._metadata, replica_gradient_records=runtime.spec.extra_aiv_records,
+            producer_records=runtime.spec.extra_aic_records)
         self._rank = runtime.rank
         self._device_id = runtime.device_id
         self._host_config = runtime_config
@@ -448,19 +494,43 @@ class _PreparedProfileRuntime:
                 stage_names=self._metadata.stage_names,
                 soc_name=soc_name,
                 task_stage_names=self._metadata.task_stage_names,
+                cube_slot_count=self._layout.cube_slot_count,
             ),
             aic_record_capacity=self._layout.aic_record_capacity,
             aiv_record_capacity=self._layout.aiv_record_capacity,
         )
 
 
-def _as_bytes(buffer: Any) -> bytes:
+def _replica_causal_args(record: Mapping[str, int]) -> dict[str, Any]:
+    """Decode bounded protocol transitions without aligning independent device clocks."""
+    names = {1: "ProducerReady", 2: "HeadPendingWindow", 3: "ConsumerReadyObserved",
+             4: "GradientReturn", 5: "IndependentReadyObserved", 6: "ReplicaReturnsMerged",
+             7: "AckIssued", 8: "AckObserved", 9: "EmptyProducerReady",
+             10: "LocalNotReadyObserved", 11: "GuestNotReadyObserved"}
+    descriptor = record["desc_id"]
+    kind = descriptor & 0xFF
+    if (descriptor & 0xFFE00) != 0x11000 or kind not in names:
+        return {}
+    band = record["task_id"] & 0xFF
+    expert = record["owner_id"] & 0xFFFF
+    producer_core = (record["task_id"] >> 8) & 63
+    return {"replica_protocol": "causal_v1", "task_stage": names[kind],
+            "projection": "W13" if descriptor & 0x100 else "W2",
+            "epoch": record["stage_task_index"], "band": None if band == 255 else band,
+            "peer_ep_rank": record["task_id"] >> 14,
+            "producer_core": None if producer_core == 63 else producer_core,
+            "ep_local_rank": record["owner_id"] >> 16,
+            "physical_expert": None if expert == 65535 else expert,
+            "observation": "local_state_transition", "producer_has_no_tiles": kind == 9}
+
+
+def _as_bytes(buffer: Any, cube_slot_count: int = CUBE_SLOT_COUNT) -> bytes:
     """Convert an array-like profile buffer to validated immutable bytes."""
     if hasattr(buffer, "tobytes"):
         raw_buffer = buffer.tobytes()
     else:
         raw_buffer = bytes(buffer)
-    minimum_buffer_bytes = CORE_SLOT_COUNT * CORE_HEADER.size
+    minimum_buffer_bytes = 3 * cube_slot_count * CORE_HEADER.size
     if len(raw_buffer) < minimum_buffer_bytes:
         raise ValueError(
             f"MegaKernel profile buffer is too small: expected at least {minimum_buffer_bytes} bytes, "
@@ -484,13 +554,15 @@ def _validate_record_capacity(record_capacity: int, core_name: str) -> None:
         )
 
 
-def _profile_layout_from_buffer(raw_buffer: bytes) -> tuple[int, int, int]:
+def _profile_layout_from_buffer(
+    raw_buffer: bytes, cube_slot_count: int = CUBE_SLOT_COUNT,
+) -> tuple[int, int, int]:
     """Read AIC/AIV capacities from the first initialized header of each slot region."""
     aic_header = CORE_HEADER.unpack_from(raw_buffer, 0)
     aic_record_capacity = aic_header[5]
     _validate_record_capacity(aic_record_capacity, "AIC")
     aic_stride = CORE_HEADER.size + aic_record_capacity * PROFILE_RECORD.size
-    aiv_region_offset = CUBE_SLOT_COUNT * aic_stride
+    aiv_region_offset = cube_slot_count * aic_stride
     if len(raw_buffer) < aiv_region_offset + CORE_HEADER.size:
         raise ValueError(
             f"MegaKernel profile buffer is too small for the AIV header: "
@@ -502,6 +574,7 @@ def _profile_layout_from_buffer(raw_buffer: bytes) -> tuple[int, int, int]:
     required_buffer_bytes = _profile_buffer_bytes_for_capacities(
         aic_record_capacity,
         aiv_record_capacity,
+        cube_slot_count,
     )
     if len(raw_buffer) < required_buffer_bytes:
         raise ValueError(
@@ -511,13 +584,15 @@ def _profile_layout_from_buffer(raw_buffer: bytes) -> tuple[int, int, int]:
     return aic_record_capacity, aiv_record_capacity, required_buffer_bytes
 
 
-def _profile_slot_layouts(aic_record_capacity: int, aiv_record_capacity: int):
+def _profile_slot_layouts(
+    aic_record_capacity: int, aiv_record_capacity: int, cube_slot_count: int = CUBE_SLOT_COUNT,
+):
     aic_stride = CORE_HEADER.size + aic_record_capacity * PROFILE_RECORD.size
     aiv_stride = CORE_HEADER.size + aiv_record_capacity * PROFILE_RECORD.size
-    for block_id in range(CUBE_SLOT_COUNT):
+    for block_id in range(cube_slot_count):
         yield 1, block_id, block_id * aic_stride, aic_record_capacity
-    aiv_region_offset = CUBE_SLOT_COUNT * aic_stride
-    for block_id in range(VECTOR_SLOT_COUNT):
+    aiv_region_offset = cube_slot_count * aic_stride
+    for block_id in range(2 * cube_slot_count):
         yield 2, block_id, aiv_region_offset + block_id * aiv_stride, aiv_record_capacity
 
 
@@ -548,6 +623,10 @@ def _event_name(
         stage_name = f"{task_stage_name}_{stage_name}"
     if not detailed_task_names:
         return stage_name
+    if desc_id in (0x1001E, 0x1001F):
+        return "WorkerTasksComplete" if desc_id == 0x1001E else "WorkerComplete"
+    if desc_id in (0x1000A, 0x1000B):
+        return f"ReplicaSlot{owner_id}_{stage_name}_epoch{stage_task_index}"
     task_name = f"{stage_name}_task{stage_task_index + 1}"
     if owner_id == INVALID_OWNER_ID:
         return task_name
@@ -558,10 +637,11 @@ def _resolve_buffer_layout(
     raw_buffer: bytes,
     aic_record_capacity: int | None,
     aiv_record_capacity: int | None,
+    cube_slot_count: int = CUBE_SLOT_COUNT,
 ) -> tuple[int, int, int]:
     """Resolve and validate the two per-core capacities and total buffer size."""
     if aic_record_capacity is None and aiv_record_capacity is None:
-        return _profile_layout_from_buffer(raw_buffer)
+        return _profile_layout_from_buffer(raw_buffer, cube_slot_count)
     if aic_record_capacity is None or aiv_record_capacity is None:
         raise ValueError("AIC and AIV profile capacities must be provided together")
     _validate_record_capacity(aic_record_capacity, "AIC")
@@ -569,6 +649,7 @@ def _resolve_buffer_layout(
     required_buffer_bytes = _profile_buffer_bytes_for_capacities(
         aic_record_capacity,
         aiv_record_capacity,
+        cube_slot_count,
     )
     if len(raw_buffer) < required_buffer_bytes:
         raise ValueError(
@@ -686,12 +767,13 @@ def _decode_cycle_records(
     raw_buffer: bytes,
     aic_record_capacity: int,
     aiv_record_capacity: int,
+    cube_slot_count: int = CUBE_SLOT_COUNT,
 ) -> tuple[list[dict[str, int]], list[int], int]:
     """Decode all initialized AIC/AIV slots and aggregate drop counters."""
     raw_records = []
     active_entry_cycles = []
     dropped_records = 0
-    for slot, layout in enumerate(_profile_slot_layouts(aic_record_capacity, aiv_record_capacity)):
+    for slot, layout in enumerate(_profile_slot_layouts(aic_record_capacity, aiv_record_capacity, cube_slot_count)):
         records, entry_cycle, dropped_count = _decode_profile_slot(raw_buffer, slot, layout)
         dropped_records += dropped_count
         if entry_cycle is not None:
@@ -768,14 +850,31 @@ def _duration_trace_event(
         "end_cycle": record["end_cycle"],
         "core_entry_cycle": record["entry_cycle"],
     }
-    if task_id in task_stage_names:
+    if desc_id in (0x1001E, 0x1001F):
+        args["task_stage"] = "WorkerTasksComplete" if desc_id == 0x1001E else "WorkerComplete"
+    elif desc_id in (0x1000A, 0x1000B):
+        args["task_stage"] = "ReplicaWeightReadyWait"
+        args["consumer_stage"] = task_stage_names.get(task_id)
+        args["projection"] = "W13" if desc_id == 0x1000A else "W2"
+        args["replica_slot"] = record["owner_id"]
+        args["epoch"] = record["stage_task_index"]
+        args.pop("task_number")
+    elif desc_id in (0x10008, 0x10009):
+        args["task_stage"] = "ReplicaW2Return" if desc_id == 0x10008 else "ReplicaW13Return"
+        args["peer_rank"] = record["stage_task_index"]
+    elif task_id in task_stage_names:
         args["task_stage"] = task_stage_names[task_id]
     if desc_id >= TASK_TYPE_DESC_BASE:
         args["task_type"] = desc_id - TASK_TYPE_DESC_BASE
-    if record["owner_id"] != INVALID_OWNER_ID:
+    if record["owner_id"] != INVALID_OWNER_ID and desc_id not in (0x1000A, 0x1000B):
         args["owner_id"] = record["owner_id"]
+    causal = _replica_causal_args(record)
+    if causal:
+        args.update(causal)
+        args.pop("task_number", None)
+    args["clock_domain"] = f"npu_system_counter:rank{rank}:device{device_id}"
     return {
-        "name": _event_name(
+        "name": ("Replica" + causal["projection"] + causal["task_stage"]) if causal else _event_name(
             desc_id,
             task_id,
             record["stage_task_index"],
@@ -807,16 +906,20 @@ def _parse_cycle_buffer(
         raise ValueError(f"cycle_frequency_mhz must be positive, got {config.cycle_frequency_mhz}")
     resolved_stage_names = _resolve_stage_names(config.stage_names)
     resolved_task_stage_names = dict(config.task_stage_names or {})
-    raw_buffer = _as_bytes(buffer)
+    if config.cube_slot_count < CUBE_SLOT_COUNT:
+        raise ValueError(f"profile Cube slot count must be at least {CUBE_SLOT_COUNT}, got {config.cube_slot_count}")
+    raw_buffer = _as_bytes(buffer, config.cube_slot_count)
     aic_record_capacity, aiv_record_capacity, required_buffer_bytes = _resolve_buffer_layout(
         raw_buffer,
         aic_record_capacity,
         aiv_record_capacity,
+        config.cube_slot_count,
     )
     raw_records, active_entry_cycles, dropped_records = _decode_cycle_records(
         raw_buffer,
         aic_record_capacity,
         aiv_record_capacity,
+        config.cube_slot_count,
     )
     if not raw_records:
         raise ValueError(

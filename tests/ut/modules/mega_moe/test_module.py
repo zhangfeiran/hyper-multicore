@@ -241,9 +241,11 @@ class TestMegaMoeExperts(unittest.TestCase):
                 self.assertIs(kwargs["group"], resources.spec.ep_group)
                 if kind == "layout":
                     peer_specification = list(value[2][0])
-                    self.assertEqual(peer_specification[-3], "EOI")
-                    peer_specification[-3] = "EIO"
-                    peer = (value[0], value[1], (tuple(peer_specification),))
+                    layout_index = peer_specification.index("EOI")
+                    peer_specification[layout_index] = "EIO"
+                    peer = list(value)
+                    peer[2] = (tuple(peer_specification),)
+                    peer = tuple(peer)
                 else:
                     peer = ("dynamic_tokens_v1", *value[1:]) if kind == "wire" else ("different",)
                 output[:] = [value, peer]
@@ -525,7 +527,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         torch.testing.assert_close(hidden_flat, hidden_states.reshape(128, 16))
         mock_prepare.assert_called_once_with(
             hidden_flat, topk_ids, topk_weights, resources.spec, tokens_per_expert,
-            workspace=resources.workspace, autograd_mask=13,
+            workspace=resources.workspace, replica_route=None, autograd_mask=13,
         )
         resources.ensure_capacity.assert_called_once_with(512)
         mock_execute.assert_called_once_with(
@@ -662,7 +664,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         root_group = object()
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None,
-                                     dynamic_tokens=False, auto_tokens=False)
+                                     dynamic_tokens=False, auto_tokens=False, replica_slots_per_rank=0)
         workspace = Mock()
         manager = Mock(root_group=root_group, heap_bytes=1024, epoch=0, workspaces=[], growth_records=[])
         manager.reserve.return_value = ({},)

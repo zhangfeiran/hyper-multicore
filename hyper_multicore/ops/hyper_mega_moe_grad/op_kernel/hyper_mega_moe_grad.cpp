@@ -27,6 +27,7 @@ __global__ __aicore__ void hyper_mega_moe_grad(
   GM_ADDR permute_out, GM_ADDR gate_dw, GM_ADDR group_list, GM_ADDR act_grad_tiling, GM_ADDR gate_grad_tiling,
   GM_ADDR w1_grad_tiling, GM_ADDR w2_grad_tiling, GM_ADDR swiglu_grad_tiling, GM_ADDR gmm_workspace,
   GM_ADDR swiglu_grad_workspace, GM_ADDR runtime_config, GM_ADDR all_event_counters, GM_ADDR diagnostic_buffer,
+  GM_ADDR shared_ptrs, GM_ADDR shared_runtime,
   GM_ADDR dispatch_target_ref,
   GM_ADDR hidden_dw_ref, GM_ADDR y_ref, GM_ADDR grad_gate_ref, GM_ADDR gate_dx_ref, GM_ADDR grad_x_ref,
   GM_ADDR gate_dw_ref, GM_ADDR workspace, GM_ADDR tiling) {
@@ -65,7 +66,7 @@ __global__ __aicore__ void hyper_mega_moe_grad(
                               workspace,
                               tiling,  // 30
                               all_event_counters,
-                              diagnostic_buffer};
+                              diagnostic_buffer, shared_ptrs, shared_runtime};
       uint32_t idx = GetBlockIdx();
       worker_kernel(idx, runtime_config, input_list);
     } else if constexpr (TRANS_A == 0 && TRANS_B == 1 && AIV_AIC_RATIO == GROUPED_MATMUL_CUBE_ONLY) {

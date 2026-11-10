@@ -1,0 +1,41 @@
+--- a/src/device/gm2gm/shmemi_device_rma.cpp
++++ b/src/device/gm2gm/shmemi_device_rma.cpp
+@@ -30,12 +30,12 @@
+     FUNC(char, char)
+ 
+ // kernels
+-ACLSHMEM_GLOBAL void aclshmemi_putmem_nbi(GM_ADDR dst, GM_ADDR src, uint32_t elem_size, int32_t pe)
++ACLSHMEM_GLOBAL_VECTOR void aclshmemi_putmem_nbi(GM_ADDR dst, GM_ADDR src, uint32_t elem_size, int32_t pe)
+ {
+     aclshmem_uint8_put_nbi(dst, src, elem_size, pe);
+ }
+ 
+-ACLSHMEM_GLOBAL void aclshmemi_putmem(GM_ADDR dst, GM_ADDR src, uint32_t elem_size, int32_t pe)
++ACLSHMEM_GLOBAL_VECTOR void aclshmemi_putmem(GM_ADDR dst, GM_ADDR src, uint32_t elem_size, int32_t pe)
+ {
+     aclshmem_uint8_put(dst, src, elem_size, pe);
+ }
+@@ -63,12 +63,12 @@
+     }
+ }
+ 
+-ACLSHMEM_GLOBAL void aclshmemi_getmem_nbi(GM_ADDR dst, GM_ADDR src, uint32_t elem_size, int32_t pe)
++ACLSHMEM_GLOBAL_VECTOR void aclshmemi_getmem_nbi(GM_ADDR dst, GM_ADDR src, uint32_t elem_size, int32_t pe)
+ {
+     aclshmem_uint8_get_nbi(dst, src, elem_size, pe);
+ }
+ 
+-ACLSHMEM_GLOBAL void aclshmemi_getmem(GM_ADDR dst, GM_ADDR src, uint32_t elem_size, int32_t pe)
++ACLSHMEM_GLOBAL_VECTOR void aclshmemi_getmem(GM_ADDR dst, GM_ADDR src, uint32_t elem_size, int32_t pe)
+ {
+     aclshmem_uint8_get(dst, src, elem_size, pe);
+ }
+@@ -115,7 +115,7 @@
+     aclshmem_getmem(dst, src, elem_size, pe);
+ }
+ 
+-ACLSHMEM_GLOBAL void k_aclshmemi_quiet()
++ACLSHMEM_GLOBAL_VECTOR void k_aclshmemi_quiet()
+ {
+     aclshmemi_quiet();
+ }

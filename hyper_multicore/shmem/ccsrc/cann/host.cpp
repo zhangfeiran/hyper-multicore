@@ -195,6 +195,10 @@ runtime::Result<data_op_engine_type_t> DataEngineMask(runtime::DataEngine data_e
   if (data_engine == runtime::DataEngine::Mte) {
     return runtime::Result<data_op_engine_type_t>::Success(ACLSHMEM_DATA_OP_MTE);
   }
+  if (data_engine == runtime::DataEngine::MteUdma) {
+    return runtime::Result<data_op_engine_type_t>::Success(
+      static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA));
+  }
   return runtime::Result<data_op_engine_type_t>::Failure(
     InvalidArgument("data_engine must be a supported Runtime DataEngine value"));
 }
@@ -268,6 +272,25 @@ runtime::Status initialize(const InitOptions &options) {
   const std::string_view tls_detail = config_store_tls_capture.finish();
   if (tls_status != ACLSHMEM_SUCCESS) {
     return CannFailure("aclshmemx_set_conf_store_tls", tls_status, tls_detail);
+  }
+
+  if (options.data_engine == runtime::DataEngine::MteUdma) {
+    if (options.udma_qp_num != 1U && options.udma_qp_num != 8U &&
+        options.udma_qp_num != 16U && options.udma_qp_num != 32U) {
+      return InvalidArgument("UDMA QP count must be 1, 8, 16 or 32");
+    }
+    const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, options.udma_qp_num);
+    if (qp_status != ACLSHMEM_SUCCESS) {
+      return CannFailure("aclshmemx_set_qp_num", qp_status);
+    }
+    uint32_t actual_qps = 0;
+    const int32_t get_status = aclshmemx_get_qp_num(ACLSHMEM_DATA_OP_UDMA, &actual_qps);
+    if (get_status != ACLSHMEM_SUCCESS) {
+      return CannFailure("aclshmemx_get_qp_num", get_status);
+    }
+    if (actual_qps != options.udma_qp_num) {
+      return InvalidArgument("UDMA QP count does not match the requested configuration");
+    }
   }
 
   aclshmemx_init_attr_t attributes{};
@@ -355,6 +378,20 @@ void get_on_stream(uintptr_t local_dst, uintptr_t remote_src, uint64_t bytes, in
   aclshmemx_getmem_on_stream(reinterpret_cast<void *>(local_dst), reinterpret_cast<void *>(remote_src),
                              static_cast<std::size_t>(bytes), source_pe,
                              reinterpret_cast<aclrtStream>(stream.native_handle));
+}
+
+runtime::Status copy_peer_on_stream(uintptr_t symmetric, uintptr_t local, uint64_t bytes, int32_t peer,
+                                    bool is_put, const runtime::StreamView &stream) {
+  void *remote = aclshmem_ptr(reinterpret_cast<void *>(symmetric), peer);
+  if (remote == nullptr) {
+    return InvalidArgument("SDMA requires a directly mapped SHMEM peer");
+  }
+  void *local_ptr = reinterpret_cast<void *>(local);
+  void *destination = is_put ? remote : local_ptr;
+  const void *source = is_put ? local_ptr : remote;
+  const aclError result = aclrtMemcpyAsync(destination, bytes, source, bytes, ACL_MEMCPY_DEVICE_TO_DEVICE,
+                                         reinterpret_cast<aclrtStream>(stream.native_handle));
+  return result == ACL_SUCCESS ? Success() : AclFailure("aclrtMemcpyAsync", result);
 }
 
 void signal_on_stream(uintptr_t remote_signal, int32_t value, SignalOp operation, int32_t target_pe,

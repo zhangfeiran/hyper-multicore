@@ -29,6 +29,7 @@ import tempfile
 from typing import Any
 
 from prepare_dependencies import dependency_revisions, load_dependency_locks, verify_git_dependency
+from mxfp8_quant_sources import QUANT_SOURCE_PATHS, compose_quant_sources
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -42,7 +43,8 @@ _OPS_NN_PATHS = (
     "norm/rms_norm_grad/op_kernel",
     "index/linear_index/op_host/op_api",
 )
-_OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel",)
+_OPS_NN_PATHS += QUANT_SOURCE_PATHS
+_OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel", "gmm/common/cgmct")
 _OPS_TRANSFORMER_MHC_PATHS = (
     "common/include",
     "mhc/mhc_post/op_kernel/arch22",
@@ -126,6 +128,22 @@ def main() -> int:
         transformer_copy,
         transformer_mhc_copy,
     )
+    mx_nn = work_dir / "mx-adapter-inputs" / "ops-nn"
+    mx_transformer = work_dir / "mx-adapter-inputs" / "ops-transformer"
+    shutil.copytree(ops_nn_copy / "quant", mx_nn / "quant")
+    shutil.copytree(ops_nn_copy / "common", mx_nn / "common")
+    shutil.copytree(transformer_copy / "gmm/common/cgmct", mx_transformer / "gmm/common/cgmct")
+    _apply_locked_adapters(mx_nn, {"patches": lock["ops_nn"]["mxfp8_patches"]})
+    _apply_locked_adapters(mx_transformer, {"patches": transformer_revisions["gmm"]["mxfp8_patches"]})
+    mx_operator = source_root / "pangu_mxfp8_task_graph"
+    shutil.copytree(_MULTICORE_OPS / "pangu_mxfp8_task_graph", mx_operator)
+    kernel = mx_operator / "op_kernel"
+    shutil.copytree(_MULTICORE_OPS / "runtime", kernel / "runtime")
+    shutil.copytree(_MULTICORE_OPS / "hyper_mega_moe/op_kernel/put_mem_signal", kernel / "put_mem_signal")
+    shutil.copytree(_MULTICORE_OPS / "mxfp8", kernel / "mxfp8")
+    shutil.copytree(_MULTICORE_OPS / "mxfp8_quant", kernel / "mxfp8_quant")
+    compose_quant_sources(mx_nn, kernel / "mxfp8_quant")
+    shutil.copytree(mx_transformer / "gmm/common/cgmct", kernel / "cgmct")
     _require_assembled_files(source_root)
     print(json.dumps({"source_root": str(source_root)}, sort_keys=True))
     return 0
@@ -265,6 +283,8 @@ def _compose_hyper_multicore_ops(
             transformer_copy / "gmm" / "grouped_matmul" / "op_kernel",
             operator_root / "op_kernel" / "grouped_matmul",
         )
+        shutil.copytree(transformer_copy / "gmm/common/cgmct", operator_root / "op_kernel/cgmct")
+        shutil.copytree(_MULTICORE_OPS / "bf16_gmm", operator_root / "op_kernel/bf16_gmm")
     shutil.copytree(
         ops_nn_copy / "activation" / "swi_glu_grad" / "op_kernel",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad",
@@ -313,6 +333,7 @@ def _compose_hyper_multicore_ops(
 def _require_assembled_files(source_root: Path) -> None:
     """Reject incomplete source closures before invoking the CANN toolchain."""
     required_paths = (
+        source_root / "pangu_mxfp8_task_graph" / "op_kernel" / "pangu_mxfp8_task_graph.cpp",
         source_root / "hyper_mega_moe" / "op_host" / "hyper_mega_moe_def.cpp",
         source_root / "hyper_mega_moe" / "op_kernel" / "hyper_mega_moe.cpp",
         source_root / "hyper_mega_moe" / "op_kernel" / "swi_glu" / "swi_glu.cpp",

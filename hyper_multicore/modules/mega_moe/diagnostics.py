@@ -14,6 +14,8 @@
 # ============================================================================
 """MegaMoe-owned expert semantics shared by its diagnostic tools."""
 
+from __future__ import annotations
+
 __all__ = []
 
 from dataclasses import dataclass
@@ -21,6 +23,7 @@ from typing import Any
 
 from hyper_multicore.scheduler.config import (
     TaskDescC,
+    TaskType,
     TaskSplitValue,
 )
 from hyper_multicore.scheduler.graph import OperatorNode, OpType
@@ -49,8 +52,11 @@ def _resolve_expert_owner(
     operator: OperatorNode,
     task_desc: TaskDescC,
     raw_context: Any,
-) -> int:
+) -> int | None:
     """Resolve the global expert ID from a graph operator and its concrete task."""
+    if operator.name.startswith("shared_") or operator.op_type == OpType.MOE_ROUTE_GRAD:
+        # Route-weight gradients reduce all selected experts for each source token.
+        return None
     context = _require_diagnostic_context(raw_context)
     topology = context.topology
     rank_owner_base = topology.rank_id * topology.single_rank_expert_num
@@ -66,6 +72,8 @@ def _resolve_expert_owner(
             raise ValueError("SwiGLU diagnostic owner resolved a zero task count per expert")
         return rank_owner_base + task_desc.task_index // num_triggers
 
+    if int(task_desc.task_type) == TaskType.TASK_MOE_TOKEN_GET:
+        return None
     if operator.op_type == OpType.ALLTOALL:
         task_count_per_expert = task_desc.task_split_num // topology.all_expert_num
         if task_count_per_expert == 0:

@@ -37,6 +37,8 @@ class DiagnosticSpec:
     execution_mode: str = "event_driven"
     vector_worker_stride: int = 2
     graph_adapter: Callable[[Any, RuntimeConfigC], ComputeGraph] | None = None
+    extra_aiv_records: int = 0
+    extra_aic_records: int = 0
 
 
 @dataclass(frozen=True)

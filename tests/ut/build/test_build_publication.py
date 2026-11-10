@@ -42,6 +42,14 @@ def test_wheel_metadata_does_not_pin_framework_versions():
             publication.validate_wheel_metadata(archive, "METADATA", info)
 
 
+def test_wheel_rejects_missing_or_duplicate_replica_host_extension(tmp_path):
+    """A release wheel cannot silently drop the selected native planner path."""
+    for names in ([], ["hyper_multicore/replica/_host_kernel/_replica_host.a.so",
+                       "hyper_multicore/replica/_host_kernel/_replica_host.b.so"]):
+        with pytest.raises(ValueError, match="exactly one native replica host extension"):
+            PUBLICATION.validate_wheel_payload(None, names, tmp_path, {"payload_sha256": {}})
+
+
 @pytest.fixture(name="staged_build")
 def _staged_build(tmp_path, monkeypatch):
     """Replace expensive workers while running the real transaction and publishers."""

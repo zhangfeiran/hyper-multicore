@@ -272,6 +272,11 @@ class _TensorDumpCall(DiagnosticCall):
         self._prepared_l1 = prepared_l1
         self.finished = False
 
+    @property
+    def preserves_task_queues(self) -> bool:
+        """Keep every task whose pre/post capture was planned by the L1 dumper."""
+        return self._prepared_l1 is not None
+
     def complete(self) -> None:
         """Capture post-launch values after a successful native launch."""
         if self.finished:
@@ -643,6 +648,8 @@ class TorchMegaKernelTensorDumper:
             "invocationCount": len(invocation_metadata),
             "invocations": invocation_metadata,
         }
+        if is_l1:
+            manifest["taskQueuePolicy"] = "full_queue_for_tensor_dump"
         manifest_path = window_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return manifest_path

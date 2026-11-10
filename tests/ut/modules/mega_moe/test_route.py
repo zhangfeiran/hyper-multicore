@@ -651,6 +651,9 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                             expected = route_module._compute_route_metadata(counts[rank], counts, received, spec, 32768)
                             actual = route_module._host_route_metadata(raw, spec, 32768, torch.device("cpu"))
                             with self.subTest(ep=ep, local=local, rank=rank, mode=mode):
+                                self.assertIsNone(expected.empty_experts)
+                                empty = tuple((received.sum(0) == 0).nonzero().flatten().tolist())
+                                expected = replace(expected, empty_experts=empty)
                                 for field, value in vars(expected).items():
                                     observed = getattr(actual, field)
                                     if isinstance(value, torch.Tensor):

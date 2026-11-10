@@ -26,6 +26,7 @@ __global__ __aicore__ void hyper_mega_moe(
   GM_ADDR down_proj_glist, GM_ADDR down_proj_y, GM_ADDR combine_target, GM_ADDR combine_target_off,
   GM_ADDR combine_src_off, GM_ADDR combine_size, GM_ADDR gmm_workspace, GM_ADDR up_proj_tiling, GM_ADDR swiglu_tiling,
   GM_ADDR down_proj_tiling, GM_ADDR runtime_config, GM_ADDR all_event_counters, GM_ADDR diagnostic_buffer,
+  GM_ADDR shared_ptrs, GM_ADDR shared_runtime,
   GM_ADDR dispatch_target_ref,
   GM_ADDR y_ref, GM_ADDR swiglu_out_ref, GM_ADDR down_proj_y_ref, GM_ADDR combine_target_ref, GM_ADDR workspace,
   GM_ADDR tiling) {
@@ -45,7 +46,7 @@ __global__ __aicore__ void hyper_mega_moe(
                               runtime_config,    nullptr,
                               workspace,         tiling,
                               all_event_counters,
-                              diagnostic_buffer};
+                              diagnostic_buffer, shared_ptrs, shared_runtime};
       uint32_t idx = GetBlockIdx();
       worker_kernel(idx, runtime_config, input_list);
     } else if constexpr (TRANS_A == 0 && TRANS_B == 1 && AIV_AIC_RATIO == GROUPED_MATMUL_CUBE_ONLY) {

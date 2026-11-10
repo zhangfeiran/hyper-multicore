@@ -1,0 +1,75 @@
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.h
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.h
+@@ -17,6 +17,8 @@
+ 
+ #include "grouped_matmul_utils.h"
+ #include "kernel_operator.h"
++
++#include "../runtime/gradient_band.h"
+ 
+ namespace GROUPED_MATMUL {
+ 
+@@ -132,6 +134,14 @@
+ 
+  public:
+     /** @brief constructor */
++    MulticoreRuntime::GradientBandProducer bandProducer;
++
++    __aicore__ inline void SetBandPublication(GM_ADDR flags, int32_t epoch, uint32_t rows,
++        MulticoreRuntime::CycleTraceRecorder *trace, uint32_t projection, uint32_t rank, uint32_t expert) {
++        bandProducer.Set(flags, epoch, rows);
++        bandProducer.SetProfile(trace, projection, rank, expert);
++    }
++
+     __aicore__ inline GMMProcess(ComputeType& computeOp_) : computeOp(computeOp_) {}
+ 
+     __aicore__ inline void Init(const GMMBaseParams* __restrict gmmBaseParamsIn,
+@@ -305,9 +315,25 @@
+         uint32_t curBlock = coreIdx >= count ? coreIdx : coreIdx + gmmBaseParams->coreNum;
+         uint32_t thresholdM_dimN = thresholdBlockNum * mnConfig.blockDimN;
+ 
++        if (bandProducer.Enabled()) {
++            bandProducer.Begin(mnConfig.m, coreIdx, gmmBaseParams->coreNum);
++            MNConfig planned = mnConfig;
++            for (uint32_t block = curBlock; block < curCount; block += gmmBaseParams->coreNum) {
++                MNBlockIdxCompute(planned, block, count, thresholdM_dimN);
++                uint32_t row = planned.mIdx * planned.singleM;
++                uint32_t rows = planned.m - row < planned.singleM ? planned.m - row : planned.singleM;
++                bandProducer.Expect(row, rows);
++            }
++            bandProducer.PublishEmpty();
++        }
+         while (curBlock < curCount) {
+             MNBlockIdxCompute(mnConfig, curBlock, count, thresholdM_dimN);
+             computeOp.MMCompute(groupIdx, mnConfig, coreIdx);
++            if (bandProducer.Enabled()) {
++                uint32_t row = mnConfig.mIdx * mnConfig.singleM;
++                uint32_t rows = mnConfig.m - row < mnConfig.singleM ? mnConfig.m - row : mnConfig.singleM;
++                bandProducer.Retire(row, rows);
++            }
+             computeOp.VectorCompute(mnConfig);
+             curBlock += gmmBaseParams->coreNum;
+         }
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
+@@ -187,6 +187,7 @@
+                        y, user1,  &gmmBaseParams_, &mmTilingData_, &tPipe);                                        \
+         processClass<decltype(computeOp)> op(computeOp);                                                           \
+         op.Init(&gmmBaseParams_, &mmTilingData_, gmmArrayAddr_, groupList, tiling);                                \
++        op.SetBandPublication(band_flags, band_epoch, band_rows, band_trace, band_projection, band_rank, band_expert);                                                \
+         op.Process();                                                                                              \
+     } while (0)
+ 
+@@ -383,7 +384,11 @@
+                                                      GM_ADDR offset, GM_ADDR antiquantScale, GM_ADDR antiquantOffset,
+                                                      GM_ADDR groupList, GM_ADDR perTokenScale, GM_ADDR y,
+                                                      GM_ADDR workspace, GM_ADDR tiling, bool transA, bool transB,
+-                                                     bool fp32Output = false)
++                                                     bool fp32Output = false, GM_ADDR band_flags = nullptr,
++                                                     int32_t band_epoch = 0, uint32_t band_rows = 0,
++                                                     MulticoreRuntime::CycleTraceRecorder *band_trace = nullptr,
++                                                     uint32_t band_projection = 0, uint32_t band_rank = 0,
++                                                     uint32_t band_expert = 0)
+ {
+     TPipe tPipe;
+     AscendCUtils::SetOverflow(1);

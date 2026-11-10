@@ -40,11 +40,14 @@ INVALID_PROFILE_DESC_ID  = 0xFFFFFFFF
 INVALID_PROFILE_OWNER_ID = 0xFFFFFFFF
 DEFAULT_DEPENDENCY_POLL_INTERVAL_US = 0
 FAST_DEPENDENCY_POLL_INTERVAL_US = 5
+A5_GMM_KERNEL_TAG = 0x41350000
 EVENT_INVALID_ID         = 0xFFFFFFFF
 RUNTIME_PROTOCOL_VERSION = 1
 
 
-def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
+def mega_moe_event_capacity(
+    num_experts: int, ep_size: int, *, shared_expert: bool = False, compute_stages: int = 3,
+) -> int:
     """Reserve graph events and the complete atomic write at the last trigger.
 
     Args:
@@ -56,9 +59,11 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
     """
     if ep_size <= 0 or num_experts <= 0 or num_experts % ep_size:
         raise ValueError("num_experts must be positive and divisible by ep_size")
-    # Ready and worker completion follow termination with separate atomic lanes.
+    # Optional per-expert producer fences follow the ready/completion atomic lanes.
     final_event = num_experts + 3 * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
-    required = final_event + ATOMIC_ADD_VALUE_LEN
+    required = final_event + 2 * ATOMIC_ADD_VALUE_LEN + num_experts // ep_size + (32 if shared_expert else 0)
+    required = max(required, num_experts + compute_stages * (num_experts // ep_size)
+                   + 3 + 2 * ATOMIC_ADD_VALUE_LEN) if compute_stages > 3 else required
     return max(MIN_EVENT_CAPACITY, (required + 15) // 16 * 16)
 
 
@@ -118,6 +123,9 @@ class TaskType(IntEnum):
     TASK_GATE_GRAD_ADD_SELECTED           = 139
     TASK_GATE_GRAD_ZEROS                  = 140
     TASK_SHMEM_GET_MEM              = 141
+    TASK_MOE_OWNER_GET              = 142
+    TASK_MOE_TOKEN_GET              = 143
+    TASK_MOE_ROUTE_GRAD             = 144
 
 
 class EventType(IntEnum):
@@ -342,6 +350,7 @@ class TaskSplitValue:
         return 1 + self.all_expert_num + e + e + e
 
     # ── Runtime counters (reset by init_task_split_value per rank) ────────────
+    shared_expert:        bool = False
     rank_id:              int = 0
     pre_pre_event_num:    int = 0
     pre_event_num:        int = 0
@@ -388,8 +397,13 @@ def _validate_swiglu_task(task: TaskDescC, descriptor_index: int, group_size: in
         )
 
 
-def _validate_gmm_task(task: TaskDescC, descriptor_index: int, expected_tasks: int) -> None:
+def _validate_gmm_task(task: TaskDescC, descriptor_index: int, expected_tasks: int, top_k: int) -> None:
     """Validate that every local expert owns one task per Cube core."""
+    if task.extra_value_2 == 0x4D54494C and (
+            task.extra_value_1 != 0 or task.dependent_event != 0xFFFFFFFF
+            or task.extra_value_0 != top_k or not 1 <= task.extra_value_0 <= 16
+            or task.outputs[0].input_position != 7):
+        raise ValueError(f"GMM task {descriptor_index} has an invalid tile-ready input contract")
     if task.task_split_num != expected_tasks:
         raise ValueError(
             f"GMM task {descriptor_index} has task_split_num {task.task_split_num}; "
@@ -413,6 +427,19 @@ def _validate_shmem_task(task: TaskDescC, descriptor_index: int, tsv: TaskSplitV
         )
 
 
+def _validate_token_task(task: TaskDescC, descriptor_index: int, tsv: TaskSplitValue) -> None:
+    """Validate original-token jobs without the expert-partitioned SHMEM rule."""
+    split = int(task.task_split_value)
+    tokens = tsv.per_expert_seq_to_other
+    if split <= 0 or tokens % split:
+        raise ValueError(f"Token task {descriptor_index} does not partition the source token rows")
+    blocks = tokens // split
+    if blocks == 0 or task.task_split_num != tsv.ep * blocks or task.task_index >= tsv.ep * blocks:
+        raise ValueError(f"Token task {descriptor_index} has invalid source block coordinates")
+    if task.inputs[1].dim[3] != tsv.top_k or task.extra_value_0 != 16 or task.extra_value_1 not in (5, 6):
+        raise ValueError(f"Token task {descriptor_index} has an invalid packed route contract")
+
+
 def _validate_runtime_task_queues(cfg: RuntimeConfigC, event_capacity: int) -> None:
     """Validate scheduled task IDs and their event ranges."""
     queues = (cfg.cube_task_indices, cfg.vector_task_indices, cfg.mix_task_indices)
@@ -432,6 +459,9 @@ def _validate_runtime_task_queues(cfg: RuntimeConfigC, event_capacity: int) -> N
                 raise ValueError(
                     f"task {task_id} references an event outside allocated capacity {event_capacity}"
                 )
+            if (task.task_type == TaskType.TASK_GROUPED_MATMUL and task.extra_value_1
+                    and task.extra_value_1 + ATOMIC_ADD_VALUE_LEN > event_capacity):
+                raise ValueError(f"task {task_id} producer event exceeds allocated capacity {event_capacity}")
 
 
 def validate_runtime_config(
@@ -480,14 +510,19 @@ def validate_runtime_config(
             TaskType.TASK_GROUPED_MATMUL,
             TaskType.TASK_SHMEM_PUT_MEM_SIGNAL,
             TaskType.TASK_SHMEM_GET_MEM,
+            TaskType.TASK_MOE_OWNER_GET,
+            TaskType.TASK_MOE_TOKEN_GET,
         ):
             continue
         _validate_task_bounds(task, descriptor_index)
 
         if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
-            _validate_swiglu_task(task, descriptor_index, group_size)
+            _validate_swiglu_task(task, descriptor_index, 1 if task.inputs[0].tensor_type == 2 else group_size)
         elif task_type == TaskType.TASK_GROUPED_MATMUL:
-            _validate_gmm_task(task, descriptor_index, num_cube_cores * local_experts)
+            _validate_gmm_task(task, descriptor_index,
+                               num_cube_cores * (1 if task.inputs[0].tensor_type == 2 else local_experts), tsv.top_k)
+        elif task_type == TaskType.TASK_MOE_TOKEN_GET:
+            _validate_token_task(task, descriptor_index, tsv)
         else:
             _validate_shmem_task(task, descriptor_index, tsv)
 
@@ -510,7 +545,9 @@ def configure_ready_handshake(cfg: RuntimeConfigC, tsv: TaskSplitValue) -> None:
     cfg.all_event_num_triggers[completion_event] = cfg.num_workers
 
 
-def event_workspace_bytes(ep_size: int, num_experts: int) -> int:
+def event_workspace_bytes(
+    ep_size: int, num_experts: int, *, shared_expert: bool = False, compute_stages: int = 3,
+) -> int:
     """Return graph counters plus separate ready and completion generations.
 
     Args:
@@ -520,7 +557,8 @@ def event_workspace_bytes(ep_size: int, num_experts: int) -> int:
     Returns:
         Required byte count for one direction's event workspace.
     """
-    counter_bytes = mega_moe_event_capacity(num_experts, ep_size) * ctypes.sizeof(ctypes.c_int32)
+    counter_bytes = mega_moe_event_capacity(
+        num_experts, ep_size, shared_expert=shared_expert, compute_stages=compute_stages) * 4
     if ep_size <= 1:
         return counter_bytes
     return counter_bytes + 2 * (ep_size + 1) * READY_CACHE_LINE_BYTES

@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -55,6 +55,7 @@ class MegaKernelDiagnostics:
     def launch(
         self, parameters: Sequence[torch.Tensor | None], *, direction: str,
         fallback_event_counters: torch.Tensor | None = None,
+        tags: Mapping[str, str] | None = None,
     ) -> DiagnosticCall:
         """Select exactly one tool, or return an ordinary no-op context.
 
@@ -65,8 +66,14 @@ class MegaKernelDiagnostics:
             parameters: Complete native ABI bindings for this invocation.
             direction: Forward or backward invocation direction.
             fallback_event_counters: Existing execution-owned event counters, if any.
+            tags: String metadata copied per invocation, independently of shared runtime plans.
         """
-        context = LaunchContext(self._runtime, parameters, direction, fallback_event_counters)
+        if tags is not None and (not isinstance(tags, Mapping)
+                                 or any(not isinstance(key, str) or not isinstance(value, str)
+                                        for key, value in tags.items())):
+            raise ValueError("diagnostic tags must map strings to strings")
+        context = LaunchContext(self._runtime, parameters, direction, fallback_event_counters,
+                                dict(tags) if tags else None)
         session = _get_active_session()
         if session is None or not session.is_capture_enabled():
             return DiagnosticCall(context.ordinary_arguments())
@@ -84,6 +91,7 @@ def prepare_mega_kernel_diagnostics(
     owner_context: Any = None,
     execution_mode: str = "event_driven", vector_worker_stride: int = 2,
     graph_adapter: Callable[[Any, RuntimeConfigC], ComputeGraph] | None = None,
+    extra_aiv_records: int = 0, extra_aic_records: int = 0,
 ) -> MegaKernelDiagnostics:
     """Prepare only normal execution storage and defer all diagnostic graph work.
 
@@ -102,6 +110,8 @@ def prepare_mega_kernel_diagnostics(
         owner_context: Business context passed unchanged to the owner callback.
         execution_mode: Event-driven queues or a broadcast ``aiv_pipeline``.
         vector_worker_stride: Two for paired MoE workers, one for all AIV workers.
+        extra_aiv_records: Per-worker records emitted outside the scheduled task queue.
+        extra_aic_records: Per-worker producer records emitted inside scheduled compute tasks.
         graph_adapter: Optional lazy business-owned binding of graph ports to the
             real native ABI. It receives a private Host config; ordinary storage
             and the caller's graph must remain unchanged.
@@ -127,6 +137,9 @@ def prepare_mega_kernel_diagnostics(
         """
         return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone().to(device=resolved_device)
 
+    for name, value in (("extra_aiv_records", extra_aiv_records), ("extra_aic_records", extra_aic_records)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
     if execution_mode not in ("event_driven", "aiv_pipeline"):
         raise ValueError(f"invalid execution mode: {execution_mode!r}")
     if vector_worker_stride not in (1, 2):
@@ -134,7 +147,7 @@ def prepare_mega_kernel_diagnostics(
     runtime = PreparedDiagnosticRuntime(
         graph, runtime_config, DiagnosticSpec(
             kernel_name, owner_label, owner_resolver, owner_context,
-            execution_mode, vector_worker_stride, graph_adapter,
+            execution_mode, vector_worker_stride, graph_adapter, extra_aiv_records, extra_aic_records,
         ),
         parameter_count=parameter_count, tensor_factory=tensor_factory, rank=rank, device_id=device_id,
     )

@@ -193,6 +193,29 @@ class TestPrepareDependencies(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "Locked patch missing or changed"):
                 checker()
 
+    def test_repository_check_allows_known_settings_but_rejects_old_imports(self):
+        """Legacy environment switches must not reopen the downstream package boundary."""
+        project = self.root / "boundary"
+        helper = project / "hyper_multicore/_build/prepare_dependencies.py"
+        helper.parent.mkdir(parents=True)
+        shutil.copy2(HELPER_PATH, helper)
+        helper.with_name("dependencies.lock.json").write_text(json.dumps(self.lock), encoding="utf-8")
+        for name in ("scripts", "tests", "examples"):
+            (project / name).mkdir()
+        for name in ("setup.py", "build.sh", "MANIFEST.in", "requirements.txt"):
+            (project / name).write_text("", encoding="utf-8")
+        source = project / "hyper_multicore/settings.py"
+        source.write_text("NAME = 'HYPER_PARALLEL_REPLICA_HOST_NATIVE'\n", encoding="utf-8")
+        checker = runpy.run_path(str(ROOT / "scripts/check_repository.py"))["main"]
+        with patch.dict(checker.__globals__, {"ROOT": project}):
+            checker()
+            source.write_text("from hyper" + "_parallel.core import multicore\n", encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "Forbidden downstream import"):
+                checker()
+            source.write_text("NAME = 'HYPER" + "_PARALLEL_UNREVIEWED_SETTING'\n", encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "Unsupported legacy identifiers"):
+                checker()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -163,7 +163,8 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         Description: Allocate and reuse event storage through the SHMEM API.
         Expectation: Preserve dynamic counters and ready tails without reallocating.
         """
-        spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16,
+        spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16, top_k=2,
+                               replica_slots_per_rank=0,
                                ep_size=64, num_experts=1024, dispatch_mode="push")
         workspace = MegaMoeWorkspace(shared=True)
         with (
@@ -175,7 +176,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
         self.assertEqual(allocate.call_count, 4)
-        self.assertEqual(workspace.event_counter_bytes, 1104 * 4)
+        self.assertEqual(workspace.event_counter_bytes, 1120 * 4)
         for tensor in (workspace.forward_event_counters, workspace.backward_event_counters):
             self.assertEqual(tensor.numel(), event_workspace_bytes(spec.ep_size, spec.num_experts))
         for allocation in allocate.call_args_list:
