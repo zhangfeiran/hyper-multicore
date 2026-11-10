@@ -127,6 +127,34 @@ def _required_replica_inbox_slots(route: ReplicaRoute) -> int:
     return max((transfer.target_slot - home + 1 for transfer in plan.transfers), default=0)
 
 
+def _schedule_plan_bounds(schedule: RouteSchedule | None, schedule_tokens: int, ep_size: int,
+                          bucket: int, home_only: bool) -> tuple[Any, dict]:
+    """Build a bounded plan key without changing its reserved storage shape."""
+    key = (bucket, True) if home_only else bucket
+    if schedule is None:
+        return key, {}
+    if schedule.expert_rows > schedule_tokens * ep_size or schedule.source_expert_rows > schedule_tokens:
+        raise RuntimeError("MegaMoe route counts exceed supported per-expert task bounds")
+    expert = min(schedule_tokens * ep_size, 1 << (max(128, schedule.expert_rows) - 1).bit_length())
+    source = min(schedule_tokens, 1 << (max(128, schedule.source_expert_rows) - 1).bit_length())
+    return (bucket, home_only, expert, source), {
+        "schedule_expert_rows": expert, "schedule_source_expert_rows": source,
+    }
+
+
+def _communication_plan_rows(spec: MegaMoeSpec, maximum_edge_rows: int | None,
+                             tokens: int, source_bound: int) -> int | None:
+    """Use the agreed communication bound only if it tightens the source schedule."""
+    if not spec._compact_communication or maximum_edge_rows is None:
+        return None
+    if not 0 <= maximum_edge_rows <= tokens:
+        raise ValueError("MegaMoe route exceeds the schedule's per-edge token capacity")
+    edge_bucket = 1 << (max(_COMMUNICATION_SPLIT, maximum_edge_rows) - 1).bit_length()
+    if maximum_edge_rows > source_bound:
+        raise RuntimeError("MegaMoe communication bound exceeds the expert route bound")
+    return edge_bucket if edge_bucket < source_bound else None
+
+
 @dataclass
 class _ForwardRouteState:
     """Share selected physical storage needs with the automatic Heap callback."""
@@ -335,27 +363,12 @@ class _MegaMoeExecutionResources:
                 f"requested={tokens}, capacity={self._token_capacity}"
             )
         bucket = 1 << (max(128, tokens) - 1).bit_length()
-        key = (bucket, True) if home_only else bucket
         schedule_tokens = min(bucket, self._token_capacity)
-        bounds = {}
-        if schedule is not None:
-            if schedule.expert_rows > schedule_tokens * spec.ep_size or schedule.source_expert_rows > schedule_tokens:
-                raise RuntimeError("MegaMoe route counts exceed supported per-expert task bounds")
-            expert = min(schedule_tokens * spec.ep_size, 1 << (max(128, schedule.expert_rows) - 1).bit_length())
-            source = min(schedule_tokens, 1 << (max(128, schedule.source_expert_rows) - 1).bit_length())
-            key = (bucket, home_only, expert, source)
-            bounds = {"schedule_expert_rows": expert, "schedule_source_expert_rows": source}
-        communication_rows = None
-        if spec._compact_communication and maximum_edge_rows is not None:
-            if not 0 <= maximum_edge_rows <= tokens:
-                raise ValueError("MegaMoe route exceeds the schedule's per-edge token capacity")
-            edge_bucket = 1 << (max(_COMMUNICATION_SPLIT, maximum_edge_rows) - 1).bit_length()
-            source_bound = bounds.get("schedule_source_expert_rows", schedule_tokens)
-            if edge_bucket > source_bound:
-                raise RuntimeError("MegaMoe communication bound exceeds the expert route bound")
-            if edge_bucket < source_bound:
-                communication_rows = edge_bucket
-                key = (key, edge_bucket)
+        key, bounds = _schedule_plan_bounds(schedule, schedule_tokens, spec.ep_size, bucket, home_only)
+        source_bound = bounds.get("schedule_source_expert_rows", schedule_tokens)
+        communication_rows = _communication_plan_rows(spec, maximum_edge_rows, tokens, source_bound)
+        if communication_rows is not None:
+            key = (key, communication_rows)
         plan = self._plans.get(key)
         if plan is None or plan.spec.plan_tokens < tokens:
             plan = build_mega_moe_plan(

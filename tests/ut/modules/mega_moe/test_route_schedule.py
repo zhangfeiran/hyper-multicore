@@ -155,6 +155,27 @@ class TestRouteSchedule(unittest.TestCase):
                     resources.plan_for_tokens(4096, "cpu", schedule=invalid)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_route_and_communication_bounds_are_consistent(self) -> None:
+        """Both bounds cover the same route and reject a contradictory communication maximum."""
+        resources = object.__new__(module_impl._MegaMoeExecutionResources)
+        resources.spec = replace(make_spec(), _compact_communication=True)
+        resources.home_spec, resources._token_capacity, resources._plans = None, 8192, {}
+        with patch.object(module_impl, "build_mega_moe_plan",
+                          side_effect=lambda spec, _device: SimpleNamespace(spec=spec)):
+            route = RouteSchedule(expert_rows=500, source_expert_rows=200, empty_experts=())
+            plan = resources.plan_for_tokens(4096, "cpu", schedule=route, maximum_edge_rows=200)
+            self.assertEqual(plan.spec.schedule_source_expert_rows, 256)
+            self.assertIsNone(plan.spec._communication_rows)
+            self.assertIs(resources.plan_for_tokens(4096, "cpu", schedule=route, maximum_edge_rows=200), plan)
+            with self.assertRaisesRegex(RuntimeError, "communication bound exceeds"):
+                resources.plan_for_tokens(4096, "cpu", schedule=route, maximum_edge_rows=257)
+            self.assertEqual(len(resources._plans), 1)
+            resources._token_capacity, resources._plans = 384, {}
+            partial = resources.plan_for_tokens(384, "cpu", maximum_edge_rows=300)
+            self.assertEqual(partial.spec.plan_tokens, 384)
+            self.assertIsNone(partial.spec._communication_rows)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_invalid_task_bounds_fail_before_serialization(self) -> None:
         """Feature: Task bound validation.
 

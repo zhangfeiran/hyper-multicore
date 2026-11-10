@@ -316,13 +316,10 @@ class TaskSplitValue:
             raise ValueError(
                 f"all_expert_num ({self.all_expert_num}) must be divisible by ep ({self.ep})."
             )
-        rows = self.communication_rows
-        if rows is not None and (
-            not isinstance(rows, int) or isinstance(rows, bool) or not 0 < rows <= self.per_expert_seq_to_other
-        ):
-            raise ValueError("communication_rows must be within the per-edge token capacity")
-        if rows is not None and self.dispatch_mode != "push":
-            raise ValueError("communication_rows is only supported for Push")
+        self._validate_bounds()
+
+    def _validate_bounds(self) -> None:
+        """Validate independent route and communication scheduling extents."""
         bounds = (("expert_rows_bound", self.expert_rows_bound, self.seq_all // self.top_k),
                   ("source_expert_rows_bound", self.source_expert_rows_bound, self.seq_all // (self.ep * self.top_k)))
         for name, bound, maximum in bounds:
@@ -330,6 +327,13 @@ class TaskSplitValue:
                 not isinstance(bound, int) or isinstance(bound, bool) or not 0 < bound <= maximum
             ):
                 raise ValueError(f"{name} must be a positive integer no larger than {maximum}")
+        rows = self.communication_rows
+        if rows is not None and (
+            not isinstance(rows, int) or isinstance(rows, bool) or not 0 < rows <= self.per_expert_seq_to_other
+        ):
+            raise ValueError("communication_rows must be within the per-edge token capacity")
+        if rows is not None and self.dispatch_mode != "push":
+            raise ValueError("communication_rows is only supported for Push")
 
     # ── Derived properties ────────────────────────────────────────────────────
     @property
