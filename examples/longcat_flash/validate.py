@@ -40,6 +40,7 @@ import hyper_multicore
 from hyper_multicore import shmem
 from hyper_multicore.longcat import LongcatFlashExperts
 from hyper_multicore.longcat._routing import route_experts
+from hyper_multicore.modules.mega_moe.plan import _build_task_values
 
 def _validate_backend(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Reject replica fixture and backend combinations not supported by the worker."""
@@ -238,6 +239,19 @@ def plan_observer(engine: object, plans: list) -> Any:
     return patch.object(engine, "_prepare_replica_route", side_effect=observed)
 
 
+def execution_plan(layer: LongcatFlashExperts) -> dict:
+    """Capture the actual last MegaMoE plan, separate from the requested controls."""
+    resources = layer.executor._resource_group.resources
+    plan = resources.last_execution_plan
+    spec = plan.spec
+    task_values = _build_task_values(spec)
+    operators = ("dispatch", "combine")
+    tasks = {name: plan.forward_graph.get_op(name).split_spec.task_num_fn(task_values) for name in operators}
+    return {"plan_tokens": spec.plan_tokens, "route_source_rows": spec.schedule_source_expert_rows,
+            "route_expert_rows": spec.schedule_expert_rows, "communication_rows": spec._communication_rows,
+            "compact_communication": spec._compact_communication, "forward_tasks": tasks}
+
+
 def _update_parameters(data: dict, other: dict, masters: list | None) -> bool:
     """Apply independent FP32 master updates and compare the resulting BF16 weights."""
     if masters is None:
@@ -265,11 +279,12 @@ def _accuracy_step(args: argparse.Namespace, data: dict, other: dict, layer: Lon
     else:
         out = execute(layer, args, other, ids, native=False, backward=True)
     comparison = compare(values(other, out), expected)
+    actual_plan = None if kind == "identity" else execution_plan(layer)
     match = _update_parameters(data, other, masters)
     local_pass = all(item["strict_pass"] for item in comparison.values()) and match
     state = torch.tensor([local_pass], dtype=torch.int32, device="npu")
     dist.all_reduce(state, op=dist.ReduceOp.MIN)
-    return {"step": step, "routes": kind, "comparison": comparison, "plans": plans,
+    return {"step": step, "routes": kind, "comparison": comparison, "plans": plans, "execution_plan": actual_plan,
             "parameters_match": match, "all_ranks_strict_pass": bool(state.item())}
 
 
@@ -333,6 +348,7 @@ def main() -> None:
     executor = layer if layer is not None else NativeExperts(args.real, args.ep, dist.group.WORLD,
                                                               args.swiglu_precision)
     result = accuracy(args, data, layer, rank) if args.check == "accuracy" else benchmark(args, data, executor)
+    final_plan = execution_plan(layer) if layer is not None else None
     if layer is not None:
         layer.close()
     torch.npu.synchronize()
@@ -345,6 +361,8 @@ def main() -> None:
               "local_experts": {"real": args.real // args.ep, "identity": args.zero // args.ep},
               "weight_layout": "EOI", "gate_shape": list(data["gate"].shape),
               "down_shape": list(data["down"].shape), "replica_slots": args.replica_slots,
+              "compact_communication_requested": os.environ.get("HYPER_MULTICORE_MOE_COMPACT_COMMUNICATION", "0"),
+              "last_execution_plan": final_plan,
               "routing_backend": args.routing_backend, "swiglu_precision": args.swiglu_precision,
               "scope": "expert component; precomputed router, no full model",
               "strict_gate": STRICT_GATE, "identities": identities, "result": result,
