@@ -127,3 +127,12 @@ Push 的可选通信任务裁剪可通过所有 rank 一致设置
 owner 的 8 个真实专家及 4 个零专家，权重沿用确定性生成的数据。这是合成压力场景，
 应同时保留默认的 `router` 场景；比较 B0/B2 时保持其余参数和种子一致，并检查
 `result.replica_plans` 中是否实际出现迁移。对 B2 增加 `--replica-slots 2`。
+
+可单独检查当前安装制品的副本计数 kernel 是否覆盖边界和非法路由：
+
+```bash
+python examples/longcat_flash/check_count_kernel.py --output ./longcat-count-check.json
+```
+
+该命令只测试整数计数算子，改变专家数和行数以覆盖计数边界，不用于替代上述原宽
+LongCat 专家组件精度或性能验证。
