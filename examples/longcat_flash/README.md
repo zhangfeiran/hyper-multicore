@@ -122,3 +122,8 @@ Push 的可选通信任务裁剪可通过所有 rank 一致设置
 输入并分别运行开关开启和关闭的进程；查看报告中的
 `compact_communication_requested`、`last_execution_plan` 和对应任务数量，
 确认实际执行计划是否发生变化。该开关的性能收益需在目标设备及实际路由上测量。
+
+使用 `--route-fixture hot` 可以构造热点负载：所有 rank 的每个 token 都选择第一个
+owner 的 8 个真实专家及 4 个零专家，权重沿用确定性生成的数据。这是合成压力场景，
+应同时保留默认的 `router` 场景；比较 B0/B2 时保持其余参数和种子一致，并检查
+`result.replica_plans` 中是否实际出现迁移。对 B2 增加 `--replica-slots 2`。

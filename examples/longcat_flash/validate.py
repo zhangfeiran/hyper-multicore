@@ -44,6 +44,8 @@ from hyper_multicore.modules.mega_moe.plan import _build_task_values
 
 def _validate_backend(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Reject replica fixture and backend combinations not supported by the worker."""
+    if args.route_fixture == "hot" and (args.real != 8 * args.ep or args.zero != 4 * args.ep or args.top_k != 12):
+        parser.error("the hot fixture requires eight real and four identity experts per rank and K=12")
     if args.replica_slots and (args.ep < 4 or args.real != 8 * args.ep or args.zero != 4 * args.ep
                                or args.top_k != 12):
         parser.error("the replica route fixtures require EP>=4, eight real and four identity experts per rank, K=12")
@@ -80,6 +82,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--zero", type=int)
     parser.add_argument("--top-k", type=int, default=12)
     parser.add_argument("--replica-slots", type=int, default=0)
+    parser.add_argument("--route-fixture", choices=("router", "hot"), default="router")
     parser.add_argument("--updates", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--samples", type=int, default=30)
@@ -154,6 +157,10 @@ def fixture(args: argparse.Namespace, rank: int) -> dict:
         scores = F.linear(hidden.float(), router.weight.float()).softmax(-1)  # pylint: disable=not-callable
         ids = torch.topk(scores, k=args.top_k, dim=-1, sorted=False)[1]
         probability = scores.gather(1, ids) * 6.0
+        if args.route_fixture == "hot":
+            real = torch.arange(8, device="npu")
+            identity = torch.arange(4, device="npu") + args.real
+            ids = torch.cat((real, identity)).expand(args.tokens, -1).clone()
     upstream = torch.randn_like(hidden)
     return {"gate": gate.requires_grad_(), "down": down.requires_grad_(), "hidden": hidden.requires_grad_(),
             "ids": ids, "probability": probability.detach().requires_grad_(), "upstream": upstream}
@@ -313,6 +320,10 @@ def accuracy(args: argparse.Namespace, data: dict, layer: LongcatFlashExperts, r
 def benchmark(args: argparse.Namespace, data: dict, executor: object) -> dict:
     """Retain every synchronized local and rank-maximum forward/backward sample."""
     is_native = args.backend == "native"
+    plans = []
+    if args.replica_slots:
+        with plan_observer(executor.executor, plans):
+            execute(executor, args, data, data["ids"], native=False, backward=True)
     for _ in range(args.warmup):
         execute(executor, args, data, data["ids"], native=is_native, backward=True)
     torch.npu.synchronize()
@@ -330,7 +341,7 @@ def benchmark(args: argparse.Namespace, data: dict, executor: object) -> dict:
     finite = bool(torch.isfinite(out).all()) and all(
         data[key].grad is not None and bool(torch.isfinite(data[key].grad).all())
         for key in ("gate", "down", "hidden", "probability"))
-    return {"local_ms": local, "rank_max_ms": maximum, "finite": finite}
+    return {"local_ms": local, "rank_max_ms": maximum, "finite": finite, "replica_plans": plans}
 
 
 def main() -> None:
@@ -361,6 +372,7 @@ def main() -> None:
               "local_experts": {"real": args.real // args.ep, "identity": args.zero // args.ep},
               "weight_layout": "EOI", "gate_shape": list(data["gate"].shape),
               "down_shape": list(data["down"].shape), "replica_slots": args.replica_slots,
+              "route_fixture": args.route_fixture,
               "compact_communication_requested": os.environ.get("HYPER_MULTICORE_MOE_COMPACT_COMMUNICATION", "0"),
               "last_execution_plan": final_plan,
               "routing_backend": args.routing_backend, "swiglu_precision": args.swiglu_precision,
