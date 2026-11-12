@@ -120,6 +120,7 @@ def place_whole_experts(plan: ExpertExecutionPlan, *, capacity_limit: int,
     loads = [sum(weights[start:start + config.home_experts])
              for start in range(0, config.num_experts, config.home_experts)]
     baseline_peak = max(loads)
+    lightest_home = min(loads)
     capacity_required = baseline_peak > capacity_limit
     guests = [0] * config.ep_size
     cross, guest_total = 0, 0
@@ -152,8 +153,11 @@ def place_whole_experts(plan: ExpertExecutionPlan, *, capacity_limit: int,
         return best, selected
 
     def prune_guests() -> None:
-        """Remove transfer costs without undoing the selected minimax receive peak."""
-        ceiling = min(capacity_limit, max(loads))
+        """Prune toward a whole-expert target instead of the admission ceiling."""
+        # Allow one largest expert beside the lightest original home workload.
+        # This avoids moving cold matrices merely to free a few rows for a guest.
+        target = max(max(loads), max(weights) + lightest_home)
+        ceiling = min(capacity_limit, target)
         if not capacity_required:
             ceiling = min(ceiling, baseline_peak - 1, baseline_peak - minimum_saved_rows,
                           int(baseline_peak * (1 - minimum_load_reduction)))
