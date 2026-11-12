@@ -29,7 +29,8 @@ from .topology import _validate_rank_nodes
 def build_whole_expert_plan(counts: Sequence[Sequence[int]], config: ExpertReplicaConfig, *, capacity_limit: int,
                             minimum_load_reduction: float, minimum_saved_rows: int = 0,
                             minimum_replica_rows: int = 0,
-                            rank_nodes: tuple[int, ...] | None = None) -> ExpertExecutionPlan:
+                            rank_nodes: tuple[int, ...] | None = None,
+                            transfer_row_credit: int = 0) -> ExpertExecutionPlan:
     """Seed complete reductions directly after the unchanged compact admission gate.
 
     Args:
@@ -40,6 +41,7 @@ def build_whole_expert_plan(counts: Sequence[Sequence[int]], config: ExpertRepli
         minimum_saved_rows: Existing minimum absolute peak reduction.
         minimum_replica_rows: Existing minimum optional guest size.
         rank_nodes: Immutable node identities in expert-parallel rank order.
+        transfer_row_credit: Existing conservative row allowance for deleting complete matrix transfers.
 
     Returns:
         The same complete plan as converting an intermediate split-K placement.
@@ -54,6 +56,7 @@ def build_whole_expert_plan(counts: Sequence[Sequence[int]], config: ExpertRepli
     return place_whole_experts(
         seed, capacity_limit=capacity_limit, minimum_load_reduction=minimum_load_reduction,
         minimum_saved_rows=minimum_saved_rows, minimum_replica_rows=minimum_replica_rows, rank_nodes=rank_nodes,
+        transfer_row_credit=transfer_row_credit,
     )
 
 
@@ -84,7 +87,8 @@ def _materialize(plan: ExpertExecutionPlan, targets: list[int]) -> ExpertExecuti
 def place_whole_experts(plan: ExpertExecutionPlan, *, capacity_limit: int,
                         minimum_load_reduction: float, minimum_saved_rows: int = 0,
                         minimum_replica_rows: int = 0,
-                        rank_nodes: tuple[int, ...] | None = None) -> ExpertExecutionPlan:
+                        rank_nodes: tuple[int, ...] | None = None,
+                        transfer_row_credit: int = 0) -> ExpertExecutionPlan:
     """Place complete expert reductions with deterministic minimax moves and pruning.
 
     Splitting the K reduction can change quantization groups and FP32 gradient
@@ -98,6 +102,7 @@ def place_whole_experts(plan: ExpertExecutionPlan, *, capacity_limit: int,
         minimum_saved_rows: Minimum absolute receive reduction for optional migration.
         minimum_replica_rows: Minimum useful optional guest size.
         rank_nodes: Immutable node labels in EP-rank order, when available.
+        transfer_row_credit: Bound the total receive-peak slack used to remove complete matrix transfers.
 
     Returns:
         Immutable complete-K plan preserving logical counts and home parameters.
@@ -109,6 +114,7 @@ def place_whole_experts(plan: ExpertExecutionPlan, *, capacity_limit: int,
     _integer(capacity_limit, "Complete expert capacity", 0)
     _integer(minimum_saved_rows, "Complete expert minimum saved rows", 0)
     _integer(minimum_replica_rows, "Complete expert minimum replica rows", 0)
+    _integer(transfer_row_credit, "Replica transfer row credit", 0)
     reduction_basis_points(minimum_load_reduction)
     config = plan.config
     nodes = _validate_rank_nodes(rank_nodes or (), config.ep_size) or (0,) * config.ep_size
@@ -157,7 +163,7 @@ def place_whole_experts(plan: ExpertExecutionPlan, *, capacity_limit: int,
         # Allow one largest expert beside the lightest original home workload.
         # This avoids moving cold matrices merely to free a few rows for a guest.
         target = max(max(loads), max(weights) + lightest_home)
-        ceiling = min(capacity_limit, target)
+        ceiling = min(capacity_limit, target + transfer_row_credit)
         if not capacity_required:
             ceiling = min(ceiling, baseline_peak - 1, baseline_peak - minimum_saved_rows,
                           int(baseline_peak * (1 - minimum_load_reduction)))

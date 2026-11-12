@@ -229,6 +229,7 @@ def _build_route_plan(counts: Any, config: ExpertReplicaConfig, complete_experts
         minimum_saved_rows=options.get('minimum_saved_rows', 0),
         minimum_replica_rows=options.get('minimum_replica_rows', 0),
         rank_nodes=options.get('_rank_nodes') or None,
+        transfer_row_credit=options.get('_replica_transfer_row_credit', 0),
     )
 
 
