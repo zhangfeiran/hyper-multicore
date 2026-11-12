@@ -72,6 +72,9 @@ def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", choices=("accuracy", "benchmark"), default="accuracy")
     parser.add_argument("--backend", choices=("native", "push", "pull"), default="push")
+    parser.add_argument("--communication-backend", choices=("shmem", "hccl"), default="shmem")
+    parser.add_argument("--exercise-edge-routes", action="store_true",
+                        help="Include hot owners, empty sources, and all-identity steps without requiring replicas")
     parser.add_argument("--routing-backend", choices=("torch", "triton"), default="torch")
     parser.add_argument("--swiglu-precision", choices=("fused", "hf"), default="fused")
     parser.add_argument("--ep", type=int, default=4)
@@ -172,13 +175,14 @@ def candidate(args: argparse.Namespace) -> LongcatFlashExperts:
                                num_experts=args.real, zero_experts=args.zero, top_k=args.top_k,
                                ep_size=args.ep, ep_group=dist.group.WORLD, dispatch_mode=args.backend,
                                swiglu_precision=args.swiglu_precision, routing_backend=args.routing_backend,
+                               communication_backend=args.communication_backend,
                                replica_slots_per_rank=args.replica_slots, gate_up_padded=True,
                                initial_token_capacity=args.tokens * args.top_k)
 
 
 def routes(args: argparse.Namespace, data: dict, step: int, rank: int) -> tuple[str, torch.Tensor]:
     """Vary owner load and include empty-source and all-identity replica steps."""
-    if not args.replica_slots:
+    if not args.replica_slots and not args.exercise_edge_routes:
         return "router", data["ids"]
     kinds = ("hot", "hot", "normal", "hot", "empty_source", "identity", "hot", "normal", "hot", "hot")
     kind = kinds[step % len(kinds)]
@@ -248,13 +252,17 @@ def plan_observer(engine: object, plans: list) -> Any:
 
 def execution_plan(layer: LongcatFlashExperts) -> dict:
     """Capture the actual last MegaMoE plan, separate from the requested controls."""
-    resources = layer.executor._resource_group.resources
+    executor = layer.executor
+    if executor.communication_backend == "hccl":
+        executor = executor._resource_group.hccl_executor.compute
+    resources = executor._resource_group.resources
     plan = resources.last_execution_plan
     spec = plan.spec
     task_values = _build_task_values(spec)
     operators = ("dispatch", "combine")
     tasks = {name: plan.forward_graph.get_op(name).split_spec.task_num_fn(task_values) for name in operators}
-    return {"plan_tokens": spec.plan_tokens, "route_source_rows": spec.schedule_source_expert_rows,
+    return {"communication_backend": layer.executor.communication_backend, "compute_ep_size": spec.ep_size,
+            "plan_tokens": spec.plan_tokens, "route_source_rows": spec.schedule_source_expert_rows,
             "route_expert_rows": spec.schedule_expert_rows, "communication_rows": spec._communication_rows,
             "compact_communication": spec._compact_communication, "forward_tasks": tasks}
 

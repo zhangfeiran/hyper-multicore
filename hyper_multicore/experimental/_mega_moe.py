@@ -44,6 +44,7 @@ class MegaMoeTuningOptions:
     """
 
     dispatch_mode: Literal["push", "pull"] = "push"
+    communication_backend: Literal["shmem", "hccl"] = "shmem"
     initial_capacity_factor: float | None = None
     capacity_growth_factor: float | None = None
     dispatch_split: int = 128

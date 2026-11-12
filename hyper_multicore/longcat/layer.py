@@ -19,7 +19,8 @@ from typing import Any
 import torch
 from torch import nn
 
-from hyper_multicore import MegaMoeExperts
+from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
+from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.longcat._routing import route_experts
 
 
@@ -50,6 +51,7 @@ class LongcatFlashExperts(nn.Module):
     def __init__(self, *, hidden_size: int, intermediate_size: int, num_experts: int,
                  zero_experts: int, top_k: int, ep_size: int = 1, ep_group: Any = None,
                  dispatch_mode: str = "push", swiglu_precision: str = "fused",
+                 communication_backend: str = "shmem",
                  routing_backend: str = "torch", replica_slots_per_rank: int = 0,
                  gate_up_padded: bool = False, initial_token_capacity: int | None = None,
                  replica_min_rows: int = 1024) -> None:
@@ -64,6 +66,7 @@ class LongcatFlashExperts(nn.Module):
             ep_size: Number of ranks in the explicit expert group.
             ep_group: Expert group; required for distributed execution.
             dispatch_mode: MegaMoE push or pull transport.
+            communication_backend: SHMEM MTE communication or HCCL routing with local MegaMoE compute.
             swiglu_precision: Fused arithmetic or HF BF16 rounding.
             routing_backend: Portable Torch or optional Ascend Triton routing.
             replica_slots_per_rank: Number of whole-expert guest slots per rank.
@@ -79,14 +82,20 @@ class LongcatFlashExperts(nn.Module):
         self.ep_size, self.ep_group = ep_size, ep_group
         self.routing_backend, self.gate_up_padded = routing_backend, gate_up_padded
         self.replica_slots_per_rank = replica_slots_per_rank
-        options = {} if initial_token_capacity is None else {"initial_token_capacity": initial_token_capacity}
-        self.executor = MegaMoeExperts(
-            hidden_size=hidden_size, intermediate_size=intermediate_size, num_experts=num_experts, top_k=1,
-            ep_group=ep_group, ep_size=ep_size, create_parameters=False, expert_weight_layout="EOI",
-            swiglu_hf_bf16=swiglu_precision == "hf", dispatch_mode=dispatch_mode,
+        actual_ep = torch.distributed.get_world_size(ep_group) if torch.distributed.is_initialized() else 1
+        if actual_ep != ep_size:
+            raise ValueError(f"LongCat ep_size={ep_size} does not match expert group size={actual_ep}")
+        tuning = MegaMoeTuningOptions(
+            dispatch_mode=dispatch_mode, communication_backend=communication_backend,
+            initial_token_capacity=128 if initial_token_capacity is None else initial_token_capacity,
             single_expert_tasks=True, route_task_bounds=True, replica_slots_per_rank=replica_slots_per_rank,
             replica_granularity="expert" if replica_slots_per_rank else "token", replica_min_rows=replica_min_rows,
-            gate_up_expert_padding=zero_experts if gate_up_padded and not replica_slots_per_rank else 0, **options,
+            gate_up_expert_padding=zero_experts if gate_up_padded and not replica_slots_per_rank else 0,
+        )
+        self.executor = MegaMoeExperts(
+            hidden_size=hidden_size, intermediate_size=intermediate_size, num_experts=num_experts, top_k=1,
+            ep_group=ep_group, numerics_options=MegaMoeNumericsOptions(swiglu_hf_bf16=swiglu_precision == "hf"),
+            tuning_options=tuning,
         )
 
     def _weights(self, expert_weights: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:

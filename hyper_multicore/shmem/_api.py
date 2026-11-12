@@ -24,6 +24,7 @@ __all__ = [
     "get",
     "host_barrier",
     "put",
+    "peer_mte_accessibility",
     "signal",
     "wait_signal",
 ]
@@ -69,6 +70,20 @@ def _normalize_alignment(alignment: Any | None) -> int | None:
         return operator.index(alignment)
     except TypeError as error:
         raise TypeError(f"alignment must be an integer, got {type(alignment).__name__}") from error
+
+
+@_runtime_access
+def peer_mte_accessibility() -> tuple[bool, ...]:
+    """Return MTE reachability in Root PE order after :func:`shmem.acquire`.
+
+    A peer can have a nonzero symmetric virtual address without supporting MTE.
+    This host query launches no device communication and does not infer capability
+    from CPU architecture, device name, or PCIe peer-access flags.
+    """
+    native = _load_native()
+    if not hasattr(native, "_peer_mte_accessibility"):
+        raise RuntimeError("SHMEM payload lacks MTE topology checks; rebuild native libraries from this checkout")
+    return tuple(native._peer_mte_accessibility())
 
 
 @_runtime_access

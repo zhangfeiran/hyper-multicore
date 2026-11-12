@@ -58,6 +58,81 @@ SwiGLU 实现，并非通过 Python 再调用一次 `torch_npu.npu_swiglu`。
 默认 `routing_backend="torch"` 不要求 Triton。可用的 Ascend Triton 环境可选
 `"triton"`，须在目标设备和版本上单独验证。EP 实际规模及每卡权重应与传入配置一致。
 
+## MTE 不互通的 EP 组与 910B2C 16 卡
+
+SHMEM 是通信接口，具体能否跨设备访问取决于传输引擎和实际拓扑。
+当前融合通信路径同时用 MTE 搬运数据、更新远端 Add 计数器；PCIe peer access
+或非空的对称虚拟地址不代表这些操作可达。上游 SHMEM 的
+[使用限制](https://github.com/hicann/shmem/blob/master/docs/debug/Troubleshooting_FAQs.md)
+说明 A2 的两个 8P HCCS 域之间不能直接使用 MTE。判断应以实际探测为准，不能只根据 CPU 架构或卡数。
+
+默认 `communication_backend="shmem"` 会在构建首个融合计划前读取 SDK 的 MTE
+可达性，并把本 rank 的失败汇合到 EP 组。缺少任何 peer 会报出不可达的 Root PE，
+避免提交必定无法完成的远端 MTE 操作。这个检查需要重新编译当前源码的原生绑定；
+旧二进制缺少探测接口时会明确要求重编译。
+
+先按照下方构建章节，激活客户自己的 CANN 环境并 source 当前编译产物的
+`build/native/payload/hyper_multicore/lib/set_env.bash`。随后可检查真实拓扑；
+此命令只初始化、读取可达性并关闭资源，不提交远端搬运：
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=16 \
+  examples/longcat_flash/check_transport.py --output ./transport-probe
+```
+
+检查每个 `rank*.json` 的 `mte_reachable` 和 `all_peers_mte_reachable`。
+`guard_injection_pass` 只说明模拟缺失 MTE peer 时的保护生效，不能作为 PCIe 实测通过。
+`--exercise both` 可在全部 peer 确认可达后检查真实 MTE/Host SDMA Put 和 Add 完成通知；
+脚本不会在缺失 MTE 链路时强行提交这些操作。
+
+对跨 MTE 域的 EP16，构造 `LongcatFlashExperts` 或 `MegaMoeExperts` 时显式加入：
+
+```python
+communication_backend="hccl",
+replica_slots_per_rank=0,
+```
+
+此时全局 EP 仍为 16，专家所有权、每卡 8 个真实专家、模型宽度、TopK 和外部 EOI
+权重均保持原配置。计数交换、dispatch/combine 和对应梯度走 HCCL；每卡使用一个
+单 PE 的 SHMEM runtime 执行本地 MegaMoE GMM/SwiGLU/dW 融合内核，内核里的搬运和
+信号仅访问自身。原生 GMM 参考路径仍独立用于验收。
+
+HCCL 路径目前不支持热专家副本，启用副本会在构造时明确报错。一个进程内的
+MegaMoE 层应统一选择通信 backend；不能同时保留需要跨 PE SHMEM 的执行器和
+HCCL 路径的单 PE runtime。该路径拆开了跨卡通信与本地计算，其性能需在目标拓扑
+重新测量，不能套用全 MTE 路径的通信计算重叠收益。
+
+在客户已有 PyTorch/torch-npu/CANN 环境中从本分支重编译后，运行完整 EP16 原宽验收：
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=16 \
+  examples/longcat_flash/validate.py --check accuracy --backend push \
+  --communication-backend hccl --ep 16 --tokens 2048 \
+  --hidden 6144 --intermediate 2048 --real 128 --zero 64 --top-k 12 \
+  --swiglu-precision fused --routing-backend torch --updates 10 \
+  --output ./longcat-hccl-accuracy
+```
+
+需要额外覆盖热点 owner、空源和全恒等专家时加入 `--exercise-edge-routes`。
+构造完整模型后，HCCL 路径会在第一次计算前登记当前 EP 组所有已创建层的本地执行器，
+使 Heap 预留包含后续层，避免前一层仍持有反向状态时才为后一层追加预留。
+串行层仍可在首次执行前显式共享执行资源；`initial_token_capacity` 在 HCCL 模式下
+也传递给本地计算执行器，用于预留本卡接收的真实 assignment 行数。
+
+两个专家层前向保留计算图后一起反传的检查，可用以下命令执行：
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=16 \
+  examples/longcat_flash/check_hccl_lifecycle.py --communication-backend hccl \
+  --ep 16 --tokens 2048 --hidden 6144 --intermediate 2048 \
+  --real 128 --zero 64 --top-k 12 --output ./longcat-hccl-two-layer
+```
+
+报告中的 `last_execution_plan.compute_ep_size=1` 描述每卡本地计算 kernel 的坐标，
+不表示将 EP16 工作负载缩成单卡模型；报告 `shape.ep` 应为 16。
+
+当前已完成的硬件、数值与资源释放检查见 [通信验证记录](TRANSPORT_VALIDATION.md)。
+
 ## 单机原宽精度验证
 
 先使用当前机器已有的 PyTorch/torch-npu 和 CANN 编译 HPM，参考

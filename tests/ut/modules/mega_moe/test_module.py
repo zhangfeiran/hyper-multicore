@@ -1060,6 +1060,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                 return_value=bound_spec,
             ),
             patch.object(mega_moe_module, "_get_heap_manager", return_value=manager),
+            patch.object(mega_moe_module.shmem, "peer_mte_accessibility", return_value=(True,)),
             patch.object(mega_moe_module, "build_mega_moe_plan", return_value=object()) as mock_build_plan,
             patch.object(mega_moe_module, "MegaMoeWorkspace", return_value=workspace),
             patch.object(_automatic._CLEANUP, "root_group", object()),
@@ -1114,6 +1115,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                 return_value=bound_spec,
             ),
             patch.object(mega_moe_module, "_get_heap_manager", return_value=manager),
+            patch.object(mega_moe_module.shmem, "peer_mte_accessibility", return_value=(True,)),
             patch.object(
                 mega_moe_module,
                 "build_mega_moe_plan",
@@ -1169,6 +1171,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             patch.object(mega_moe_module, "bind_mega_moe_spec", return_value=bound_spec),
             patch.object(mega_moe_module, "_workspace_layout", return_value=object()),
             patch.object(mega_moe_module, "_get_heap_manager", return_value=manager),
+            patch.object(mega_moe_module.shmem, "peer_mte_accessibility", return_value=(True,)),
             patch.object(mega_moe_module, "build_mega_moe_plan", side_effect=RuntimeError("plan failed")),
             self.assertRaisesRegex(RuntimeError, "plan failed"),
         ):
