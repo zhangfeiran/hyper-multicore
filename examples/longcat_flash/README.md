@@ -85,7 +85,8 @@ python -m torch.distributed.run --standalone --nproc-per-node=16 \
 `--exercise both` 可在全部 peer 确认可达后检查真实 MTE/Host SDMA Put 和 Add 完成通知；
 脚本不会在缺失 MTE 链路时强行提交这些操作。
 
-对跨 MTE 域的 EP16，构造 `LongcatFlashExperts` 或 `MegaMoeExperts` 时显式加入：
+如需单独验证跨 MTE 域 EP16 的通信兼容性，可在构造 `LongcatFlashExperts` 或
+`MegaMoeExperts` 时显式加入：
 
 ```python
 communication_backend="hccl",
@@ -100,7 +101,12 @@ replica_slots_per_rank=0,
 HCCL 路径目前不支持热专家副本，启用副本会在构造时明确报错。一个进程内的
 MegaMoE 层应统一选择通信 backend；不能同时保留需要跨 PE SHMEM 的执行器和
 HCCL 路径的单 PE runtime。该路径拆开了跨卡通信与本地计算，其性能需在目标拓扑
-重新测量，不能套用全 MTE 路径的通信计算重叠收益。
+重新测量，不能套用全 MTE 路径的通信计算重叠收益。当前实现先完成外层 dispatch
+All-to-All，随后进入本地融合计算，再执行 combine All-to-All，因此没有保留按专家
+就绪推进的跨卡通信计算流水。这里的开关用于兼容性验证，不作为目标拓扑的性能优化结论。
+
+面向跨 MTE 域的融合性能路径，参见 [SHMEM 单边 RDMA 原型与接入设计](one_sided_probe/README.md)。
+该原型已验证 AIV 直驱数据、通知及按专家提前就绪，生产 MegaMoE 路径尚未接入 RDMA。
 
 在客户已有 PyTorch/torch-npu/CANN 环境中从本分支重编译后，运行完整 EP16 原宽验收：
 
