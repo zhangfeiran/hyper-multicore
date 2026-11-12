@@ -29,6 +29,8 @@ def test_hotspot_keeps_achievable_peak_and_complete_source_reductions(budget: in
                                    minimum_load_reduction=0.4, minimum_replica_rows=1024,
                                    rank_nodes=(0,) * 8 + (1,) * 8)
     assert max(plan.destination_loads) <= 58688
+    assert len(plan.transfers) == 6
+    assert all(edge.logical_expert < 8 for edge in plan.transfers)
     assert max(plan.replica_slots_used) <= budget
     assert plan.logical_counts == counts
     for expert in range(config.num_experts):
@@ -66,3 +68,11 @@ def test_balanced_and_budget_zero_preserve_home_only_layout() -> None:
                                        minimum_load_reduction=0.4, minimum_replica_rows=1024)
         assert plan.transfers == ()
         assert plan.destination_loads == (96,) * 16
+
+
+def test_empty_experts_do_not_create_guest_transfers() -> None:
+    config = ExpertReplicaConfig(96, 16, 2)
+    plan = build_whole_expert_plan(((0,) * 96,) * 16, config, capacity_limit=393216,
+                                   minimum_load_reduction=0.4, minimum_replica_rows=1024)
+    assert plan.transfers == ()
+    assert plan.destination_loads == (0,) * 16
