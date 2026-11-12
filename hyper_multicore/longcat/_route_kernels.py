@@ -195,7 +195,7 @@ class OrderedGather(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: Any, hidden: torch.Tensor, token: torch.Tensor,
-                inverse: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                inverse: torch.Tensor, indexed: bool) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather real assignments and retain one storage-sharing identity view.
 
         Args:
@@ -206,7 +206,9 @@ class OrderedGather(torch.autograd.Function):
         """
         ctx.save_for_backward(inverse)
         ctx.shape = hidden.shape
-        return hidden.index_select(0, token), hidden.view_as(hidden)
+        real = (hidden.as_strided((token.numel(), hidden.shape[1]), (0, 1)) if indexed
+                else hidden.index_select(0, token))
+        return real, hidden.view_as(hidden)
 
     @staticmethod
     def backward(ctx: Any, real_gradient: torch.Tensor, identity_gradient: torch.Tensor) -> tuple:
@@ -223,7 +225,7 @@ class OrderedGather(torch.autograd.Function):
         if specialized and not real_gradient.shape[0]:
             _launch(_empty_input_gradient_kernel, ctx.shape[0], ctx.shape[1],
                     identity_gradient, output, top_k=inverse.shape[1])
-            return output, None, None
+            return output, None, None, None
         # The adapter sorts real experts before identity experts. Skip their
         # zero contributions while retaining the descending BF16 sum order.
         kernel = (_input_prefix_gradient_kernel
@@ -231,7 +233,7 @@ class OrderedGather(torch.autograd.Function):
                   else _input_gradient_kernel)
         _launch(kernel, ctx.shape[0], ctx.shape[1],
                real_gradient, identity_gradient, inverse, output, top_k=inverse.shape[1])
-        return output, None, None
+        return output, None, None, None
 
 
 class OrderedCombine(torch.autograd.Function):

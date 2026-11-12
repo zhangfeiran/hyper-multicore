@@ -199,6 +199,13 @@ runtime::Result<data_op_engine_type_t> DataEngineMask(runtime::DataEngine data_e
   if (data_engine == runtime::DataEngine::Mte) {
     return runtime::Result<data_op_engine_type_t>::Success(ACLSHMEM_DATA_OP_MTE);
   }
+  if (data_engine == runtime::DataEngine::MteRoce) {
+    return runtime::Result<data_op_engine_type_t>::Success(
+      static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_ROCE));
+  }
+  if (data_engine == runtime::DataEngine::Roce) {
+    return runtime::Result<data_op_engine_type_t>::Success(ACLSHMEM_DATA_OP_ROCE);
+  }
   return runtime::Result<data_op_engine_type_t>::Failure(
     InvalidArgument("data_engine must be a supported Runtime DataEngine value"));
 }
@@ -305,6 +312,12 @@ runtime::Status initialize(const InitOptions &options) {
       return CannFailure("aclshmemx_set_attr_uniqueid_args", status, attribute_detail);
     }
   }
+  // Keep the selected transport and timeouts explicit at the final initialization boundary.
+  attributes.option_attr.data_op_engine_type = data_engine_mask.value();
+  attributes.option_attr.shm_init_timeout = options.timeout_seconds;
+  attributes.option_attr.shm_create_timeout = options.timeout_seconds;
+  attributes.option_attr.control_operation_timeout = options.timeout_seconds;
+  attributes.option_attr.sockFd = kNoSocketFd;
   const LargePageHbmSnapshot memory = query_current_device_large_page_hbm();
   log::ErrorCapture init_capture;
   const int32_t init_status = aclshmemx_init_attr(
@@ -386,6 +399,10 @@ void wait_signal_on_stream(uintptr_t local_signal, CompareOp comparison, int32_t
                            const runtime::StreamView &stream) {
   aclshmemx_signal_wait_until_on_stream(reinterpret_cast<int32_t *>(local_signal), CannCompareOp(comparison), value,
                                         reinterpret_cast<aclrtStream>(stream.native_handle));
+}
+
+std::vector<uint32_t> peer_transport_masks() {
+  return std::vector<uint32_t>(g_state.topo_list, g_state.topo_list + g_state.npes);
 }
 
 std::vector<bool> peer_mte_accessibility() {

@@ -109,12 +109,16 @@ Result<Config> ParseConfig(const ConfigInput &input) {
 
   const std::string_view data_engine =
     input.data_engine.has_value() ? std::string_view(*input.data_engine) : kDefaultDataEngine;
-  if (data_engine != kDefaultDataEngine) {
+  if (data_engine == "mte") {
+    config.data_engine = DataEngine::Mte;
+  } else if (data_engine == "mte_roce") {
+    config.data_engine = DataEngine::MteRoce;
+  } else if (data_engine == "roce") {
+    config.data_engine = DataEngine::Roce;
+  } else {
     return Result<Config>::Failure(InvalidConfig(std::string(kDataEngineEnv) +
-                                                 " only accepts the case-sensitive value 'mte', but got '" +
-                                                 std::string(data_engine) + "'"));
+      " accepts 'mte', 'mte_roce' or 'roce', but got '" + std::string(data_engine) + "'"));
   }
-  config.data_engine = DataEngine::Mte;
 
   const std::string_view endpoint = input.bootstrap_endpoint_base.has_value()
                                       ? std::string_view(*input.bootstrap_endpoint_base)

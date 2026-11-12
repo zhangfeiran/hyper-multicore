@@ -37,13 +37,16 @@ from hyper_multicore.scheduler.config import MIN_EVENT_CAPACITY, event_workspace
 from hyper_multicore.shmem import _lifecycle
 
 from .spec import MegaMoeSpec, initial_receive_capacity
+from . import rdma
 
 _GMM_WORKSPACE_BYTES = 512
 _SWIGLU_GRAD_WORKSPACE_BYTES = 512
 _WORKSPACE_ALIGNMENT = 512
 _SYMMETRIC_FIELDS = (
     "source_buffer",
+    "source_indices",
     "expert_buffer",
+    "return_source_buffer",
     "routed_buffer",
     "forward_event_counters",
     "backward_event_counters",
@@ -61,11 +64,15 @@ def _workspace_allocation_specs(
     num_experts: int,
     dtype: torch.dtype,
     replica_inbox_bytes: int = 0,
+    shmem_data_engine: str = "mte",
+    dispatch_split: int = 128,
+    combine_split: int = 128,
 ) -> tuple[tuple[str, _lifecycle._AllocationSpec], ...]:
     """Return the single ordered physical Allocation description for a workspace."""
     data_field = "source_buffer" if dispatch_mode == "pull" else "expert_buffer"
     data_rows = routed_slots if dispatch_mode == "pull" else receive_capacity
-    event_bytes = event_workspace_bytes(ep_size, num_experts)
+    event_bytes = (event_workspace_bytes(ep_size, num_experts) if shmem_data_engine == "mte"
+                   else rdma.layout(ep_size, num_experts, routed_slots, dispatch_split, combine_split)[3])
     allocation_spec = _lifecycle._AllocationSpec
     allocations = (
         (data_field, allocation_spec((data_rows, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
@@ -73,6 +80,14 @@ def _workspace_allocation_specs(
         ("forward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
         ("backward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
     )
+    if shmem_data_engine != "mte":
+        additional = "expert_buffer" if dispatch_mode == "pull" else "source_buffer"
+        additional_rows = receive_capacity if dispatch_mode == "pull" else routed_slots
+        allocations += (
+            (additional, allocation_spec((additional_rows, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
+            ("source_indices", allocation_spec((routed_slots,), torch.int32, _WORKSPACE_ALIGNMENT)),
+            ("return_source_buffer", allocation_spec((receive_capacity, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
+        )
     if replica_inbox_bytes:
         allocations += (("replica_inbox", allocation_spec((replica_inbox_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),)
     return allocations
@@ -115,7 +130,7 @@ def _spec_workspace_bytes(
     capacity = initial_receive_capacity(specification)
     if receive_capacity is not None:
         capacity = receive_capacity
-    if specification.get("dispatch_mode", "push") == "pull":
+    if specification.get("dispatch_mode", "push") == "pull" and not rdma.enabled(specification):
         capacity = routed_slots
     allocations = _workspace_allocation_specs(
         dispatch_mode=specification.get("dispatch_mode", "push"),
@@ -126,6 +141,9 @@ def _spec_workspace_bytes(
         num_experts=specification["num_experts"],
         dtype=dtype,
         replica_inbox_bytes=_replica_inbox_bytes(specification),
+        shmem_data_engine=specification.get("shmem_data_engine", "mte"),
+        dispatch_split=specification.get("dispatch_split", 128),
+        combine_split=specification.get("combine_split", 128),
     )
     return sum((spec.dtype.itemsize * math.prod(spec.shape) + spec.alignment_bytes - 1 for _, spec in allocations))
 
@@ -141,7 +159,9 @@ class MegaMoeWorkspace:
     routed_slots: int = 0
     dispatch_mode: str = "push"
     source_buffer: Any | None = None
+    source_indices: Any | None = None
     expert_buffer: Any | None = None
+    return_source_buffer: Any | None = None
     routed_buffer: Any | None = None
     forward_event_counters: Any | None = None
     backward_event_counters: Any | None = None
@@ -156,6 +176,12 @@ class MegaMoeWorkspace:
     closing: bool = False
     used: bool = False
     event_counter_bytes: int = MIN_EVENT_CAPACITY * 4
+    rdma_enabled: bool = False
+    rdma_ep_size: int = 1
+    rdma_num_experts: int = 1
+    rdma_dispatch_split: int = 128
+    rdma_combine_split: int = 128
+    rdma_value_bytes: int = 0
     forward_ready_initialized: bool = False
     backward_ready_initialized: bool = False
     capacity_floor: int = 0
@@ -181,6 +207,9 @@ class MegaMoeWorkspace:
             num_experts=spec.num_experts,
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
+            shmem_data_engine=getattr(spec, "shmem_data_engine", "mte"),
+            dispatch_split=getattr(spec, "dispatch_split", 128),
+            combine_split=getattr(spec, "combine_split", 128),
         )
         replacement = _lifecycle._AllocationReplacement
         return tuple((replacement(getattr(self, field_name), target) for field_name, target in targets))
@@ -211,6 +240,9 @@ class MegaMoeWorkspace:
             num_experts=spec.num_experts,
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
+            shmem_data_engine=getattr(spec, "shmem_data_engine", "mte"),
+            dispatch_split=getattr(spec, "dispatch_split", 128),
+            combine_split=getattr(spec, "combine_split", 128),
         )
         if len(replacements) != len(expected):
             raise RuntimeError("materialized workspace has an incomplete restart Allocation mapping")
@@ -240,11 +272,23 @@ class MegaMoeWorkspace:
             num_experts=spec.num_experts,
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
+            shmem_data_engine=getattr(spec, "shmem_data_engine", "mte"),
+            dispatch_split=getattr(spec, "dispatch_split", 128),
+            combine_split=getattr(spec, "combine_split", 128),
         )
         self.source_buffer = None
         self.expert_buffer = None
+        self.return_source_buffer = None
         for tensor, (field_name, _) in zip(tensors, targets):
             setattr(self, field_name, tensor)
+        self.rdma_enabled = rdma.enabled(spec)
+        self.rdma_ep_size = spec.ep_size
+        self.rdma_num_experts = spec.num_experts
+        self.rdma_dispatch_split = getattr(spec, "dispatch_split", 128)
+        self.rdma_combine_split = getattr(spec, "combine_split", 128)
+        self.rdma_value_bytes = (spec.num_experts * ((spec.routed_slots
+                                 + min(self.rdma_dispatch_split, self.rdma_combine_split) - 1)
+                                 // min(self.rdma_dispatch_split, self.rdma_combine_split)) + 1) * 4
         self.dispatch_mode = spec.dispatch_mode
         self.dtype = dtype
         self.device = device
@@ -277,6 +321,9 @@ class MegaMoeWorkspace:
             num_experts=spec.num_experts,
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
+            shmem_data_engine=getattr(spec, "shmem_data_engine", "mte"),
+            dispatch_split=getattr(spec, "dispatch_split", 128),
+            combine_split=getattr(spec, "combine_split", 128),
         )
         if len(tensors) != len(targets):
             raise RuntimeError("SHMEM restart returned an unexpected Allocation count")
@@ -344,7 +391,18 @@ class MegaMoeWorkspace:
             num_experts=spec.num_experts,
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
+            shmem_data_engine=getattr(spec, "shmem_data_engine", "mte"),
+            dispatch_split=getattr(spec, "dispatch_split", 128),
+            combine_split=getattr(spec, "combine_split", 128),
         )
+        self.rdma_enabled = rdma.enabled(spec)
+        self.rdma_ep_size = spec.ep_size
+        self.rdma_num_experts = spec.num_experts
+        self.rdma_dispatch_split = getattr(spec, "dispatch_split", 128)
+        self.rdma_combine_split = getattr(spec, "combine_split", 128)
+        self.rdma_value_bytes = (spec.num_experts * ((spec.routed_slots
+                                 + min(self.rdma_dispatch_split, self.rdma_combine_split) - 1)
+                                 // min(self.rdma_dispatch_split, self.rdma_combine_split)) + 1) * 4
         self.dispatch_mode = spec.dispatch_mode
         self.dtype = dtype
         self.device = device
@@ -401,6 +459,17 @@ class MegaMoeWorkspace:
         if events is None:
             raise RuntimeError(f"MegaMoe workspace {field_name} is not initialized.")
         events[:self.event_counter_bytes].zero_()
+        if self.rdma_enabled:
+            if not ready_initialized:
+                events[self.event_counter_bytes:].zero_()
+            rdma.prepare_events(self, events, ready_initialized)
+            if not ready_initialized:
+                shmem.host_barrier()
+                if forward:
+                    self.forward_ready_initialized = True
+                else:
+                    self.backward_ready_initialized = True
+            return events
         if events.numel() == self.event_counter_bytes or ready_initialized:
             return events
 

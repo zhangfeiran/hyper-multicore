@@ -38,22 +38,27 @@ def _validate(hidden: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, to
 def _identity(hidden: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, real: int,
               initial: torch.Tensor, inputs: tuple) -> torch.Tensor:
     """Add identity contributions in expert order with per-slot BF16 casts."""
-    order = ids.argsort(dim=-1)
-    ordered_ids, ordered_weights = ids.gather(1, order), weights.gather(1, order)
     result = initial
     for slot in range(ids.shape[1]):
-        probability = ordered_weights[:, slot] * (ordered_ids[:, slot] >= real)
+        probability = weights[:, slot] * (ids[:, slot] >= real)
         result = result + (inputs[slot] * probability[:, None]).to(hidden.dtype)
     return result
+
+
+def _uses_indexed_source(executor: Any) -> bool:
+    """Keep metadata carriers inside the fused SHMEM consumer that understands them."""
+    return (getattr(executor, "communication_backend", "shmem") == "shmem"
+            and getattr(executor, "shmem_data_engine", "mte") in ("mte_roce", "roce"))
 
 
 def _torch_forward(executor: Any, hidden: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor,
                    real: int, total: int, group: Any, expert_weights: tuple) -> torch.Tensor:
     """Preserve ordered LongCat arithmetic using ordinary Torch operators."""
     error = ((ids < 0) | (ids >= total)).any()
-    order = ids.argsort(dim=-1)
+    order = (ids.float() if total <= 2**24 else ids).argsort(dim=-1)
     ids, weights = ids.gather(1, order), weights.gather(1, order)
-    gather = OrderedInputGather(ids.shape[1])
+    indexed = _uses_indexed_source(executor)
+    gather = OrderedInputGather(ids.shape[1], indexed=indexed)
     result = masked_expert_forward(executor, hidden, ids, weights, ids < real, expert_weights=expert_weights,
                                    ep_group=group, route_error=error, input_gather=gather)
     return _identity(hidden, ids, weights, real, result, gather.identity_inputs)
@@ -84,11 +89,13 @@ def _triton_forward(executor: Any, hidden: torch.Tensor, ids: torch.Tensor, weig
     if token.numel():
         positions = token * ids.shape[1] + slot
         inverse.view(-1).index_copy_(0, positions, torch.arange(token.numel(), device=ids.device, dtype=torch.int32))
-    states, identity = OrderedGather.apply(hidden, token, inverse)
+    indexed = _uses_indexed_source(executor)
+    states, identity = OrderedGather.apply(hidden, token, inverse, indexed)
     if count:
         compact_ids = ids[token, slot].reshape(-1, 1).contiguous()
+        options = {"_indexed_source": (hidden, token)} if indexed else {}
         unweighted = executor(states, compact_ids, weights.new_ones((token.numel(), 1)),
-                              expert_weights=expert_weights)
+                              expert_weights=expert_weights, **options)
     else:
         unweighted = states
     return OrderedCombine.apply(identity, unweighted, weights, inverse, token, slot)

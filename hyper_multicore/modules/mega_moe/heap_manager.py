@@ -31,6 +31,7 @@ from hyper_multicore import _collective, shmem
 from hyper_multicore.replica.capacity import ExpertReplicaConfig
 from hyper_multicore.shmem import _lifecycle
 
+from . import rdma
 from .spec import (
     _DEFAULT_CAPACITY_FACTOR,
     MegaMoeSpec,
@@ -365,7 +366,7 @@ class _HeapManager:
             token_capacity = max(spec.local_num_tokens, _align_capacity(tokens)) if spec.auto_tokens else None
             fixed = _workspace_layout(entry.specification, self.dtype, 0, token_capacity).required_bytes
             other = sum((item.layout.required_bytes for item in self.entries if item is not entry))
-            row_bytes = spec.hidden_size * self.element_size
+            row_bytes = spec.hidden_size * self.element_size * (2 if rdma.enabled(spec) else 1)
             self._budget(_round_heap_bytes(fixed + other + entry.layout.receive_capacity * row_bytes))
             available = max(0, (self.heap_limit - other - fixed) // row_bytes)
             allowance = available // 128 * 128
@@ -416,7 +417,8 @@ class _HeapManager:
         """Check shape and guest-prefix growth before the read-only transaction preflight."""
         spec = entry.bound_spec
         grow_source = tokens > spec.local_num_tokens
-        grow_receive = spec.dispatch_mode == "push" and received > entry.layout.receive_capacity
+        symmetric_receive = spec.dispatch_mode == "push" or rdma.enabled(spec)
+        grow_receive = symmetric_receive and received > entry.layout.receive_capacity
         inbox_slots = entry.layout.replica_inbox_slots
         if inbox_slots is not None and (not 0 <= replica_slots <= spec.replica_slots_per_rank):
             raise ValueError("The selected route exceeds the configured replica slot cap")

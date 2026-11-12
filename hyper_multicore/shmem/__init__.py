@@ -23,6 +23,7 @@ from ._api import (
     host_barrier,
     put,
     peer_mte_accessibility,
+    peer_transport_masks,
     signal,
     wait_signal,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "host_barrier",
     "put",
     "peer_mte_accessibility",
+    "peer_transport_masks",
     "release",
     "root_members",
     "signal",

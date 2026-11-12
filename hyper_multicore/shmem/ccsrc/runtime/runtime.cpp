@@ -39,7 +39,14 @@ const char *StateName(State state) {
   return "Unknown";
 }
 
-const char *DataEngineName(DataEngine engine) { return engine == DataEngine::Mte ? "mte" : "unknown"; }
+const char *DataEngineName(DataEngine engine) {
+  switch (engine) {
+    case DataEngine::Mte: return "mte";
+    case DataEngine::MteRoce: return "mte_roce";
+    case DataEngine::Roce: return "roce";
+  }
+  return "unknown";
+}
 
 DfxPhase PhaseForDeviceStatus(const Status &status) {
   return status.error_code == ErrorCode::CannError || status.error_code == ErrorCode::Timeout ? DfxPhase::CannCall
@@ -348,9 +355,11 @@ Status Runtime::ValidateInitialInput(const RootWorldInfo &root, const Config &co
                      "root_rank must be in [0, root_size) and root_size must be positive, but got root_rank=" +
                        std::to_string(root.root_rank) + ", root_size=" + std::to_string(root.root_size));
   }
-  if (config.heap_size_bytes == 0 || config.timeout_seconds == 0 || config.data_engine != DataEngine::Mte) {
+  if (config.heap_size_bytes == 0 || config.timeout_seconds == 0 ||
+      (config.data_engine != DataEngine::Mte && config.data_engine != DataEngine::MteRoce &&
+       config.data_engine != DataEngine::Roce)) {
     return MakeError(ErrorCode::InvalidConfig,
-                     "Runtime Config requires positive heap/timeout values and the MTE data engine");
+                     "Runtime Config requires positive heap/timeout values and a supported data engine");
   }
   if (config.bootstrap_endpoint_base.empty() || config.bootstrap_endpoint_base.size() > kMaxBootstrapEndpointBytes) {
     return MakeError(ErrorCode::InvalidConfig, "bootstrap_endpoint_base must contain between 1 and " +

@@ -402,6 +402,7 @@ class TestMegaMoeRoute(unittest.TestCase):
         def permute_input(
             input_hidden_states: Any,
             input_topk_ids: Any,
+            _spec: Any = None,
         ) -> tuple[Any, Any]:
             """Record the mocked payload permutation launch."""
             self.assertIs(input_hidden_states, hidden_states)

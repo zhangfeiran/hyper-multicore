@@ -66,8 +66,8 @@ def masked_expert_forward(
         Weighted real-expert contribution in the original token order.
 
     Note:
-        Compaction materializes [R, H] ordinary scratch for R active slots.
-        This is a compatibility path, not an indexed-source transport.
+        An indexed gather aliases the original activation and passes explicit row metadata.
+        Ordinary gather paths materialize [R, H] scratch for R active slots.
     """
     _validate_inputs(hidden_states, expert_ids, routing_weights, active)
     token, slot = active.nonzero(as_tuple=True)
@@ -87,8 +87,10 @@ def masked_expert_forward(
         return hidden_states * 0 + routing_weights.sum().to(hidden_states.dtype) * 0
     if states is None:
         states = hidden_states.index_select(0, token)
+    options = ({"_indexed_source": (hidden_states, token)}
+               if getattr(input_gather, "indexed", False) else {})
     unweighted = executor(
-        states, ids, routing_weights.new_ones((ids.shape[0], 1)), expert_weights=expert_weights,
+        states, ids, routing_weights.new_ones((ids.shape[0], 1)), expert_weights=expert_weights, **options,
     )
     weighted = (unweighted.float() * routing_weights[token, slot, None]).to(hidden_states.dtype)
     # The empty dependency keeps remote expert backward reachable on empty sources.

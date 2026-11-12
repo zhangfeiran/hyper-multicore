@@ -14,6 +14,7 @@
 # ============================================================================
 """CPU contracts for framework-independent LongCat expert routing."""
 
+from typing import Any
 import unittest
 from unittest.mock import patch
 
@@ -33,6 +34,38 @@ class _Executor:
         """Return a distinct output per real expert without accelerator code."""
         scale = expert_weights[0][ids.reshape(-1)]
         return states * scale[:, None]
+
+
+class _IndexedRead(torch.autograd.Function):
+    """Model a receiver computation with adapter-owned assignment gradients."""
+
+    @staticmethod
+    def forward(_ctx: Any, carrier: torch.Tensor, source: torch.Tensor,
+                token: torch.Tensor) -> torch.Tensor:
+        """Read original token values without reading the gradient carrier."""
+        if carrier.shape[0] != token.numel():
+            raise ValueError("Carrier and assignment row map differ")
+        return source.index_select(0, token)
+
+    @staticmethod
+    def backward(_ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        """Return compact gradients through the ordered input boundary exactly once."""
+        return gradient, None, None
+
+
+class _IndexedExecutor(_Executor):
+    """Model the indexed native boundary while retaining the existing reference arithmetic."""
+
+    shmem_data_engine = "roce"
+
+    def __call__(self, states: torch.Tensor, ids: torch.Tensor, _weights: torch.Tensor, *,
+                 expert_weights: tuple, _indexed_source: tuple) -> torch.Tensor:
+        """Consume values through explicit metadata and gradients through the carrier."""
+        source, token = _indexed_source
+        if states.untyped_storage().data_ptr() != source.untyped_storage().data_ptr():
+            raise RuntimeError("The adapter materialized expanded activation storage")
+        values = _IndexedRead.apply(states, source, token)
+        return values * expert_weights[0][ids.reshape(-1), None]
 
 
 class TestLongcatRouting(unittest.TestCase):
@@ -68,6 +101,26 @@ class TestLongcatRouting(unittest.TestCase):
                                     (weights.grad, ref_weights.grad), (parameters.grad, ref_parameters.grad)):
             torch.testing.assert_close(observed, reference, rtol=1e-6, atol=1e-6)
 
+    def test_indexed_source_preserves_bf16_slot_gradient_order(self):
+        """The indexed path shares original storage and matches output, dX, dP and dW exactly."""
+        generator = torch.Generator().manual_seed(404)
+        source = torch.randn(17, 13, generator=generator, dtype=torch.bfloat16)
+        ids = torch.tensor([[3, 0, 2], [1, 3, 0], [2, 3, 0], [0, 1, 3]])[torch.arange(17) % 4]
+        probabilities = torch.rand(17, 3, generator=generator)
+        scale = torch.tensor([1.75, -0.625], dtype=torch.bfloat16)
+        upstream = torch.randn(17, 13, generator=generator, dtype=torch.bfloat16)
+        results = []
+        for executor in (_Executor(), _IndexedExecutor()):
+            hidden = source.clone().requires_grad_()
+            weights = probabilities.clone().requires_grad_()
+            parameters = scale.clone().requires_grad_()
+            output = route_experts(executor, hidden, ids, weights, 2, 2, 3, None,
+                                   (parameters, parameters), "torch")
+            output.backward(upstream)
+            results.append((output, hidden.grad, weights.grad, parameters.grad))
+        for actual, expected in zip(results[1], results[0]):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_all_identity_preserves_router_and_input_gradients(self):
         """All-identity routes do not execute or update real-expert parameters."""
         hidden = torch.randn(3, 4, requires_grad=True)
@@ -79,6 +132,21 @@ class TestLongcatRouting(unittest.TestCase):
         self.assertIsNone(real.grad)
         torch.testing.assert_close(hidden.grad, weights.sum(1)[:, None].expand_as(hidden))
         torch.testing.assert_close(weights.grad, hidden.sum(1)[:, None].expand_as(weights))
+
+    def test_hccl_transport_keeps_value_inputs_with_roce_environment(self):
+        """A RoCE local runtime must not give the outer HCCL transport a metadata-only carrier."""
+        executor = _Executor()
+        executor.shmem_data_engine = "roce"
+        executor.communication_backend = "hccl"
+        hidden = torch.tensor([[2., -3.], [5., 7.]], requires_grad=True)
+        probability = torch.tensor([[0.25, 0.75], [0.6, 0.4]], requires_grad=True)
+        scale = torch.tensor([2., 3.], requires_grad=True)
+        output = route_experts(executor, hidden, torch.tensor([[0, 2], [1, 3]]), probability,
+                               2, 2, 2, None, (scale, scale), "torch")
+        expected_scale = torch.tensor([1.25, 2.2])
+        torch.testing.assert_close(output, hidden * expected_scale[:, None])
+        output.sum().backward()
+        torch.testing.assert_close(hidden.grad, expected_scale[:, None].expand_as(hidden))
 
     def test_invalid_expert_id_fails(self):
         """Reject an out-of-range identity or real expert ID."""

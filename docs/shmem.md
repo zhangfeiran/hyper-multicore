@@ -248,6 +248,7 @@ Runtime初始化时冻结当前NPU设备。`empty`、`barrier`、`signal`、`wai
 干净关闭后生命周期字段为`None`。占用量按请求字节投影；CANN heap按16字节对齐并切分余洞，真实设备侧占用
 可能略高。
 
+<!-- markdownlint-disable-next-line MD033 -->
 <a id="runtime-restart"></a>
 
 ## 4. Runtime restart
@@ -395,10 +396,16 @@ flowchart TB
 | `HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT` | `tcp://127.0.0.1:8662` | 普通WORLD或单进程初始化endpoint；子组及显式heap初始化使用独立unique ID |
 | `SHMEM_UID_SOCK_IFNAME` | CANN自动选择 | 子组UID bootstrap使用的Host网卡，所有group成员必须可达 |
 | `HYPER_MULTICORE_SHMEM_TIMEOUT_SEC` | 120 | Runtime超时秒数 |
-| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte` | 数据搬移引擎，当前只支持`mte` |
+| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte` | `mte`、`mte_roce` 或 `roce`；在首次获取 Runtime 前统一设置 |
 | `SHMEM_LOG_LEVEL` | `ERROR` | CANN及HP SHMEM日志级别：`DEBUG`、`INFO`、`WARN`、`ERROR`或`FATAL` |
 | `SHMEM_LOG_TO_STDOUT` | `0` | `1`输出到stdout且不落盘；其他值使用文件sink |
 | `SHMEM_LOG_PATH` | `${HOME}/shmem/log` | CANN及HP SHMEM日志的统一落盘目录 |
+
+`mte_roce` 初始化 MTE 与 RoCE 能力，`roce` 初始化 RoCE；MegaMoE 使用显式设备原语
+落实每 peer 的传输策略。`shmem.peer_transport_masks()` 返回活动 Root 内各 peer 的 SDK 能力位：
+MTE 为 1，RoCE 为 2；能力位可以同时存在，不能单独证明某次传输实际使用了哪个引擎。
+融合 MegaMoE 的引擎选择、源生命周期与通知协议见
+[LongCat RDMA 说明](../examples/longcat_flash/RDMA_VALIDATION.md)。
 
 CANN和HP日志共用SHMEM原生sink，由它统一补充时间戳、级别、TID和PID，并负责级别过滤、stdout选择及文件
 轮转。原始CANN正文保持`[SHM_SHMEM file:line]`格式；HP正文使用

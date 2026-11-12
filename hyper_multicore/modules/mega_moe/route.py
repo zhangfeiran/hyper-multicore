@@ -38,6 +38,7 @@ from hyper_multicore.replica.routing import (
 from hyper_multicore.torch import ops as multicore_ops
 
 from .spec import MegaMoeSpec, _align_capacity
+from . import rdma
 
 if TYPE_CHECKING:
     from .workspace import MegaMoeWorkspace
@@ -82,6 +83,9 @@ class RouteMetadata:
     empty_owner_experts: tuple[int, ...] | None = None
     maximum_edge_rows: int | None = None
     schedule: RouteSchedule | None = None
+    original_source: torch.Tensor | None = None
+    source_row_indices: torch.Tensor | None = None
+    source_rows_bound: int | None = None
 
 
 @dataclass(frozen=True)
@@ -244,10 +248,19 @@ def _expert_capacity(
 def _permute_topk_input(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
+    spec: MegaMoeSpec | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Expand hidden rows with the native NPU MoE permutation operator."""
+    """Build inverse routing indices, materializing hidden rows only for the ordinary MTE path."""
     if hidden_states.shape[0] == 0:
         return hidden_states, torch.empty(0, dtype=torch.int32, device=hidden_states.device)
+    if rdma.enabled(spec):
+        keys = topk_ids.reshape(-1)
+        if spec.num_experts <= 2**24:
+            keys = keys.float()
+        order = torch.argsort(keys, stable=True)
+        mapping = torch.empty(order.numel(), dtype=torch.int32, device=order.device)
+        mapping.scatter_(0, order, torch.arange(order.numel(), dtype=torch.int32, device=order.device))
+        return hidden_states, mapping
     routed_tokens, unpermute_mapping = load_torch_npu().npu_moe_token_permute(
         hidden_states,
         topk_ids,
@@ -262,8 +275,11 @@ def _permute_topk_input_out(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
     output: torch.Tensor,
+    spec: MegaMoeSpec | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Keep the inverse mapping owned while writing rows into leased SHMEM."""
+    if rdma.enabled(spec):
+        return _permute_topk_input(hidden_states, topk_ids, spec)
     mapping = torch.empty(topk_ids.numel(), dtype=torch.int32, device=topk_ids.device)
     multicore_ops.moe_token_permute_out(hidden_states.contiguous(), topk_ids.contiguous(), output, mapping)
     return output, mapping
@@ -487,7 +503,7 @@ def prepare_topk_route(
     counts = _resolve_counts(flat_ids, tokens_per_expert, spec)
     permutation_output = None
     if workspace is not None:
-        if spec.dispatch_mode == "pull":
+        if spec.dispatch_mode == "pull" and not rdma.enabled(spec):
             if not workspace.in_use or workspace.source_buffer is None:
                 raise RuntimeError("Pull permutation requires an initialized, claimed workspace.")
             permutation_output = workspace.source_buffer
@@ -495,9 +511,9 @@ def prepare_topk_route(
             workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, spec)
     if permutation_output is None:
-        routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
+        routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids, spec)
     else:
-        routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output)
+        routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output, spec)
     received_counts = _finish_count_gather(counts_by_source, count_work, spec)
     expert_capacity, maximum_received_slots = _expert_capacity(counts_by_source, spec)
     return PreparedTopKRoute(
@@ -738,7 +754,7 @@ def _permute_dynamic_pull(
         raise RuntimeError("Pull permutation requires an initialized, claimed workspace.")
     tokens = hidden_states.shape[0]
     output = workspace.source_buffer[: tokens * spec.top_k]
-    return _permute_topk_input_out(hidden_states, topk_ids, output) if tokens else (output, topk_ids.reshape(-1))
+    return _permute_topk_input_out(hidden_states, topk_ids, output, spec) if tokens else (output, topk_ids.reshape(-1))
 
 
 def _can_stage_pull(hidden_states: torch.Tensor, spec: MegaMoeSpec) -> bool:
@@ -766,7 +782,7 @@ def _stage_dynamic_permutation(
         or _can_stage_pull(hidden_states, spec)
         and not getattr(workspace, "route_cache_probe_after", 0)
     ):
-        return _permute_topk_input(hidden_states, topk_ids)
+        return _permute_topk_input(hidden_states, topk_ids, spec)
     return None
 
 
@@ -779,6 +795,8 @@ def _publish_staged_pull(
     """Publish staged rows only after every rank validated and committed its workspace."""
     if workspace is None or not workspace.in_use or workspace.source_buffer is None:
         raise RuntimeError("Pull publication requires an initialized, claimed workspace.")
+    if rdma.enabled(spec):
+        return permuted
     output = workspace.source_buffer[: hidden_states.shape[0] * spec.top_k]
     output.copy_(permuted[0])
     return output, permuted[1]
@@ -899,7 +917,7 @@ def _prepare_dynamic_route(
             else _publish_staged_pull(permuted, hidden_states, spec, workspace)
         )
     elif permuted is None:
-        permuted = _permute_topk_input(hidden_states, topk_ids)
+        permuted = _permute_topk_input(hidden_states, topk_ids, spec)
     if work is not None:
         work.wait()
     if summary is None:
@@ -1146,7 +1164,7 @@ def _prepare_replica_dynamic_route(
     permuted = (
         _permute_dynamic_pull(hidden_states, agreed.ids, agreed.spec, workspace)
         if agreed.spec.dispatch_mode == "pull"
-        else _permute_topk_input(hidden_states, agreed.ids)
+        else _permute_topk_input(hidden_states, agreed.ids, spec)
     )
     metadata = _replica_metadata(agreed, capacity, hidden_states.device)
     route = agreed.route

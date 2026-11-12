@@ -52,6 +52,7 @@ def require_mte_peers(accessible: Sequence[bool], ep_size: int) -> None:
     if missing:
         raise RuntimeError(
             f"MegaMoE requires MTE connectivity to every EP peer; unreachable Root PEs: {missing}. "
+            "Select HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte_roce before constructing modules if RoCE is available. "
             'Use communication_backend="hccl" to keep local MegaMoE compute with HCCL dispatch/combine, '
             "or place each SHMEM EP group inside an MTE domain. PCIe peer access alone is insufficient."
         )

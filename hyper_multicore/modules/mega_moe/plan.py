@@ -64,6 +64,7 @@ from hyper_multicore.modules.mega_moe.forward.tiling_tables import (
 from hyper_multicore.scheduler.config import TaskSplitValue
 from hyper_multicore.scheduler.graph import ComputeGraph
 
+from . import rdma
 from .diagnostics import _mega_moe_owner_options
 from .gradient_queue import (
     ACT_FIRST_GRADIENT_PROJECTIONS,
@@ -245,6 +246,12 @@ def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> 
     attach_mega_moe_l1_view_resolvers(backward_graph)
     backward_data = build_backward_config(backward_graph, task_values, spec.rank_id, spec.num_cube_cores)
     _apply_execution_policies(spec, task_values, forward_data, backward_data, backward_graph, overlap_w13)
+    if spec.shmem_data_engine != "mte":
+        owners = min(spec.ep_size, spec.num_cube_cores)
+        for runtime in (forward_data, backward_data):
+            runtime.protocol_version = 1
+            runtime.completion_event = task_values.all_event_num + 11
+            runtime.all_event_num_triggers[runtime.completion_event] = runtime.num_workers + owners
     return (forward_graph, forward_data, backward_graph, backward_data)
 
 
@@ -277,13 +284,14 @@ def _prepare_diagnostics(
     weight_records = 2 * spec.replica_slots_per_rank
     return (
         prepare_mega_kernel_diagnostics(
-            forward_graph, forward_config, parameter_count=16, extra_aic_records=weight_records, **options
+            forward_graph, forward_config, parameter_count=16, extra_aic_records=weight_records,
+            extra_aiv_records=rdma.communication_profile_records(spec, forward_config), **options
         ),
         prepare_mega_kernel_diagnostics(
             backward_graph,
             backward_config,
             parameter_count=20,
-            extra_aiv_records=gradient_records,
+            extra_aiv_records=max(gradient_records, rdma.communication_profile_records(spec, backward_config)),
             extra_aic_records=producer_records + weight_records,
             **options,
         ),

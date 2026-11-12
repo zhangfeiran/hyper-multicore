@@ -46,6 +46,7 @@ class MegaMoeSpec:
     rank_id: int
     num_cube_cores: int
     dispatch_mode: str = "push"
+    shmem_data_engine: str = "mte"
     capacity_growth_factor: float | None = _DEFAULT_CAPACITY_FACTOR
     dispatch_split: int = _COMMUNICATION_SPLIT
     combine_split: int = _COMMUNICATION_SPLIT
@@ -126,7 +127,8 @@ def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> tu
     upper = spec.maximum_receive_capacity
     if required > upper:
         raise ValueError("MegaMoe route exceeds the lossless token bound")
-    requested = max(required, math.ceil(min(upper, current * spec.capacity_growth_factor)))
+    factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
+    requested = max(required, math.ceil(min(upper, current * factor)))
     return (min(upper, _align_capacity(requested)), _align_capacity(required))
 
 
@@ -227,6 +229,7 @@ def bind_mega_moe_spec(specification: Mapping[str, Any], tensor: torch.Tensor) -
         replica_slots_per_rank=specification.get("replica_slots_per_rank", 0),
         replica_transport=specification.get("replica_transport", "shmem_signal_kernel_gradient_bands"),
         top_k=top_k,
+        shmem_data_engine=specification.get("shmem_data_engine", "mte"),
         initial_capacity_factor=initial_capacity_factor,
         receive_capacity=receive_capacity,
         ep_size=ep_size,

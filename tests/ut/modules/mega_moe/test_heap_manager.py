@@ -48,16 +48,18 @@ class TestMegaMoeHeapManager(unittest.TestCase):
     # These tests deliberately inspect the private manager and lifecycle transaction.
     # pylint: disable=protected-access
 
-    def _automatic_workspace(self, mode: str) -> tuple:
+    def _automatic_workspace(self, mode: str, engine: str = "mte") -> tuple:
         """Materialize a small symmetric layout using CPU storage for restart validation."""
         specification = {"local_num_tokens": 128, "hidden_size": 16, "intermediate_size": 8,
                          "num_experts": 4, "top_k": 2, "ep_size": 2, "dispatch_mode": mode,
-                         "initial_capacity_factor": 1.25 if mode == "push" else None, "auto_tokens": True}
+                         "initial_capacity_factor": 1.25 if mode == "push" else None, "auto_tokens": True,
+                         "shmem_data_engine": engine}
         layout = _workspace_layout(specification, torch.bfloat16)
         manager = self._manager_with_reservation(specification, layout)
         spec = MegaMoeSpec(128, 16, 8, 4, 2, specification["initial_capacity_factor"],
                            layout.receive_capacity, 2, None, 0, 24, dispatch_mode=mode,
-                           capacity_growth_factor=1.25 if mode == "push" else None, auto_tokens=True)
+                           capacity_growth_factor=1.25 if mode == "push" else None, auto_tokens=True,
+                           shmem_data_engine=engine)
         workspace = MegaMoeWorkspace(shared=True)
         workspace.capacity_floor = manager.bind(workspace, spec, specification)
         for name, allocation in self._allocations(spec, layout.receive_capacity):
@@ -121,6 +123,43 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                 self.assertIs(manager.entries[0].bound_spec, spec)
                 self.assertIs(workspace.routed_buffer, original)
                 self.assertEqual(manager.epoch, 0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_rdma_pull_receive_growth_resizes_both_dma_operands_without_source_growth(self) -> None:
+        """A hot owner must get larger symmetric receive and return buffers even with constant source rows."""
+        for engine in ("mte_roce", "roce"):
+            with self.subTest(engine=engine):
+                manager, workspace, retained = self._automatic_workspace("pull", engine)
+                with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
+                    committed = manager.ensure_token_capacity(workspace, 128, 512)
+                    self.assertEqual(restart.call_count, 1)
+                    self.assertEqual(committed.local_num_tokens, 128)
+                    self.assertGreaterEqual(committed.receive_capacity, 512)
+                    self.assertEqual(workspace.expert_buffer.shape, (committed.receive_capacity, 16))
+                    self.assertEqual(workspace.return_source_buffer.shape, workspace.expert_buffer.shape)
+                    self.assertEqual(workspace.source_buffer.shape, (256, 16))
+                    self.assertIs(manager.ensure_token_capacity(workspace, 128, 384), committed)
+                    self.assertEqual(restart.call_count, 1)
+                self.assertEqual(retained.receive_capacity, 256)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_rdma_push_budget_accounts_for_receive_and_return_allocations(self) -> None:
+        """Admission must not advertise rows whose two symmetric DMA operands exceed the heap budget."""
+        specification = {"local_num_tokens": 128, "hidden_size": 16384, "intermediate_size": 8,
+                         "num_experts": 4, "top_k": 2, "ep_size": 2, "dispatch_mode": "push",
+                         "initial_capacity_factor": 1.25, "auto_tokens": True, "shmem_data_engine": "roce"}
+        layout = _workspace_layout(specification, torch.bfloat16)
+        manager = self._manager_with_reservation(specification, layout)
+        spec = MegaMoeSpec(128, 16384, 8, 4, 2, 1.25, layout.receive_capacity, 2, None, 0, 24,
+                           auto_tokens=True, shmem_data_engine="roce")
+        workspace = MegaMoeWorkspace(shared=True)
+        manager.bind(workspace, spec, specification)
+        manager.heap_limit = manager.heap_bytes
+        limit = manager.receive_capacity_limit(workspace, 128)
+        self.assertEqual(limit, layout.receive_capacity)
+        self.assertLessEqual(_workspace_layout(specification, torch.bfloat16, limit).required_bytes, manager.heap_limit)
+        self.assertGreater(_workspace_layout(specification, torch.bfloat16, limit + 128).required_bytes,
+                           manager.heap_limit)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -219,6 +258,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             ep_size=specification.ep_size,
             num_experts=specification.num_experts,
             dtype=torch.bfloat16,
+            shmem_data_engine=getattr(specification, "shmem_data_engine", "mte"),
         )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",

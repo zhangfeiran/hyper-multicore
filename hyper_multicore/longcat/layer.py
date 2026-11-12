@@ -14,6 +14,7 @@
 # ============================================================================
 """Framework-independent LongCat identity and MegaMoE expert integration."""
 
+import os
 from typing import Any
 
 import torch
@@ -53,7 +54,7 @@ class LongcatFlashExperts(nn.Module):
                  communication_backend: str = "shmem",
                  routing_backend: str = "torch", replica_slots_per_rank: int = 0,
                  gate_up_padded: bool = False, initial_token_capacity: int | None = None,
-                 replica_min_rows: int = 1024) -> None:
+                 replica_min_rows: int = 1024, replica_transport: str | None = None) -> None:
         """Configure real experts and optional whole-expert replicas.
 
         Args:
@@ -65,13 +66,14 @@ class LongcatFlashExperts(nn.Module):
             ep_size: Number of ranks in the explicit expert group.
             ep_group: Expert group; required for distributed execution.
             dispatch_mode: MegaMoE push or pull transport.
-            communication_backend: SHMEM MTE communication or HCCL routing with local MegaMoE compute.
+            communication_backend: Fused SHMEM MTE/RoCE communication or HCCL routing with local MegaMoE compute.
             swiglu_precision: Fused arithmetic or HF BF16 rounding.
             routing_backend: Portable Torch or optional Ascend Triton routing.
             replica_slots_per_rank: Number of whole-expert guest slots per rank.
             gate_up_padded: Caller storage includes trailing identity rows per rank.
             initial_token_capacity: Optional compact-assignment reservation.
             replica_min_rows: Soft minimum rows for a guest expert.
+            replica_transport: Guest weight and gradient transport; RDMA defaults to independent HCCL P2P.
         """
         super().__init__()
         values = (hidden_size, intermediate_size, num_experts, top_k, ep_size)
@@ -82,6 +84,11 @@ class LongcatFlashExperts(nn.Module):
         self.routing_backend, self.gate_up_padded = routing_backend, gate_up_padded
         self.replica_slots_per_rank = replica_slots_per_rank
         options = {} if initial_token_capacity is None else {"initial_token_capacity": initial_token_capacity}
+        engine = os.environ.get("HYPER_MULTICORE_SHMEM_DATA_ENGINE", "mte")
+        if replica_transport is not None:
+            options["replica_transport"] = replica_transport
+        elif engine != "mte" and replica_slots_per_rank:
+            options["replica_transport"] = "p2p"
         self.executor = MegaMoeExperts(
             hidden_size=hidden_size, intermediate_size=intermediate_size, num_experts=num_experts, top_k=1,
             ep_group=ep_group, ep_size=ep_size, create_parameters=False, expert_weight_layout="EOI",

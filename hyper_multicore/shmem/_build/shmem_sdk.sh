@@ -198,6 +198,7 @@ PY
         -DCMAKE_BUILD_TYPE=Release \
         -DHP_SHMEM_SOURCE_DIR="${source_dir}" \
         -DUSE_CXX11_ABI=ON \
+        -DACLSHMEM_RDMA_SUPPORT=ON \
         -DUSE_UNIT_TEST=OFF \
         -DUSE_EXAMPLES=OFF \
         -DBUILD_PYTHON=OFF \

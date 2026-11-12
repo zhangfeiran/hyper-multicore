@@ -15,6 +15,7 @@
 """Standalone LongCat expert-component precision and performance worker."""
 
 import argparse
+import ctypes
 from dataclasses import asdict
 import hashlib
 import json
@@ -38,9 +39,11 @@ from native_reference import NativeExperts
 
 import hyper_multicore
 from hyper_multicore import shmem
+from hyper_multicore.diagnostics import profiler as multicore_profiler
 from hyper_multicore.longcat import LongcatFlashExperts
 from hyper_multicore.longcat._routing import route_experts
 from hyper_multicore.modules.mega_moe.plan import _build_task_values
+from hyper_multicore.modules.mega_moe import rdma
 
 def _validate_backend(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Reject replica fixture and backend combinations not supported by the worker."""
@@ -49,8 +52,8 @@ def _validate_backend(parser: argparse.ArgumentParser, args: argparse.Namespace)
     if args.replica_slots and (args.ep < 4 or args.real != 8 * args.ep or args.zero != 4 * args.ep
                                or args.top_k != 12):
         parser.error("the replica route fixtures require EP>=4, eight real and four identity experts per rank, K=12")
-    if args.check == "accuracy" and args.backend == "native":
-        parser.error("accuracy compares native against MegaMoE push or pull")
+    if args.check in ("accuracy", "profile") and args.backend == "native":
+        parser.error(f"{args.check} requires MegaMoE push or pull")
     if args.backend == "native" and args.replica_slots:
         parser.error("the native baseline cannot be configured with replica slots")
 
@@ -64,21 +67,30 @@ def _validate_arguments(parser: argparse.ArgumentParser, args: argparse.Namespac
         parser.error("invalid non-positive dimension, count or negative slot count")
     if args.real % args.ep or args.zero % args.ep or args.top_k > args.real + args.zero:
         parser.error("expert counts must divide EP and top-k must fit the total experts")
+    if args.initial_token_capacity is not None and args.initial_token_capacity <= 0:
+        parser.error("initial-token-capacity must be positive")
     _validate_backend(parser, args)
 
 
 def arguments() -> argparse.Namespace:
     """Parse a single-node EP configuration with original LongCat widths."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", choices=("accuracy", "benchmark"), default="accuracy")
+    parser.add_argument("--check", choices=("accuracy", "benchmark", "profile"), default="accuracy")
     parser.add_argument("--backend", choices=("native", "push", "pull"), default="push")
     parser.add_argument("--communication-backend", choices=("shmem", "hccl"), default="shmem")
+    parser.add_argument("--shmem-data-engine", choices=("mte", "mte_roce", "roce"),
+                        default=os.environ.get("HYPER_MULTICORE_SHMEM_DATA_ENGINE", "mte"))
+    parser.add_argument("--operator-timeout", type=int, default=60,
+                        help="Per-process NPU operator timeout in seconds for diagnosis")
+    parser.add_argument("--replica-transport", default=None)
     parser.add_argument("--exercise-edge-routes", action="store_true",
                         help="Include hot owners, empty sources, and all-identity steps without requiring replicas")
     parser.add_argument("--routing-backend", choices=("torch", "triton"), default="torch")
     parser.add_argument("--swiglu-precision", choices=("fused", "hf"), default="fused")
     parser.add_argument("--ep", type=int, default=4)
     parser.add_argument("--tokens", type=int, default=2048)
+    parser.add_argument("--initial-token-capacity", type=int, default=None,
+                        help="Override the initial compact-assignment reservation to exercise automatic growth")
     parser.add_argument("--hidden", type=int, default=6144)
     parser.add_argument("--intermediate", type=int, default=2048)
     parser.add_argument("--real", type=int)
@@ -177,7 +189,9 @@ def candidate(args: argparse.Namespace) -> LongcatFlashExperts:
                                swiglu_precision=args.swiglu_precision, routing_backend=args.routing_backend,
                                communication_backend=args.communication_backend,
                                replica_slots_per_rank=args.replica_slots, gate_up_padded=True,
-                               initial_token_capacity=args.tokens * args.top_k)
+                               replica_transport=args.replica_transport,
+                               initial_token_capacity=(getattr(args, "initial_token_capacity", None)
+                                                       or args.tokens * args.top_k))
 
 
 def routes(args: argparse.Namespace, data: dict, step: int, rank: int) -> tuple[str, torch.Tensor]:
@@ -261,7 +275,19 @@ def execution_plan(layer: LongcatFlashExperts) -> dict:
     task_values = _build_task_values(spec)
     operators = ("dispatch", "combine")
     tasks = {name: plan.forward_graph.get_op(name).split_spec.task_num_fn(task_values) for name in operators}
+    transport = {"shmem_data_engine": spec.shmem_data_engine, "replica_transport": spec.replica_transport}
+    if rdma.enabled(spec):
+        credits, progress, _, _ = rdma.layout(spec.ep_size, spec.num_experts, spec.routed_slots,
+                                            spec.dispatch_split, spec.combine_split)
+        counters = resources.workspace.forward_event_counters
+        posted = counters[progress:progress + progress - credits].view(torch.int32).reshape(spec.ep_size, -1)
+        transport.update({"rdma_notified_peers": posted.sum(1).nonzero().reshape(-1).cpu().tolist(),
+                          "peer_transport_masks": list(shmem.peer_transport_masks()),
+                          "runtime_config": shmem.debug_state()["config"],
+                          "source_reserved_bytes": resources.workspace.source_buffer.numel() * 2,
+                          "source_index_bytes": resources.workspace.source_indices.numel() * 4})
     return {"communication_backend": layer.executor.communication_backend, "compute_ep_size": spec.ep_size,
+            **transport,
             "plan_tokens": spec.plan_tokens, "route_source_rows": spec.schedule_source_expert_rows,
             "route_expert_rows": spec.schedule_expert_rows, "communication_rows": spec._communication_rows,
             "compact_communication": spec._compact_communication, "forward_tasks": tasks}
@@ -352,11 +378,50 @@ def benchmark(args: argparse.Namespace, data: dict, executor: object) -> dict:
     return {"local_ms": local, "rank_max_ms": maximum, "finite": finite, "replica_plans": plans}
 
 
+def set_operator_timeout(seconds: int) -> None:
+    """Bound a diagnostic operator without changing the application's transport protocol."""
+    if seconds <= 0:
+        raise ValueError("--operator-timeout must be positive")
+    runtime = ctypes.CDLL("libascendcl.so")
+    runtime.aclrtSetOpExecuteTimeOut.argtypes = [ctypes.c_uint32]
+    runtime.aclrtSetOpExecuteTimeOut.restype = ctypes.c_int
+    status = runtime.aclrtSetOpExecuteTimeOut(seconds)
+    if status:
+        raise RuntimeError(f"aclrtSetOpExecuteTimeOut failed: {status}")
+
+
+def profile(args: argparse.Namespace, data: dict, executor: object) -> dict:
+    """Capture complete fusion calls without treating profiler time as a benchmark."""
+    for _ in range(args.warmup):
+        execute(executor, args, data, data["ids"], native=False, backward=True)
+    torch.npu.synchronize()
+    dist.barrier()
+    with multicore_profiler.mega_kernel_profile() as capture:
+        for _ in range(args.samples):
+            output = execute(executor, args, data, data["ids"], native=False, backward=True)
+            capture.step()
+    args.output.mkdir(parents=True, exist_ok=True)
+    trace = capture.export_chrome_trace(args.output / f"trace-rank{dist.get_rank()}.json")
+    metadata = trace["megaKernelCycleTrace"]
+    if metadata["droppedRecordCount"] or metadata["warnings"]:
+        raise RuntimeError("Incomplete internal profile; inspect the trace metadata")
+    return {"finite": bool(torch.isfinite(output).all()), "profile": metadata}
+
+
+def _run_check(args: argparse.Namespace, data: dict, layer: Any, executor: Any, rank: int) -> dict:
+    """Keep numerical, timing, and internal trace result contracts separate."""
+    if args.check == "accuracy":
+        return accuracy(args, data, layer, rank)
+    return profile(args, data, executor) if args.check == "profile" else benchmark(args, data, executor)
+
+
 def main() -> None:
     """Run one local EP worker and write all-rank terminal evidence."""
     args = arguments()
+    os.environ["HYPER_MULTICORE_SHMEM_DATA_ENGINE"] = args.shmem_data_engine
     rank = int(os.environ["RANK"])
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    set_operator_timeout(args.operator_timeout)
     dist.init_process_group("hccl")
     if dist.get_world_size() != args.ep or int(os.environ["LOCAL_WORLD_SIZE"]) != args.ep:
         raise ValueError("this worker requires a single node and WORLD_SIZE == LOCAL_WORLD_SIZE == EP")
@@ -366,7 +431,7 @@ def main() -> None:
     layer = None if args.backend == "native" else candidate(args)
     executor = layer if layer is not None else NativeExperts(args.real, args.ep, dist.group.WORLD,
                                                               args.swiglu_precision)
-    result = accuracy(args, data, layer, rank) if args.check == "accuracy" else benchmark(args, data, executor)
+    result = _run_check(args, data, layer, executor, rank)
     final_plan = execution_plan(layer) if layer is not None else None
     if layer is not None:
         layer.close()
@@ -383,6 +448,8 @@ def main() -> None:
               "route_fixture": args.route_fixture,
               "compact_communication_requested": os.environ.get("HYPER_MULTICORE_MOE_COMPACT_COMMUNICATION", "0"),
               "last_execution_plan": final_plan,
+              "shmem_data_engine": args.shmem_data_engine,
+              "replica_transport_requested": args.replica_transport,
               "routing_backend": args.routing_backend, "swiglu_precision": args.swiglu_precision,
               "scope": "expert component; precomputed router, no full model",
               "strict_gate": STRICT_GATE, "identities": identities, "result": result,

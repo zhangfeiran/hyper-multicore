@@ -114,5 +114,8 @@ runtime::Result<DeviceIdentity> query_device_identity();
 /** @brief Read actual MTE reachability from the initialized, locked CANN SHMEM state. */
 std::vector<bool> peer_mte_accessibility();
 
+/** @brief Read SDK transport capabilities in Root PE order. */
+std::vector<uint32_t> peer_transport_masks();
+
 }  // namespace host
 }  // namespace hyper_multicore::shmem::cann
