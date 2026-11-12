@@ -665,6 +665,11 @@ void WaitSignal(const at::Tensor &signal, int64_t value, const py::object &compa
   cann::host::wait_signal_on_stream(reinterpret_cast<uintptr_t>(signal.data_ptr()), compare_op, signal_value, stream);
 }
 
+std::vector<bool> PeerMteAccessibility() {
+  UnwrapRuntime(Runtime::Instance().RootSize(), "peer_mte_accessibility");
+  return cann::host::peer_mte_accessibility();
+}
+
 void AllGather(const at::Tensor &output, const at::Tensor &input) {
   constexpr std::string_view kOperation = "all_gather";
 
@@ -832,6 +837,7 @@ PYBIND11_MODULE(hyper_multicore_shmem_torch, module) {
   module.def("_all_gather", &bindings::AllGather, py::arg("output"), py::arg("input"));
   module.def("_log_debug", &bindings::log_debug, py::arg("message"));
   module.def("_debug_state", &bindings::DebugState);
+  module.def("_peer_mte_accessibility", &bindings::PeerMteAccessibility);
   module.def("_validate_shutdown", &bindings::ValidateShutdown);
   module.def("_shutdown",
              [] { bindings::RequireOk(bindings::Runtime::Instance().Shutdown(), bindings::DfxOperation::Shutdown); });

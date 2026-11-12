@@ -21,6 +21,10 @@
 
 #include "cann/log.h"
 #include "shmem.h"
+#include "host_device/shmem_common_types.h"
+
+// The private SDK is pinned by dependencies.lock; pointer existence alone does not imply MTE reachability.
+extern aclshmem_device_host_state_t g_state;
 
 namespace hyper_multicore::shmem::cann::host {
 namespace {
@@ -382,6 +386,15 @@ void wait_signal_on_stream(uintptr_t local_signal, CompareOp comparison, int32_t
                            const runtime::StreamView &stream) {
   aclshmemx_signal_wait_until_on_stream(reinterpret_cast<int32_t *>(local_signal), CannCompareOp(comparison), value,
                                         reinterpret_cast<aclrtStream>(stream.native_handle));
+}
+
+std::vector<bool> peer_mte_accessibility() {
+  std::vector<bool> result;
+  result.reserve(g_state.npes);
+  for (int32_t peer = 0; peer < g_state.npes; ++peer) {
+    result.push_back(peer == g_state.mype || (g_state.topo_list[peer] & ACLSHMEM_TRANSPORT_MTE) != 0);
+  }
+  return result;
 }
 
 runtime::Result<int32_t> query_current_device_index() {

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "cann/signal.h"
 #include "device/device_model.h"
@@ -109,6 +110,9 @@ runtime::Result<int32_t> query_current_device_index();
  * @return Current device index, owned SoC name, and normalized model; or an error if either query fails.
  */
 runtime::Result<DeviceIdentity> query_device_identity();
+
+/** @brief Read actual MTE reachability from the initialized, locked CANN SHMEM state. */
+std::vector<bool> peer_mte_accessibility();
 
 }  // namespace host
 }  // namespace hyper_multicore::shmem::cann

@@ -19,6 +19,7 @@ from __future__ import annotations
 __all__ = ["MegaMoeExperts"]
 import math
 import struct
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -46,6 +47,7 @@ from hyper_multicore.replica.topology import _local_node_identity, _node_ids
 from hyper_multicore.scheduler.config import mega_moe_event_capacity
 
 from ..module import MulticoreModule
+from .transport import HcclExpertTransport, require_mte_peers
 from .function import execute_mega_moe_with_permutation
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
@@ -64,6 +66,7 @@ from .workspace import MegaMoeWorkspace
 
 ExpertWeightLayout = Literal["EIO", "EOI"]
 _EXPERT_WEIGHT_LAYOUTS = frozenset(("EIO", "EOI"))
+_HCCL_OWNERS: weakref.WeakSet[MegaMoeExperts] = weakref.WeakSet()
 
 
 def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
@@ -201,6 +204,7 @@ class _MegaMoeExecutionResources:
 
             def construct() -> None:
                 """Build and bind local resources before converging construction results."""
+                require_mte_peers(shmem.peer_mte_accessibility(), self.spec.ep_size)
                 self.plan = build_mega_moe_plan(self.spec, tensor.device) if not self.spec.dynamic_tokens else None
                 self.home_spec = None
                 self.home_plan = None
@@ -461,6 +465,13 @@ class MegaMoeExperts(MulticoreModule):
         result.down_weight._replica_owned_parameter = True
         return result
 
+    @staticmethod
+    def _validate_unbound_groups(members: tuple, first_group: Any) -> None:
+        """Keep HCCL routing owners immutable after their first execution."""
+        if any(hasattr(member._resource_group, "hccl_executor") for member in members):
+            raise RuntimeError("execution resources must be shared before first use")
+        MulticoreModule._validate_unbound_groups(members, first_group)
+
     def _resource_signature(self, tensor: Any) -> Any:
         """Compare static configuration without process-local group identities."""
         configuration = tuple(
@@ -488,6 +499,7 @@ class MegaMoeExperts(MulticoreModule):
         create_parameters: bool = True,
         expert_weight_layout: ExpertWeightLayout = "EIO",
         dispatch_mode: str = "push",
+        communication_backend: str = "shmem",
         initial_capacity_factor: float | None = None,
         initial_token_capacity: int = _COMMUNICATION_SPLIT,
         capacity_growth_factor: float | None = None,
@@ -527,6 +539,10 @@ class MegaMoeExperts(MulticoreModule):
                 Requires no replicas and a row count divisible by EP; trailing gradients are zero.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
+            communication_backend: ``"shmem"`` retains fused MTE communication and requires
+                all EP peers to be MTE reachable. ``"hccl"`` uses differentiable HCCL routing
+                around single-PE MegaMoE compute; no remote MTE operations are submitted.
+                HCCL currently requires replica_slots_per_rank=0.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
                 Must be a positive multiple of 128.
             combine_split: Combine tile rows in forward and backward, with the same
@@ -549,6 +565,12 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
+        if communication_backend not in ("shmem", "hccl"):
+            raise ValueError("communication_backend must be 'shmem' or 'hccl'")
+        if communication_backend == "hccl" and replica_slots_per_rank:
+            raise ValueError("HCCL MegaMoE communication currently requires replica_slots_per_rank=0")
+        self.communication_backend = communication_backend
+        self._communication_checked = False
         if replica_granularity not in ("token", "expert"):
             raise ValueError("replica_granularity must be 'token' or 'expert'")
         if not isinstance(single_expert_tasks, bool):
@@ -595,6 +617,7 @@ class MegaMoeExperts(MulticoreModule):
             "ep_group": ep_group,
             "expert_weight_layout": expert_weight_layout,
             "dispatch_mode": dispatch_mode,
+            "communication_backend": communication_backend,
             "capacity_growth_factor": capacity_growth_factor,
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
@@ -616,6 +639,8 @@ class MegaMoeExperts(MulticoreModule):
         self.gate_up_expert_padding = gate_up_expert_padding
         self.initial_token_capacity = specification["local_num_tokens"]
         self._initialize_module_state(specification, create_parameters=create_parameters)
+        if self.communication_backend == "hccl":
+            _HCCL_OWNERS.add(self)
 
     def _initialize_module_state(self, specification: Mapping[str, Any], *, create_parameters: bool) -> None:
         """Bind normalized configuration and initialize expert parameters."""
@@ -931,6 +956,18 @@ class MegaMoeExperts(MulticoreModule):
         hidden_flat = self._validate_forward_inputs(hidden_states, topk_ids, topk_weights, tokens_per_expert, weights)
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
+        if self._resource_closed or self._resource_group.closed or self._resource_group.closing:
+            raise RuntimeError("cannot execute a closed or closing multicore module")
+        if not self._communication_checked:
+            signature = (self.communication_backend, self.hidden_size, self.intermediate_size, self.num_experts,
+                         self.top_k, self.expert_weight_layout, self.swiglu_hf_bf16, self.swiglu_limit)
+            peers = _collective.exchange(signature, group=self._ep_group, failure_prefix="MegaMoE transport agreement")
+            if any(peer != signature for peer in peers):
+                raise RuntimeError("MegaMoE communication and compute configuration must match on all EP ranks")
+            self._communication_checked = True
+        if self.communication_backend == "hccl":
+            executor = self._hccl_transport()
+            return executor(hidden_flat, topk_ids, topk_weights, weights).reshape_as(hidden_states)
         resources = self._get_execution_resources(hidden_flat)
         route_options = {
             "autograd_mask": int(torch.is_grad_enabled())
@@ -996,6 +1033,40 @@ class MegaMoeExperts(MulticoreModule):
             return expert_output.reshape_as(hidden_states)
         output = restore_topk_output(expert_output, route.unpermute_mapping, topk_weights)
         return output.reshape(hidden_states.shape)
+
+    def _hccl_transport(self) -> HcclExpertTransport:
+        """Register local layers before the first native bind reserves the shared Heap."""
+        if hasattr(self._resource_group, "hccl_executor"):
+            return self._resource_group.hccl_executor
+        owners = sorted((owner for owner in _HCCL_OWNERS if not owner._resource_closed
+                         and owner._resource_group.scope_key == self._resource_group.scope_key),
+                        key=lambda owner: owner._resource_group.identifier)
+        # Later layers may execute while earlier autograd contexts still need the Heap.
+        # Registering every local executor now preserves the existing aggregate reservation policy.
+        for owner in owners:
+            group = owner._resource_group
+            if not hasattr(group, "hccl_executor"):
+                group.hccl_executor = HcclExpertTransport(owner._ep_group, owner.num_experts, owner._local_executor)
+        return self._resource_group.hccl_executor
+
+    def _local_executor(self, group: Any) -> MegaMoeExperts:
+        """Retain arithmetic and layout while binding native communication to self."""
+        specification = self._resource_group.specification
+        options = {key: specification[key] for key in (
+            "swiglu_limit", "swiglu_hf_bf16", "single_expert_tasks", "route_task_bounds",
+            "expert_weight_layout", "dispatch_mode", "initial_capacity_factor", "capacity_growth_factor",
+            "dispatch_split", "combine_split",
+        )}
+        return MegaMoeExperts(hidden_size=self.hidden_size, intermediate_size=self.intermediate_size,
+                              num_experts=self.local_experts, top_k=1, ep_group=group, ep_size=1,
+                              create_parameters=False, initial_token_capacity=self.initial_token_capacity, **options)
+
+    def close(self) -> None:
+        """Release transport-local compute after the last shared owner finishes."""
+        group = self._resource_group
+        if hasattr(group, "hccl_executor") and group.members == {self._resource_member_token}:
+            group.hccl_executor.close()
+        super().close()
 
     def _create_execution_resources(
         self,
