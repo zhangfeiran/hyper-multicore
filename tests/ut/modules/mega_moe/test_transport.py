@@ -19,6 +19,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_multicore.modules.mega_moe import module as module_impl
 from hyper_multicore.modules.mega_moe import transport
@@ -44,29 +45,28 @@ class TestExpertTransport(unittest.TestCase):
 
     def test_backend_validation_precedes_registration(self) -> None:
         """Unsupported options and replica transports never create runtime owners."""
-        options = dict(hidden_size=6144, intermediate_size=2048, num_experts=8, top_k=1,
-                       create_parameters=False)
+        options = dict(hidden_size=6144, intermediate_size=2048, num_experts=8, top_k=1)
         with self.assertRaisesRegex(ValueError, "communication_backend"):
-            MegaMoeExperts(**options, communication_backend="rdma")
+            MegaMoeExperts(**options, tuning_options=MegaMoeTuningOptions(communication_backend="rdma"))
         with self.assertRaisesRegex(ValueError, "replica_slots_per_rank=0"):
-            MegaMoeExperts(**options, communication_backend="hccl", replica_slots_per_rank=2)
+            MegaMoeExperts(**options, tuning_options=MegaMoeTuningOptions(communication_backend="hccl", replica_slots_per_rank=2))
 
     def test_hccl_constructor_is_lazy_and_keeps_layout(self) -> None:
         """HCCL construction neither initializes SHMEM nor changes caller-owned EOI storage."""
         with patch("hyper_multicore.shmem.acquire") as acquire:
             layer = MegaMoeExperts(hidden_size=6144, intermediate_size=2048, num_experts=8, top_k=1,
-                                   create_parameters=False, expert_weight_layout="EOI",
-                                   communication_backend="hccl", gate_up_expert_padding=4)
+                                   tuning_options=MegaMoeTuningOptions(
+                                       communication_backend="hccl", gate_up_expert_padding=4))
             self.assertEqual(layer.communication_backend, "hccl")
-            self.assertEqual(layer.expert_weight_layout, "EOI")
-            self.assertIsNone(layer.gate_up_weight)
+            self.assertEqual(layer._weight_shapes["EOI"], ((12, 4096, 6144), (8, 6144, 2048)))
+            self.assertFalse(hasattr(layer, "gate_up_weight"))
             acquire.assert_not_called()
             layer.close()
 
     def test_shared_hccl_executor_closes_after_last_owner(self) -> None:
         """Serial owners retain one local fused executor until their last close."""
         options = dict(hidden_size=6144, intermediate_size=2048, num_experts=8, top_k=1,
-                       create_parameters=False, communication_backend="hccl")
+                       tuning_options=MegaMoeTuningOptions(communication_backend="hccl"))
         first, second = MegaMoeExperts(**options), MegaMoeExperts(**options)
         MegaMoeExperts.share_execution_resources((first, second))
         executor = Mock()
@@ -104,7 +104,7 @@ class TestExpertTransport(unittest.TestCase):
     def test_hccl_registers_later_layers_before_first_heap_binding(self) -> None:
         """A later layer must reserve native storage before an earlier graph stays live."""
         options = dict(hidden_size=6144, intermediate_size=2048, num_experts=8, top_k=1,
-                       create_parameters=False, communication_backend="hccl", initial_token_capacity=24576)
+                       tuning_options=MegaMoeTuningOptions(communication_backend="hccl", initial_token_capacity=24576))
         first, second = MegaMoeExperts(**options), MegaMoeExperts(**options)
         transports = [Mock(), Mock()]
         with patch.object(module_impl, "HcclExpertTransport", side_effect=transports) as build:

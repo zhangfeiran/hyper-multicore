@@ -24,6 +24,7 @@ experts = LongcatFlashExperts(
     swiglu_precision="fused",
     routing_backend="torch",
     replica_slots_per_rank=0,
+    initial_token_capacity=2048 * 12,  # 每卡最大 token 数乘 TopK；在首次执行前预留
 )
 
 # hidden 可以有多个 token 维；ID/权重先展平为 [token数, 12]。
@@ -61,12 +62,12 @@ SwiGLU 实现，并非通过 Python 再调用一次 `torch_npu.npu_swiglu`。
 ## MTE 不互通的 EP 组与 910B2C 16 卡
 
 SHMEM 是通信接口，具体能否跨设备访问取决于传输引擎和实际拓扑。
-当前融合通信路径同时用 MTE 搬运数据、更新远端 Add 计数器；PCIe peer access
+默认 MTE 模式同时用 MTE 搬运数据、更新远端 Add 计数器；PCIe peer access
 或非空的对称虚拟地址不代表这些操作可达。上游 SHMEM 的
 [使用限制](https://github.com/hicann/shmem/blob/master/docs/debug/Troubleshooting_FAQs.md)
 说明 A2 的两个 8P HCCS 域之间不能直接使用 MTE。判断应以实际探测为准，不能只根据 CPU 架构或卡数。
 
-默认 `communication_backend="shmem"` 会在构建首个融合计划前读取 SDK 的 MTE
+默认 `communication_backend="shmem"`、MTE 引擎会在构建首个融合计划前读取 SDK 的 MTE
 可达性，并把本 rank 的失败汇合到 EP 组。缺少任何 peer 会报出不可达的 Root PE，
 避免提交必定无法完成的远端 MTE 操作。这个检查需要重新编译当前源码的原生绑定；
 旧二进制缺少探测接口时会明确要求重编译。
@@ -84,6 +85,36 @@ python -m torch.distributed.run --standalone --nproc-per-node=16 \
 `guard_injection_pass` 只说明模拟缺失 MTE peer 时的保护生效，不能作为 PCIe 实测通过。
 `--exercise both` 可在全部 peer 确认可达后检查真实 MTE/Host SDMA Put 和 Add 完成通知；
 脚本不会在缺失 MTE 链路时强行提交这些操作。
+
+### 融合 SHMEM RoCE 路径
+
+在创建模型、初始化 HPM SHMEM 之前选择进程内统一的引擎：
+
+```bash
+export HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte_roce
+```
+
+保留 `communication_backend="shmem"`。`mte_roce` 根据 SDK 的真实能力选择：
+可达 peer 使用 MTE，其余 peer 使用设备侧 RoCE；不会写死逻辑 rank 的前后各 8 卡。
+`roce` 则强制所有远端 peer 使用 RoCE，便于在同时具备 MTE 的机器上验证真实 RDMA 路径；
+本卡仍使用 MTE。所需 peer 缺少可用能力时，在融合内核启动前汇合报错。
+
+dispatch、combine、反向 dX 均保留在 MegaMoE 设备任务图内。每个 peer 固定一个 AIV
+提交 RDMA，使用每源独立的累积完成通知替代远端 Add；GMM1 按专家就绪依赖启动，
+SwiGLU、GMM2 和结果回传继续沿任务图推进。完成与源缓冲区复用仍包含最终 quiet 和跨 rank fence。
+前向只暂存原始 `[T,H]` 激活和行索引，不生成发送端 `[T*K,H]` 展开激活。
+反向 assignment 梯度、接收区、回传区和对称 heap 预留需分别核算。
+
+LongCat 启用热专家副本时，RDMA 模式默认使用 `replica_transport="p2p"`
+交换副本权重和归还 dW；激活与 dX 保持融合 SHMEM 通信。底层 `MegaMoeExperts`
+需显式指定该副本 transport，当前不支持将 MTE 内核中的副本梯度协议直接切到 RDMA。
+EOI 权重与默认 fused SwiGLU 均保持原配置。
+
+完整原宽命令、协议边界及验收结果见 [融合 RDMA 验证](RDMA_VALIDATION.md)。
+生产代码不依赖 HyperParallel。客户 x86_64、910B2C 需要在本机编译 `ascend910b`，
+并验证自己的 RNIC、网络和驱动；本机 910C 强制 RoCE 的通过结果不能替代客户拓扑验收。
+
+### 外层 HCCL 兼容路径
 
 如需单独验证跨 MTE 域 EP16 的通信兼容性，可在构造 `LongcatFlashExperts` 或
 `MegaMoeExperts` 时显式加入：
@@ -105,8 +136,8 @@ HCCL 路径的单 PE runtime。该路径拆开了跨卡通信与本地计算，�
 All-to-All，随后进入本地融合计算，再执行 combine All-to-All，因此没有保留按专家
 就绪推进的跨卡通信计算流水。这里的开关用于兼容性验证，不作为目标拓扑的性能优化结论。
 
-面向跨 MTE 域的融合性能路径，参见 [SHMEM 单边 RDMA 原型与接入设计](one_sided_probe/README.md)。
-该原型已验证 AIV 直驱数据、通知及按专家提前就绪，生产 MegaMoE 路径尚未接入 RDMA。
+面向跨 MTE 域的融合性能路径使用上述 SHMEM RoCE 模式。
+[最初的单边 RDMA 原型](one_sided_probe/README.md)保留传输机制实验，结果与集成后的模型验收分开记录。
 
 在客户已有 PyTorch/torch-npu/CANN 环境中从本分支重编译后，运行完整 EP16 原宽验收：
 

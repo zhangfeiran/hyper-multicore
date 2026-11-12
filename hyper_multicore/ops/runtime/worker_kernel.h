@@ -36,6 +36,9 @@
 #include "vector_ready_queue.h"
 
 
+#include "get_mem.h"
+#include "empty_dispatch.h"
+#include "rdma_transport.h"
 #include "replica_gradient.h"
 #include "gradient_band.h"
 #include "gradient_band_observer.h"
@@ -102,6 +105,7 @@ class KernelWorkerBase {
     if (!isRuntimeStorageValid(runtimeConfigPtr, runtime_bytes, event_bytes, ep_size, local_experts)) {
       AscendC::Trap();
     }
+    rdma_.Init(runtimeConfigPtr, runtime_bytes, ep_size, getRuntimeEventCapacity(runtimeConfigPtr));
     InitReplicaExtension(runtime_bytes, local_experts);
     this->runtime_task_capacity = getRuntimeTaskCapacity(runtimeConfigPtr);
     this->runtime_event_capacity = getRuntimeEventCapacity(runtimeConfigPtr);
@@ -211,13 +215,7 @@ class KernelWorkerBase {
       const bool projection_ready = runtime_bytes != base_bytes + 48;
       const uint64_t magic = kernel_gradients ? 0x0000000553505754ULL :
                              projection_ready ? 0x0000000453505754ULL : 0x0000000253505754ULL;
-      if (extension[0] != magic || extension[1] == 0 || extension[1] > local_experts) {
-        AscendC::Trap();
-      }
-      if (extension[1] == local_experts &&
-          (projection_ready || extension[2] || extension[3] || extension[4] || extension[5])) {
-        AscendC::Trap();
-      }
+      ValidateReplicaExtension(extension, magic, local_experts, projection_ready);
       home_experts_ = extension[1];
       for (uint32_t index = 0; index < 4; ++index) {
         replica_matrix_bases_[index] = reinterpret_cast<GM_ADDR>(extension[index + 2]);
@@ -231,6 +229,17 @@ class KernelWorkerBase {
         }
         replica_gradient_config_ = reinterpret_cast<GM_ADDR>(extension[9]);
       }
+    }
+  }
+
+  __aicore__ inline void ValidateReplicaExtension(__gm__ uint64_t *extension, uint64_t magic,
+                                                  uint32_t local_experts, bool projection_ready) {
+    if (extension[0] != magic || extension[1] == 0 || extension[1] > local_experts) {
+      AscendC::Trap();
+    }
+    if (extension[1] == local_experts &&
+        (projection_ready || extension[2] || extension[3] || extension[4] || extension[5])) {
+      AscendC::Trap();
     }
   }
 
@@ -658,6 +667,10 @@ class KernelWorkerBase {
     const uint32_t count = this->cube_task_num;
     const uint32_t stride = this->core_num;
 #else
+    if (rdma_.enabled && this->worker_id_ % 2 == 0) {
+      ProcessRdmaCommunicationQueue(mode, recorder);
+      return;
+    }
     if (ready_queue_) {
       ProcessVectorReady(mode, recorder);
       return;
@@ -754,6 +767,16 @@ class KernelWorkerBase {
 
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
   __aicore__ inline void CompleteDeviceReads(const ReadyHandshakeMeta &meta) {
+    if (rdma_.enabled) {
+#ifndef HMC_RUNTIME_CUBE
+      if (this->worker_id_ % 2 == 0 && this->worker_id_ / 2 >= RdmaOwnerCount()) return;
+#endif
+      TriggerEvent(meta.completion_event);
+#ifndef HMC_RUNTIME_CUBE
+      if (this->worker_id_ == 1) WaitForDependency(meta.completion_event);
+#endif
+      return;
+    }
 #ifndef HMC_RUNTIME_CUBE
     if (!IsActiveVectorWorker()) {
       return;
@@ -763,7 +786,7 @@ class KernelWorkerBase {
 #ifndef HMC_RUNTIME_CUBE
     if (this->worker_id_ == 1) {
       WaitForDependency(meta.completion_event);
-      if (meta.ready_event != 0) {
+      if (meta.ready_event != 0 && !rdma_.enabled) {
         PublishDeviceReady(meta, true);
       }
     }
@@ -771,6 +794,16 @@ class KernelWorkerBase {
   }
 #else
   __aicore__ inline void CompleteDeviceReads(const ReadyHandshakeMeta &meta) {
+    if (rdma_.enabled) {
+#ifndef HMC_RUNTIME_CUBE
+      if (this->worker_id_ % 2 == 0 && this->worker_id_ / 2 >= RdmaOwnerCount()) return;
+#endif
+      TriggerEvent(meta.completion_event);
+#ifndef HMC_RUNTIME_CUBE
+      if (this->worker_id_ == 1) WaitForDependency(meta.completion_event);
+#endif
+      return;
+    }
 #ifndef HMC_RUNTIME_CUBE
     if (this->worker_id_ % 2 == 0) {
       return;
@@ -791,6 +824,13 @@ class KernelWorkerBase {
 
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
   __aicore__ inline void WaitForDeviceReady(const ReadyHandshakeMeta &meta) {
+    if (rdma_.enabled) {
+#ifndef HMC_RUNTIME_CUBE
+      if (this->worker_id_ == 1) PrepareRdmaEpoch(meta);
+#endif
+      WaitForDependency(meta.ready_event);
+      return;
+    }
 #ifdef HMC_RUNTIME_CUBE
     WaitForDependency(meta.ready_event);
 #else
@@ -806,6 +846,13 @@ class KernelWorkerBase {
   }
 #else
   __aicore__ inline void WaitForDeviceReady(const ReadyHandshakeMeta &meta) {
+    if (rdma_.enabled) {
+#ifndef HMC_RUNTIME_CUBE
+      if (this->worker_id_ == 1) PrepareRdmaEpoch(meta);
+#endif
+      WaitForDependency(meta.ready_event);
+      return;
+    }
 #ifdef HMC_RUNTIME_CUBE
     WaitForDependency(meta.ready_event);
 #else
@@ -921,6 +968,7 @@ class KernelWorkerBase {
     const uint64_t selected = NormalTraceNow();
     TaskDesc task_desc;
     LoadTaskDescriptor(task_id, task_desc);
+    if (rdma_.enabled && IsCommunication(task_desc) && !executing_communication_) return;
     const bool profile = mode == DiagnosticMode::PROFILE;
     const bool dump = mode == DiagnosticMode::TENSOR_DUMP_L1;
     const uint32_t owner_id = profile ? getTaskProfileOwnerId(this->runtimeConfigPtr, task_id) : 0;
@@ -937,7 +985,11 @@ class KernelWorkerBase {
     const uint64_t compute_start = profile ? recorder.Now() : 0;
     replica_trace_ = profile ? &recorder : nullptr;
     replica_trace_task_ = task_id;
-    static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
+    if (UsesRdmaTransfer(task_desc)) {
+      ExecuteRdmaTransfer(task_desc);
+    } else {
+      static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
+    }
     replica_trace_ = nullptr;
     const uint64_t computed = NormalTraceNow();
     if (profile) {
@@ -992,6 +1044,7 @@ class KernelWorkerBase {
     DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
       all_event_counters[event_index]);
     int32_t current = all_event_counters.GetValue(event_index);
+    if (rdma_.enabled && current < needed) current += rdma_.Received(event_index);
     PipeBarrier<PIPE_ALL>();
     int64_t previous_cycle = AscendC::GetSystemCycle();
     while (current < needed) {
@@ -1000,6 +1053,7 @@ class KernelWorkerBase {
         DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
           all_event_counters[event_index]);
         current = all_event_counters.GetValue(event_index);
+        if (rdma_.enabled && current < needed) current += rdma_.Received(event_index);
         previous_cycle = AscendC::GetSystemCycle();
       }
     }
@@ -1023,6 +1077,182 @@ class KernelWorkerBase {
       TriggerEvent(task.extra_value_1);
     }
   }
+
+  __aicore__ inline bool IsCommunication(const TaskDesc &task) const {
+    return task.task_type == TaskType::TASK_SHMEM_PUT_MEM_SIGNAL || task.task_type == TaskType::TASK_SHMEM_GET_MEM;
+  }
+
+  __aicore__ inline uint32_t CommunicationPeer(const TaskDesc &task) const {
+    const uint32_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+    return task.task_index / (task.task_split_num / ep);
+  }
+
+  __aicore__ inline uint32_t RdmaOwnerCount() const {
+    const uint32_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+    return ep < core_num ? ep : core_num;
+  }
+
+  __aicore__ inline __gm__ int32_t *RdmaEpochStorage(bool completion) const {
+    const uint32_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+    constexpr uint32_t stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
+    auto ready = reinterpret_cast<__gm__ int32_t *>(input_list[Derived::EVENT_IDX]) + runtime_event_capacity;
+    return completion ? ready + (ep + 1) * stride : ready;
+  }
+
+  __aicore__ inline void PrepareRdmaEpoch(const ReadyHandshakeMeta &meta) {
+#ifndef HMC_RUNTIME_CUBE
+    const uint32_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+    constexpr uint32_t stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
+    auto source = RdmaEpochStorage(false) + ep * stride;
+    dcci_cachelines(reinterpret_cast<GM_ADDR>(source), sizeof(int32_t));
+    int32_t generation = *reinterpret_cast<__gm__ volatile int32_t *>(source);
+    if (generation == INT32_MAX) AscendC::Trap();
+    *source = generation + 1;
+    dcci_cachelines(reinterpret_cast<GM_ADDR>(source), sizeof(int32_t));
+    rdma_.PublishSignalSource(source);
+    TriggerEvent(meta.ready_event);
+#endif
+  }
+
+  __aicore__ inline void ExchangeRdmaEpoch(bool completion) {
+#ifndef HMC_RUNTIME_CUBE
+    ReadyHandshakeMeta meta;
+    if (!LoadReadyHandshakeMeta(&meta)) return;
+    const uint32_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+    const uint32_t rank = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0) % ep;
+    constexpr uint32_t stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
+    auto source = RdmaEpochStorage(false) + ep * stride;
+    auto flags = RdmaEpochStorage(completion);
+    dcci_cachelines(reinterpret_cast<GM_ADDR>(source), sizeof(int32_t));
+    const int32_t generation = *reinterpret_cast<__gm__ volatile int32_t *>(source);
+    const uint32_t owner = worker_id_ / 2;
+    // Publish every owned peer before waiting: one owner can cover several peers at larger EP sizes.
+    for (uint32_t peer = owner; peer < ep; peer += RdmaOwnerCount()) {
+      if (peer != rank) rdma_.SignalSet(flags + rank * stride, source, peer);
+    }
+    for (uint32_t peer = owner; peer < ep; peer += RdmaOwnerCount()) {
+      if (peer != rank) aclshmem_signal_wait_until(flags + peer * stride, ACLSHMEM_CMP_GE, generation);
+    }
+#endif
+  }
+
+  __aicore__ inline void ProcessRdmaCommunicationQueue(DiagnosticMode mode, CycleTraceRecorder &recorder) {
+#ifndef HMC_RUNTIME_CUBE
+    const uint32_t owner = worker_id_ / 2;
+    const uint32_t owners = RdmaOwnerCount();
+    if (owner >= owners) return;
+    ExchangeRdmaEpoch(false);
+    executing_communication_ = true;
+    // All dispatches precede return waits: a blocked Combine must never prevent a later peer's dispatch.
+    for (uint32_t phase = 0; phase < 2; ++phase) {
+      for (uint32_t slot = 0; slot < vector_task_num; ++slot) {
+        TaskId id = GetTaskIndex(slot);
+        TaskDesc task;
+        getTaskDesc(runtimeConfigPtr, &task, id);
+        if (!IsCommunication(task) || CommunicationPeer(task) % owners != owner) continue;
+        if ((task.inputs[1].input_position == 2) != (phase == 0)) continue;
+        ExecuteTask(id, mode, recorder);
+      }
+      const uint32_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+      for (uint32_t peer = owner; peer < ep; peer += owners) {
+        if (rdma_.UsesRdma(peer)) rdma_.Quiet(peer);
+      }
+    }
+    ExchangeRdmaEpoch(true);
+    executing_communication_ = false;
+#endif
+  }
+
+  __aicore__ inline bool UsesRdmaTransfer(const TaskDesc &task) const {
+    return rdma_.enabled && IsCommunication(task) &&
+      (rdma_.UsesRdma(CommunicationPeer(task)) ||
+       (rdma_.row_indices != nullptr && task.inputs[1].input_position == 2));
+  }
+
+  __aicore__ inline void ExecuteRdmaTransfer(const TaskDesc &task) {
+#ifndef HMC_RUNTIME_CUBE
+    const int64_t experts = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 2);
+    const int64_t hidden = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 3);
+    const int64_t tiles = task.task_split_num / experts;
+    const int64_t tile = task.task_index % tiles;
+    const int64_t size = reinterpret_cast<__gm__ int32_t *>(
+      input_list[task.inputs[3].input_position])[task.inputs[3].base_ptr_offset];
+    const int64_t chunk = static_cast<int64_t>(task.task_split_value) * hidden;
+    const int64_t start = tile * chunk;
+    const uint32_t peer = CommunicationPeer(task);
+    const bool pull = task.task_type == TaskType::TASK_SHMEM_GET_MEM;
+    const bool network = rdma_.UsesRdma(peer);
+    if (start < size) {
+      const int64_t destination_offset = reinterpret_cast<__gm__ int64_t *>(
+        input_list[task.inputs[0].input_position])[task.inputs[0].base_ptr_offset] + start;
+      const int64_t source_offset = reinterpret_cast<__gm__ int64_t *>(
+        input_list[task.inputs[2].input_position])[task.inputs[2].base_ptr_offset] + start;
+      const uint32_t elements = static_cast<uint32_t>(size - start < chunk ? size - start : chunk);
+      GM_ADDR destination = input_list[task.outputs[0].input_position] +
+                            destination_offset * task.outputs[0].data_type;
+      GM_ADDR source = input_list[task.inputs[1].input_position];
+      if (rdma_.row_indices != nullptr && task.inputs[1].input_position == 2) {
+        ExecuteIndexedRows(task, destination, source, source_offset / hidden, elements / hidden, peer);
+      } else {
+        source += source_offset * task.inputs[1].data_type;
+        const uint32_t bytes = elements * task.inputs[1].data_type;
+        if (pull) rdma_.Get(destination, source, bytes, peer);
+        else rdma_.Put(destination, source, bytes, peer);
+      }
+      if (pull && network) rdma_.Quiet(peer);
+    }
+    if (!pull) {
+      int32_t credit = start < size ? 1 : EmptyDispatchCredit(task.extra_value_0, tile, tiles, start, size, chunk);
+      if (credit) {
+        if (network) rdma_.Credit(task.trigger_event, credit, peer);
+        else aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(input_list[Derived::EVENT_IDX]) +
+                                  task.trigger_event, credit, ACLSHMEM_SIGNAL_ADD, peer);
+      }
+    }
+#endif
+  }
+
+  __aicore__ inline void ExecuteIndexedRows(const TaskDesc &task, GM_ADDR destination, GM_ADDR source,
+                                            uint32_t first, uint32_t rows, uint32_t peer) {
+#ifndef HMC_RUNTIME_CUBE
+    const uint32_t hidden = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 3);
+    const uint32_t row_bytes = hidden * task.inputs[1].data_type;
+    const bool pull = task.task_type == TaskType::TASK_SHMEM_GET_MEM;
+    const bool network = rdma_.UsesRdma(peer);
+    auto indices = rdma_.row_indices + first;
+    if (pull) {
+      auto local_indices = rdma_.IndexScratch(peer);
+      if (network) {
+        rdma_.Get(reinterpret_cast<GM_ADDR>(local_indices), reinterpret_cast<GM_ADDR>(indices),
+                  rows * sizeof(int32_t), peer);
+        rdma_.Quiet(peer);
+      } else {
+        PullToLocal<int32_t>(reinterpret_cast<GM_ADDR>(local_indices), reinterpret_cast<GM_ADDR>(indices), rows, peer);
+        // Communication owners have no TPipe. Keep this event separate from get_pipelined's EVENT_ID0/1.
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+      }
+      indices = local_indices;
+    }
+    dcci_cachelines(reinterpret_cast<GM_ADDR>(indices), rows * sizeof(int32_t));
+    for (uint32_t row = 0; row < rows; ++row) {
+      int32_t source_row = *reinterpret_cast<__gm__ volatile int32_t *>(indices + row);
+      if (source_row < 0 || static_cast<uint64_t>(source_row) >= rdma_.source_rows) AscendC::Trap();
+      GM_ADDR original = source + static_cast<uint64_t>(source_row) * row_bytes;
+      GM_ADDR target = destination + static_cast<uint64_t>(row) * row_bytes;
+      if (network) {
+        if (pull) rdma_.Get(target, original, row_bytes, peer);
+        else rdma_.Put(target, original, row_bytes, peer);
+      } else {
+        if (pull) PullToLocal<uint8_t>(target, original, row_bytes, peer);
+        else hyper_multicore::shmem::data_plane::put(target, original, row_bytes, peer);
+      }
+    }
+#endif
+  }
+
+  RdmaTransport rdma_;
+  bool executing_communication_ = false;
 
   bool pull_protocol_ = false;
   bool ready_queue_ = false;

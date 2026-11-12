@@ -25,7 +25,7 @@ class _OrderedExpertInputs(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: Any, hidden: torch.Tensor, token: torch.Tensor,
-                slot: torch.Tensor, top_k: int) -> tuple:
+                slot: torch.Tensor, top_k: int, indexed: bool) -> tuple:
         """Gather real rows and retain one storage-sharing identity view per slot.
 
         Args:
@@ -34,11 +34,15 @@ class _OrderedExpertInputs(torch.autograd.Function):
             token: Source token for each compact real assignment.
             slot: Sorted expert slot for each compact real assignment.
             top_k: Number of original router slots.
+            indexed: Emit an assignment-shaped gradient carrier for an indexed executor.
         """
         ctx.save_for_backward(token, slot)
         ctx.source_shape = hidden.shape
         ctx.top_k = top_k
-        return (hidden.index_select(0, token),) + tuple(hidden.view_as(hidden) for _ in range(top_k))
+        # The carrier preserves assignment-shaped gradients; only the indexed executor may consume its values.
+        real = (hidden.as_strided((token.numel(), hidden.shape[1]), (0, 1)) if indexed
+                else hidden.index_select(0, token))
+        return (real,) + tuple(hidden.view_as(hidden) for _ in range(top_k))
 
     @staticmethod
     def backward(ctx: Any, real_gradient: torch.Tensor, *identity_gradients: torch.Tensor) -> tuple:
@@ -58,19 +62,21 @@ class _OrderedExpertInputs(torch.autograd.Function):
             if slot_tokens.numel():
                 contribution = contribution.index_copy(0, slot_tokens, real_gradient[selected])
             gradient = gradient + contribution
-        return gradient, None, None, None
+        return gradient, None, None, None, None
 
 
 class OrderedInputGather:
     """Bind the real gather and identity aliases to one forward invocation."""
 
-    def __init__(self, top_k: int) -> None:
+    def __init__(self, top_k: int, *, indexed: bool = False) -> None:
         """Retain the current source slot count.
 
         Args:
             top_k: Number of router slots in this invocation.
+            indexed: Keep original activation storage and pass explicit row indices to the executor.
         """
         self.top_k = top_k
+        self.indexed = indexed
         self.identity_inputs = ()
 
     def __call__(self, hidden: torch.Tensor, token: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
@@ -81,6 +87,6 @@ class OrderedInputGather:
             token: Source token for each compact real assignment.
             slot: Sorted expert slot for each compact real assignment.
         """
-        real, *identity = _OrderedExpertInputs.apply(hidden, token, slot, self.top_k)
+        real, *identity = _OrderedExpertInputs.apply(hidden, token, slot, self.top_k, self.indexed)
         self.identity_inputs = tuple(identity)
         return real

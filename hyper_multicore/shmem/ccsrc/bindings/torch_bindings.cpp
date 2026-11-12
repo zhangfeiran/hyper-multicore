@@ -100,7 +100,13 @@ std::string_view ToString(State state) {
 }
 
 std::string_view ToString(DataEngine engine) {
-  return engine == DataEngine::Mte ? "mte" : (engine == DataEngine::MteUdma ? "mte_udma" : "Unknown");
+  switch (engine) {
+    case DataEngine::Mte: return "mte";
+    case DataEngine::MteUdma: return "mte_udma";
+    case DataEngine::MteRoce: return "mte_roce";
+    case DataEngine::Roce: return "roce";
+  }
+  return "Unknown";
 }
 
 std::string_view ToString(DfxOperation operation) {
@@ -654,6 +660,11 @@ void WaitSignal(const at::Tensor &signal, int64_t value, const py::object &compa
   cann::host::wait_signal_on_stream(reinterpret_cast<uintptr_t>(signal.data_ptr()), compare_op, signal_value, stream);
 }
 
+std::vector<uint32_t> PeerTransportMasks() {
+  UnwrapRuntime(Runtime::Instance().RootSize(), "peer_transport_masks");
+  return cann::host::peer_transport_masks();
+}
+
 std::vector<bool> PeerMteAccessibility() {
   UnwrapRuntime(Runtime::Instance().RootSize(), "peer_mte_accessibility");
   return cann::host::peer_mte_accessibility();
@@ -821,6 +832,7 @@ PYBIND11_MODULE(hyper_multicore_shmem_torch, module) {
   module.def("_log_debug", &bindings::log_debug, py::arg("message"));
   module.def("_debug_state", &bindings::DebugState);
   module.def("_peer_mte_accessibility", &bindings::PeerMteAccessibility);
+  module.def("_peer_transport_masks", &bindings::PeerTransportMasks);
   module.def("_validate_shutdown", &bindings::ValidateShutdown);
   module.def("_shutdown",
              [] { bindings::RequireOk(bindings::Runtime::Instance().Shutdown(), bindings::DfxOperation::Shutdown); });

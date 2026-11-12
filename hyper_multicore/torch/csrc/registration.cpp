@@ -20,6 +20,7 @@ TORCH_LIBRARY(hyper_multicore, m) {
     "-> (Tensor(a!), Tensor(b!))");
   m.def("mega_moe_compact_version() -> int", []() -> int64_t { return 1; });
   m.def("mega_moe_transport_version() -> int", []() -> int64_t { return 1; });
+  m.def("mega_moe_rdma_version() -> int", []() -> int64_t { return 2; });
   m.def("mega_moe_schedule_version() -> int", []() -> int64_t { return 3; });
   m.def("mega_moe_adaptive_gradient_version() -> int", []() -> int64_t { return 4; });
   m.def("mega_moe_local_gradient_version() -> int", []() -> int64_t { return 1; });

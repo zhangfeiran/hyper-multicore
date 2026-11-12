@@ -25,6 +25,7 @@ __all__ = [
     "host_barrier",
     "put",
     "peer_mte_accessibility",
+    "peer_transport_masks",
     "signal",
     "wait_signal",
 ]
@@ -70,6 +71,15 @@ def _normalize_alignment(alignment: Any | None) -> int | None:
         return operator.index(alignment)
     except TypeError as error:
         raise TypeError(f"alignment must be an integer, got {type(alignment).__name__}") from error
+
+
+@_runtime_access
+def peer_transport_masks() -> tuple[int, ...]:
+    """Return actual SDK capabilities in Root PE order: MTE bit 1 and RoCE bit 2."""
+    native = _load_native()
+    if not hasattr(native, "_peer_transport_masks"):
+        raise RuntimeError("SHMEM payload lacks RDMA topology checks; rebuild from this checkout")
+    return tuple(native._peer_transport_masks())
 
 
 @_runtime_access

@@ -52,6 +52,7 @@ from hyper_multicore.scheduler.config import mega_moe_event_capacity
 
 from ..module import MulticoreModule
 from .transport import HcclExpertTransport, require_mte_peers
+from . import rdma
 from .function import execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
@@ -78,6 +79,27 @@ class _InvalidExpertWeightType(TypeError):
 
 
 _HCCL_OWNERS: weakref.WeakSet[MegaMoeExperts] = weakref.WeakSet()
+
+
+def _validate_execution_controls(communication_backend: str, replica_slots_per_rank: int,
+                                 replica_transport: str, replica_granularity: str,
+                                 single_expert_tasks: bool, route_task_bounds: bool) -> str:
+    """Validate mutually compatible communication and scheduling choices once."""
+    if communication_backend not in ("shmem", "hccl"):
+        raise ValueError("communication_backend must be 'shmem' or 'hccl'")
+    if communication_backend == "hccl" and replica_slots_per_rank:
+        raise ValueError("HCCL MegaMoE communication currently requires replica_slots_per_rank=0")
+    if rdma.configured_engine() in ("roce", "mte_roce") and replica_slots_per_rank and replica_transport != "p2p":
+        raise ValueError("RDMA expert replicas currently require replica_transport='p2p'")
+    if replica_granularity not in ("token", "expert"):
+        raise ValueError("replica_granularity must be 'token' or 'expert'")
+    if not isinstance(single_expert_tasks, bool):
+        raise ValueError("single_expert_tasks must be boolean")
+    if not isinstance(route_task_bounds, bool):
+        raise ValueError("route_task_bounds must be boolean")
+    if replica_transport not in ("p2p", *KERNEL_GRADIENT_TRANSPORT_MODES):
+        raise ValueError("Unsupported replica_transport; expected p2p or a kernel-gradient transport")
+    return rdma.configured_engine()
 
 
 def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
@@ -195,7 +217,17 @@ class _MegaMoeExecutionResources:
 
             def construct() -> None:
                 """Build and bind local resources before converging construction results."""
-                require_mte_peers(shmem.peer_mte_accessibility(), self.spec.ep_size)
+                if rdma.enabled(self.spec):
+                    rdma.require_native()
+                    masks = shmem.peer_transport_masks()
+                    missing = [peer for peer, mask in enumerate(masks) if peer != self.spec.rank_id
+                               and not (mask & 2 or self.spec.shmem_data_engine == "mte_roce" and mask & 1)]
+                    if len(masks) != self.spec.ep_size or missing:
+                        raise RuntimeError(f"SHMEM peers lack the requested MTE/RoCE transport: {missing}")
+                    if shmem.debug_state()["config"]["data_engine"] != self.spec.shmem_data_engine:
+                        raise RuntimeError("SHMEM data engine changed after module construction")
+                else:
+                    require_mte_peers(shmem.peer_mte_accessibility(), self.spec.ep_size)
                 self.plan = build_mega_moe_plan(self.spec, tensor.device) if not self.spec.dynamic_tokens else None
                 self.home_spec = None
                 self.home_plan = None
@@ -317,6 +349,7 @@ class _MegaMoeExecutionResources:
             "replica_minimum_load_reduction",
             "single_expert_tasks",
             "route_task_bounds",
+            "shmem_data_engine",
         )
         manifest = (
             "dynamic_tokens_v4",
@@ -361,6 +394,9 @@ class _MegaMoeExecutionResources:
                 "MegaMoe schedule exceeds committed token capacity: "
                 f"requested={tokens}, capacity={self._token_capacity}"
             )
+        if rdma.enabled(spec):
+            spec = replace(spec, local_num_tokens=self._token_capacity,
+                           receive_capacity=self.workspace.capacity_floor)
         bucket = 1 << (max(128, tokens) - 1).bit_length()
         schedule_tokens = min(bucket, self._token_capacity)
         key, bounds = _schedule_plan_bounds(schedule, schedule_tokens, spec.ep_size, bucket, home_only)
@@ -370,6 +406,8 @@ class _MegaMoeExecutionResources:
             key = (key, "batched_experts")
         if nominal_schedule:
             key = (key, "nominal_schedule")
+        if rdma.enabled(spec):
+            key = (key, spec.local_num_tokens, spec.receive_capacity)
         source_bound = bounds.get("schedule_source_expert_rows", schedule_tokens)
         communication_rows = _communication_plan_rows(spec, maximum_edge_rows, tokens, source_bound)
         if communication_rows is not None:
@@ -494,6 +532,11 @@ class MegaMoeExperts(MulticoreModule):
             raise ValueError("single_expert_tasks and route_task_bounds must be boolean")
         if replica_transport not in ("p2p", *KERNEL_GRADIENT_TRANSPORT_MODES):
             raise ValueError("Unsupported replica_transport")
+        self.shmem_data_engine = _validate_execution_controls(
+            communication_backend, replica_slots_per_rank, replica_transport, replica_granularity,
+            single_expert_tasks, route_task_bounds)
+        if self.shmem_data_engine in ("roce", "mte_roce") and numerics.apply_probs_before_fc2:
+            raise ValueError("RDMA does not support probability weighting before FC2")
         _integer(replica_min_rows, "replica_min_rows", 0)
         resolve_replica_admission(replica_minimum_load_reduction)
         _integer(initial_token_capacity, "initial_token_capacity", 1)
@@ -533,6 +576,7 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": tuning.dispatch_split,
             "combine_split": tuning.combine_split,
             "communication_backend": communication_backend,
+            "shmem_data_engine": self.shmem_data_engine,
             "_host_replica_metadata": True,
             "_summary_home_admission": self._summary_home_admission,
         }
@@ -905,6 +949,7 @@ class MegaMoeExperts(MulticoreModule):
         *,
         expert_weights: tuple[torch.Tensor, torch.Tensor],
         tokens_per_expert: torch.Tensor | None = None,
+        _indexed_source: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Route token states through the configured experts.
 
@@ -917,6 +962,7 @@ class MegaMoeExperts(MulticoreModule):
                 ``([E,2I,H], [E,H,I])``. Layout binds on first use and stays fixed.
                 EIO copies retain autograd; EOI weights must be contiguous.
             tokens_per_expert: Trusted exact global-expert histogram; skips histogram recomputation.
+            _indexed_source: Internal original source and compact assignment row map for RDMA adapters.
 
         Note:
             Returns the input shape and dtype. EOI noncontiguity raises ValueError;
@@ -938,7 +984,8 @@ class MegaMoeExperts(MulticoreModule):
             if resources is not None:
                 layout = resources.spec.expert_weight_layout
             signature = (self.communication_backend, self.hidden_size, self.intermediate_size, self.num_experts,
-                         self.top_k, layout, specification["swiglu_hf_bf16"], self.swiglu_limit)
+                         self.top_k, layout, specification["swiglu_hf_bf16"], self.swiglu_limit,
+                         self.shmem_data_engine)
             peers = _collective.exchange((signature, weight_error), group=self._ep_group,
                                          failure_prefix="MegaMoE transport agreement")
             if any(error for _, error in peers):
@@ -949,6 +996,7 @@ class MegaMoeExperts(MulticoreModule):
         if self.communication_backend == "hccl":
             executor = self._hccl_transport()
             return executor(hidden_flat, topk_ids, topk_weights, weights).reshape_as(hidden_states)
+        raw_capacity = self._indexed_source_capacity(hidden_flat, _indexed_source)
         resources = self._get_execution_resources(hidden_flat)
         route_options = {"autograd_mask": _INVALID_WEIGHT_MASK if weight_error else (
             int(torch.is_grad_enabled()) | (int(hidden_flat.requires_grad) << 1)
@@ -970,6 +1018,7 @@ class MegaMoeExperts(MulticoreModule):
                 received: Current routed receive-row count.
             """
             nonlocal claimed
+            tokens = max(tokens, raw_capacity)
             if adaptive_inbox:
                 resources.prepare_auto_workspace(tokens, received, hidden_flat, replica_slots=route_state.inbox_slots)
             else:
@@ -978,7 +1027,7 @@ class MegaMoeExperts(MulticoreModule):
 
         if automatic:
             route_options["prepare_workspace"] = prepare_workspace
-        elif pull:
+        elif pull and not rdma.enabled(resources.spec):
             resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
             resources.workspace.claim()
             claimed = True
@@ -987,15 +1036,17 @@ class MegaMoeExperts(MulticoreModule):
                 route, topk_ids = self._prepare_forward_route(
                     resources, hidden_flat, topk_ids, topk_weights, tokens_per_expert, route_options, route_state
                 )
-            if not pull and (not automatic):
+            route = self._attach_indexed_source(route, hidden_flat, _indexed_source, raw_capacity)
+            if not automatic and (not pull or rdma.enabled(resources.spec)):
                 resources.ensure_capacity(route.maximum_received_slots)
+            self._validate_received_capacity(resources, route.maximum_received_slots)
             execution_plan = resources.plan_for_tokens(
                 route.metadata.plan_tokens, hidden_flat.device, home_only=route_state.home_only,
                 maximum_edge_rows=route.metadata.maximum_edge_rows,
                 schedule=getattr(route.metadata, "schedule", None),
             )
             resources.last_execution_plan = execution_plan
-            if not torch.is_grad_enabled():
+            if not torch.is_grad_enabled() and not rdma.enabled(resources.spec):
                 return _execute_mega_moe_without_autograd(
                     topk_weights, *weights, route, execution_plan, resources.workspace,
                     workspace_claimed=pull).reshape_as(hidden_states)
@@ -1017,6 +1068,57 @@ class MegaMoeExperts(MulticoreModule):
             return expert_output.reshape_as(hidden_states)
         output = restore_topk_output(expert_output, route.unpermute_mapping, topk_weights)
         return output.reshape(hidden_states.shape)
+
+    def _indexed_source_capacity(self, hidden_flat: torch.Tensor,
+                                 indexed_source: tuple[torch.Tensor, torch.Tensor] | None) -> int:
+        """Keep raw source capacity common even when a rank has no real assignments."""
+        if indexed_source is not None and not rdma.enabled(self._resource_group.specification):
+            raise ValueError("Indexed sources require an RDMA execution specification")
+        original_rows = hidden_flat.shape[0] if indexed_source is None else indexed_source[0].shape[0]
+        raw_capacity = original_rows
+        if indexed_source is not None:
+            self._validate_indexed_source(hidden_flat, indexed_source)
+            capacity = torch.tensor([original_rows], dtype=torch.int64, device=hidden_flat.device)
+            if self.ep_size > 1:
+                dist.all_reduce(capacity, op=dist.ReduceOp.MAX, group=self._ep_group)
+            raw_capacity = int(capacity.item())
+        return raw_capacity
+
+    @staticmethod
+    def _validate_received_capacity(resources: Any, maximum_received_slots: int) -> None:
+        """Reject a group-wide overflow before any rank launches a symmetric receive."""
+        if rdma.enabled(resources.spec) and maximum_received_slots > resources.workspace.capacity_floor:
+            raise RuntimeError("RDMA expert receive capacity does not cover the agreed route load")
+
+    def _validate_indexed_source(self, hidden_flat: torch.Tensor,
+                                 indexed_source: tuple[torch.Tensor, torch.Tensor]) -> None:
+        """Reject metadata carriers that do not alias the original contiguous activation."""
+        source, indices = indexed_source
+        if (source.ndim != 2 or source.shape[1] != self.hidden_size or source.dtype != hidden_flat.dtype
+                or source.device != hidden_flat.device or indices.ndim != 1
+                or indices.numel() != hidden_flat.shape[0] or indices.device != source.device
+                or indices.dtype not in (torch.int32, torch.int64) or not source.is_contiguous()
+                or hidden_flat.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()):
+            raise ValueError("Invalid indexed original source or assignment row metadata")
+
+    def _attach_indexed_source(self, route: Any, hidden_flat: torch.Tensor,
+                               indexed_source: tuple[torch.Tensor, torch.Tensor] | None,
+                               source_rows_bound: int | None = None) -> Any:
+        """Attach original source row metadata without materializing assignment activations."""
+        if rdma.enabled(self._resource_group.specification):
+            inverse = route.unpermute_mapping.long()
+            assignment_order = torch.empty_like(inverse)
+            assignment_order.scatter_(0, inverse, torch.arange(inverse.numel(), device=inverse.device))
+            source_indices = torch.div(assignment_order, self.top_k, rounding_mode="floor").long()
+            source = hidden_flat
+            if indexed_source is not None:
+                source = indexed_source[0]
+                source_indices = indexed_source[1].index_select(0, source_indices)
+            route = replace(route, metadata=replace(route.metadata, original_source=source,
+                                                   source_row_indices=source_indices.to(torch.int32),
+                                                   source_rows_bound=(source_rows_bound if indexed_source is not None
+                                                                      else None)))
+        return route
 
     def _hccl_transport(self) -> HcclExpertTransport:
         """Register local layers before the first native bind reserves the shared Heap."""

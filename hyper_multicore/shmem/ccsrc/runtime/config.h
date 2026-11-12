@@ -34,6 +34,8 @@ inline constexpr std::size_t kMaxBootstrapEndpointBytes = 63U;
 enum class DataEngine : uint8_t {
   Mte,
   MteUdma,
+  MteRoce,
+  Roce,
 };
 
 /** @brief Validated, framework-independent Runtime configuration. */

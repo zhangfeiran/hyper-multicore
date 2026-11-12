@@ -14,6 +14,7 @@
 # ============================================================================
 """Framework-independent LongCat identity and MegaMoE expert integration."""
 
+import os
 from typing import Any
 
 import torch
@@ -54,7 +55,7 @@ class LongcatFlashExperts(nn.Module):
                  communication_backend: str = "shmem",
                  routing_backend: str = "torch", replica_slots_per_rank: int = 0,
                  gate_up_padded: bool = False, initial_token_capacity: int | None = None,
-                 replica_min_rows: int = 1024) -> None:
+                 replica_min_rows: int = 1024, replica_transport: str | None = None) -> None:
         """Configure real experts and optional whole-expert replicas.
 
         Args:
@@ -66,13 +67,14 @@ class LongcatFlashExperts(nn.Module):
             ep_size: Number of ranks in the explicit expert group.
             ep_group: Expert group; required for distributed execution.
             dispatch_mode: MegaMoE push or pull transport.
-            communication_backend: SHMEM MTE communication or HCCL routing with local MegaMoE compute.
+            communication_backend: Fused SHMEM MTE/RoCE communication or HCCL routing with local MegaMoE compute.
             swiglu_precision: Fused arithmetic or HF BF16 rounding.
             routing_backend: Portable Torch or optional Ascend Triton routing.
             replica_slots_per_rank: Number of whole-expert guest slots per rank.
             gate_up_padded: Caller storage includes trailing identity rows per rank.
             initial_token_capacity: Optional compact-assignment reservation.
             replica_min_rows: Soft minimum rows for a guest expert.
+            replica_transport: Guest weight and gradient transport; RDMA defaults to independent HCCL P2P.
         """
         super().__init__()
         values = (hidden_size, intermediate_size, num_experts, top_k, ep_size)
@@ -85,7 +87,13 @@ class LongcatFlashExperts(nn.Module):
         actual_ep = torch.distributed.get_world_size(ep_group) if torch.distributed.is_initialized() else 1
         if actual_ep != ep_size:
             raise ValueError(f"LongCat ep_size={ep_size} does not match expert group size={actual_ep}")
+        engine = os.environ.get("HYPER_MULTICORE_SHMEM_DATA_ENGINE", "mte")
+        effective_replica_transport = replica_transport or (
+            "p2p" if engine in ("roce", "mte_roce") and replica_slots_per_rank
+            else "shmem_signal_kernel_gradient_bands"
+        )
         tuning = MegaMoeTuningOptions(
+            replica_transport=effective_replica_transport,
             dispatch_mode=dispatch_mode, communication_backend=communication_backend,
             initial_token_capacity=128 if initial_token_capacity is None else initial_token_capacity,
             single_expert_tasks=True, route_task_bounds=True, replica_slots_per_rank=replica_slots_per_rank,

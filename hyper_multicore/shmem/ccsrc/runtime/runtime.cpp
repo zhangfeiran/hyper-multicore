@@ -40,8 +40,12 @@ const char *StateName(State state) {
 }
 
 const char *DataEngineName(DataEngine engine) {
-  if (engine == DataEngine::Mte) return "mte";
-  if (engine == DataEngine::MteUdma) return "mte_udma";
+  switch (engine) {
+    case DataEngine::Mte: return "mte";
+    case DataEngine::MteUdma: return "mte_udma";
+    case DataEngine::MteRoce: return "mte_roce";
+    case DataEngine::Roce: return "roce";
+  }
   return "unknown";
 }
 
@@ -355,10 +359,11 @@ Status Runtime::ValidateInitialInput(const RootWorldInfo &root, const Config &co
                        std::to_string(root.root_rank) + ", root_size=" + std::to_string(root.root_size));
   }
   if (config.heap_size_bytes == 0 || config.timeout_seconds == 0 ||
-      (config.data_engine != DataEngine::Mte && config.data_engine != DataEngine::MteUdma)) {
+      (config.data_engine != DataEngine::Mte && config.data_engine != DataEngine::MteUdma &&
+       config.data_engine != DataEngine::MteRoce &&
+       config.data_engine != DataEngine::Roce)) {
     return MakeError(ErrorCode::InvalidConfig,
-                     "Runtime Config requires positive heap/timeout values and a supported "
-                     "MTE or MTE/UDMA data engine");
+                     "Runtime Config requires positive heap/timeout values and a supported data engine");
   }
   if (config.bootstrap_endpoint_base.empty() || config.bootstrap_endpoint_base.size() > kMaxBootstrapEndpointBytes) {
     return MakeError(ErrorCode::InvalidConfig, "bootstrap_endpoint_base must contain between 1 and " +

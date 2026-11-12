@@ -14,14 +14,19 @@
 # ============================================================================
 """Validate two full-width LongCat expert forwards before a shared reverse pass."""
 
+from contextlib import ExitStack
 import json
 import os
+from typing import Any
 
 import torch
 import torch.distributed as dist
 
 from native_reference import NativeExperts
-from validate import arguments, candidate, compare, environment, fixture, start_shmem_lifetime
+from validate import (
+    arguments, candidate, compare, environment, fixture, hash_tensor, plan_observer,
+    set_operator_timeout, start_shmem_lifetime,
+)
 
 from hyper_multicore import shmem
 from hyper_multicore.longcat._routing import route_experts
@@ -50,27 +55,59 @@ def results(data: list, output: torch.Tensor) -> dict:
     return values
 
 
+def _copy_inputs(data: list[dict]) -> list[dict]:
+    """Give each path independent leaves while retaining the same fixture values."""
+    return [{key: value.detach().clone().requires_grad_(True) if key in
+              ("gate", "down", "hidden", "probability") else value for key, value in item.items()}
+             for item in data]
+
+
+def _layer_inputs(args: Any, rank: int) -> tuple[list[dict], list[dict]]:
+    """Use different layer weights and hot owners so stale guest state cannot pass parity."""
+    data = [fixture(args, rank + index * args.ep) for index in range(2)]
+    if args.route_fixture == "hot":
+        for index, item in enumerate(data):
+            real_ids = torch.arange(8, device="npu") + (index % args.ep) * 8
+            identities = torch.arange(4, device="npu") + args.real
+            item["ids"] = torch.cat((real_ids, identities)).expand(args.tokens, -1).clone()
+    identities = [{key: hash_tensor(item[key]) for key in ("gate", "down", "ids")} for item in data]
+    return data, identities
+
+
+def _replica_chain(layers: list, args: Any, data: list[dict]) -> tuple[torch.Tensor, list, bool]:
+    """Observe public replica decisions while retaining both layer contexts."""
+    plans = []
+    with ExitStack() as observers:
+        if args.replica_slots:
+            for layer in layers:
+                observers.enter_context(plan_observer(layer.executor, plans))
+        output = chain(layers, args, data, False)
+    active = any(not plan["home_only"] and plan["transfers"] for plan in plans)
+    transfers = torch.tensor([active], dtype=torch.int32, device="npu")
+    dist.all_reduce(transfers, op=dist.ReduceOp.MAX)
+    return output, plans, bool(transfers.item())
+
+
 def main() -> None:
     """Write all-rank terminal parity, runtime scope, and cleanup evidence."""
     args = arguments()
-    if args.communication_backend != "hccl" or args.replica_slots:
-        raise ValueError("Lifecycle validation requires --communication-backend hccl and no replicas")
+    os.environ["HYPER_MULTICORE_SHMEM_DATA_ENGINE"] = args.shmem_data_engine
     rank = int(os.environ["RANK"])
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    set_operator_timeout(args.operator_timeout)
     dist.init_process_group("hccl")
     if dist.get_world_size() != args.ep:
         raise ValueError("WORLD_SIZE must match --ep")
     start_shmem_lifetime()
-    data = [fixture(args, rank) for _ in range(2)]
-    other = [{key: value.detach().clone().requires_grad_(True) if key in
-              ("gate", "down", "hidden", "probability") else value for key, value in item.items()}
-             for item in data]
+    data, identities = _layer_inputs(args, rank)
+    other = _copy_inputs(data)
     reference = [NativeExperts(args.real, args.ep, dist.group.WORLD, args.swiglu_precision) for _ in data]
     native = chain(reference, args, data, True)
     expected = {key: None if value is None else value.detach().cpu()
                 for key, value in results(data, native).items()}
     layers = [candidate(args) for _ in data]
-    output = chain(layers, args, other, False)
+    output, plans, replicas_exercised = _replica_chain(layers, args, other)
+    replicas_pass = not args.replica_slots or replicas_exercised
     comparison = compare(results(other, output), expected)
     local_pass = all(value["strict_pass"] for value in comparison.values())
     flags = torch.tensor([local_pass], dtype=torch.int32, device="npu")
@@ -80,8 +117,13 @@ def main() -> None:
         layer.close()
     torch.npu.synchronize()
     runtime = dict(shmem.debug_state())
-    passed = bool(flags.item()) and active_runtime["root_size"] == 1 and runtime["state"] == "Uninitialized"
+    expected_root = 1 if args.communication_backend == "hccl" else args.ep
+    passed = (bool(flags.item()) and replicas_pass and active_runtime["root_size"] == expected_root
+              and runtime["state"] == "Uninitialized")
     report = {"rank": rank, "ep_size": args.ep, "expert_layers": len(layers),
+              "communication_backend": args.communication_backend, "shmem_data_engine": args.shmem_data_engine,
+              "replica_slots": args.replica_slots, "replicas_exercised": replicas_exercised,
+              "layer_identities": identities, "replica_plans": plans,
               "shape": {key: getattr(args, key) for key in
                         ("tokens", "hidden", "intermediate", "real", "zero", "top_k")},
               "comparison": comparison, "strict_pass": passed, "environment": environment(),
@@ -91,7 +133,7 @@ def main() -> None:
     print(json.dumps({"rank": rank, "strict_pass": passed}), flush=True)
     dist.destroy_process_group()
     if not passed:
-        raise RuntimeError("Two-layer HCCL MegaMoE lifecycle or parity check failed")
+        raise RuntimeError("Two-layer MegaMoE lifecycle or parity check failed")
 
 
 if __name__ == "__main__":

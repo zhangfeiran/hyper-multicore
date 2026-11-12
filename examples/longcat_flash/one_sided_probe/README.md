@@ -2,7 +2,9 @@
 
 这是独立的传输协议原型，使用本仓库锁定的 SHMEM 源码构建 RDMA SDK，不依赖 HyperParallel。
 原型验证 AIV 在内核中提交 RoCE 数据与完成通知，以及接收端按专家提前观察数据就绪。
-当前生产 MegaMoE 仍使用 MTE 数据搬运和远端 Add 计数器，尚未接入此协议。
+本目录保留最初的传输实验。当前 MegaMoE 已接入设备侧 RoCE 的完整前反向路径，
+使用每源独立的累积计数通知；配置和模型验收见[融合 RDMA 验证](../RDMA_VALIDATION.md)。
+下文的位图协议、原型时延和提前就绪窗口仅描述本目录原型。
 
 ## 为什么继续使用 SHMEM
 
@@ -16,8 +18,9 @@ RDMA 引擎；设备 RNIC 和网络需要支持并连通，CPU 的 x86_64/aarch6
 说明 A2 16 卡机器的两个 8P Fullmesh 组之间不能直接使用 MTE。
 实际客户拓扑应由探测确认，不能只根据 16 卡或 910B2C 名称推断。
 
-当前锁定版本为 `d30702bb55d0c9ce028a241ea608ae38dbaebc8e`，生产 SDK 构建没有开启
-`ACLSHMEM_RDMA_SUPPORT`，运行时也只接受 MTE。原型在独立构建目录开启 RDMA，不替换已交付的运行库。
+锁定版本为 `d30702bb55d0c9ce028a241ea608ae38dbaebc8e`。最初实验在独立构建目录开启
+`ACLSHMEM_RDMA_SUPPORT`；当前生产 SDK 也开启 RDMA，默认运行引擎仍为 MTE。
+这些原型结果对应原型自身的独立库和源码身份。
 
 ## 协议约束与实现
 

@@ -78,6 +78,7 @@ from .schedule_policy import (
     MegaMoeSchedulePolicy, compact_graph,
 )
 
+from . import rdma
 from .gradient_queue import (
     ACT_FIRST_GRADIENT_PROJECTIONS,
     ACTIVE_GRADIENT_PROJECTIONS,
@@ -331,6 +332,12 @@ def _build_runtime_artifacts(
     if compact and not spec.batch_experts:
         forward_data.cube_single_group = 1
     _apply_execution_policies(spec, task_values, forward_data, backward_data, backward_graph, overlap_w13)
+    if rdma.enabled(spec):
+        owners = min(spec.ep_size, spec.num_cube_cores)
+        for runtime in (forward_data, backward_data):
+            runtime.protocol_version = 1
+            runtime.completion_event = task_values.all_event_num + 11
+            runtime.all_event_num_triggers[runtime.completion_event] = runtime.num_workers + owners
     if spec.replica_slots_per_rank:
         backward_data.task_validator = validate_replica_task_options
     return forward_graph, forward_data, backward_graph, backward_data
@@ -385,13 +392,14 @@ def _prepare_diagnostics(
         prepare_mega_kernel_diagnostics(
             forward_graph, forward_config,
             parameter_count=PROBABILITY_POSITION_FORWARD + 1 if spec.apply_probs_before_fc2 else 16,
-            extra_aic_records=weight_records, **options
+            extra_aic_records=weight_records,
+            extra_aiv_records=rdma.communication_profile_records(spec, forward_config), **options
         ),
         prepare_mega_kernel_diagnostics(
             backward_graph,
             backward_config,
             parameter_count=PROBABILITY_POSITION_BACKWARD + 1 if spec.apply_probs_before_fc2 else 20,
-            extra_aiv_records=gradient_records,
+            extra_aiv_records=max(gradient_records, rdma.communication_profile_records(spec, backward_config)),
             extra_aic_records=producer_records + weight_records,
             **options,
         ),

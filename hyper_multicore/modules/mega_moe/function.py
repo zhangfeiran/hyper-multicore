@@ -40,6 +40,7 @@ from .local_gradients import use_local_gradient_bf16
 from .plan import MegaMoePlan, record_plan_stream
 from .route import PreparedTopKRoute, RouteMetadata, restore_topk_output
 from .workspace import MegaMoeWorkspace
+from . import rdma
 
 
 @dataclass
@@ -134,6 +135,7 @@ class _ForwardExecution:
     event_counters: Any
     gmm_workspace: Any
     intermediates: _ForwardIntermediates
+    source_indices: torch.Tensor | None = None
     runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
     task_prefix: GuestTaskPrefix | None = None
     prefix_cache: dict[int, tuple[Any, tuple[int, int, int, int]]] | None = None
@@ -164,6 +166,11 @@ def _workspace_tensor(tensor: Any | None, name: str) -> Any:
 
 def _dispatch_and_source(spec: Any, workspace: Any, rows: Any, capacity: int) -> tuple[Any, Any]:
     """Select transport storage while retaining a source-ready stream dependency."""
+    if rdma.enabled(spec):
+        source = _workspace_tensor(workspace.source_buffer, "source_buffer")[:rows.shape[0]]
+        if source.data_ptr() != rows.data_ptr():
+            source.copy_(rows)
+        return _workspace_tensor(workspace.expert_buffer, "expert_buffer"), source
     if getattr(spec, "dispatch_mode", "push") == "push":
         return _workspace_tensor(workspace.expert_buffer, "expert_buffer"), rows
     source = _workspace_tensor(workspace.source_buffer, "source_buffer")[: rows.shape[0]]
@@ -210,6 +217,10 @@ def _stage_backward_source(ctx: Any, grad_output: Any, permutation_inputs: tuple
                 ctx.workspace.probabilities(ctx.plan.spec).slice(ctx.source_rows))
         return source, None
     if getattr(ctx.plan.spec, "dispatch_mode", "push") == "push":
+        if rdma.enabled(ctx.plan.spec):
+            source = _workspace_tensor(ctx.workspace.source_buffer, "source_buffer")[:ctx.source_rows]
+            source.copy_(grad_output)
+            return source, None
         return grad_output, None
     source = _workspace_tensor(ctx.workspace.source_buffer, "source_buffer")[: ctx.source_rows]
     if not ctx.has_unpermute:
@@ -332,11 +343,11 @@ def _prepare_forward_execution(
         combine=combine,
         event_counters=workspace.prepare_event_counters(forward=True),
         gmm_workspace=_kernel_workspace(workspace, plan.spec),
-        intermediates=_allocate_forward_intermediates(
-            plan.spec,
-            capacity,
-            routed_tokens,
-            dispatch,
+        intermediates=(
+            replace(_allocate_forward_intermediates(plan.spec, capacity, routed_tokens, dispatch),
+                    down_proj=_workspace_tensor(workspace.return_source_buffer, "return_source_buffer")[:capacity])
+            if rdma.enabled(plan.spec)
+            else _allocate_forward_intermediates(plan.spec, capacity, routed_tokens, dispatch)
         ),
     )
 
@@ -357,7 +368,7 @@ def _prepare_backward_execution(
     """Resolve workspace, event counters, and intermediate tensors for backward."""
     dispatch = (
         torch.empty_like(saved.dispatch)
-        if plan.spec.dispatch_mode == "pull"
+        if plan.spec.dispatch_mode == "pull" and not rdma.enabled(plan.spec)
         else _workspace_tensor(workspace.expert_buffer, "expert_buffer")
     )
     grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
@@ -493,6 +504,7 @@ def _split_runtime(
     *,
     backward: bool = False,
     gradient_return: torch.Tensor | None = None,
+    rdma_suffix: bytes = b"",
     home_only: bool = False,
     cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None,
     task_prefix: GuestTaskPrefix | None = None,
@@ -502,7 +514,7 @@ def _split_runtime(
     if gradient_return is not None and (not backward or getattr(pool, "projection_ready", None) is None):
         raise ValueError("Kernel gradient metadata requires a projection-ready backward lease")
     if pool is None and (not home_only):
-        return base
+        return _runtime_image(base, rdma_suffix, cache, static=True) if rdma_suffix else base
     if pool is None:
         projection_ready = None
         values = (home, 0, 0, 0, 0)
@@ -521,7 +533,7 @@ def _split_runtime(
         )
     else:
         data = struct.pack("<II5Q", 1397774164, 2, *values)
-    runtime = _runtime_image(base, data, cache, static=projection_ready is None)
+    runtime = _runtime_image(base, data + rdma_suffix, cache, static=projection_ready is None)
     return apply_guest_task_prefix(runtime, task_prefix, base=base, cache=prefix_cache)
 
 
@@ -551,7 +563,7 @@ def _runtime_image(
 
 def _saved_dispatch_launch(plan):
     """Capture one coherent runtime/prefix choice for this diagnostic context."""
-    enabled = plan.spec._fuse_saved_dispatch and not plan.fwd_diagnostics.is_active
+    enabled = plan.spec._fuse_saved_dispatch and not plan.fwd_diagnostics.is_active and not rdma.enabled(plan.spec)
     return enabled, plan.fwd_saved_task_prefixes if enabled else plan.fwd_task_prefixes
 
 
@@ -568,6 +580,8 @@ def _launch_forward_kernel(
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
     require_normal_trace_mode(plan.fwd_diagnostics.is_active)
+    suffix = (rdma.runtime_suffix(spec, execution.event_counters, row_indices=execution.source_indices,
+                                  source_rows=metadata.source_rows_bound) if rdma.enabled(spec) else b"")
     kernel_parameters = (
         execution.dispatch,
         metadata.dispatch_target_off,
@@ -600,6 +614,7 @@ def _launch_forward_kernel(
                 runtime_config,
                 pool,
                 weight2.shape[0],
+                rdma_suffix=suffix,
                 home_only=pool is None and (bool(spec.replica_slots_per_rank) or spec.single_expert_tasks),
                 cache=execution.runtime_cache,
                 task_prefix=execution.task_prefix,
@@ -630,6 +645,7 @@ def _launch_forward_kernel(
                 diagnostic_call.runtime_config,
                 pool,
                 weight2.shape[0],
+                rdma_suffix=suffix,
                 home_only=pool is None and (bool(spec.replica_slots_per_rank) or spec.single_expert_tasks),
                 task_prefix=None if diagnostic_call.preserves_task_queues else execution.task_prefix,
             ),
@@ -695,6 +711,7 @@ def _launch_backward_kernel(
                 saved.weight2.shape[0],
                 backward=True,
                 gradient_return=gradient_return,
+                rdma_suffix=(rdma.runtime_suffix(spec, execution.event_counters) if rdma.enabled(spec) else b""),
                 home_only=pool is None and (bool(spec.replica_slots_per_rank) or spec.single_expert_tasks),
                 cache=execution.runtime_cache,
                 task_prefix=execution.task_prefix,
@@ -732,6 +749,7 @@ def _launch_backward_kernel(
                 saved.weight2.shape[0],
                 backward=True,
                 gradient_return=gradient_return,
+                rdma_suffix=(rdma.runtime_suffix(spec, execution.event_counters) if rdma.enabled(spec) else b""),
                 home_only=pool is None and (bool(spec.replica_slots_per_rank) or spec.single_expert_tasks),
                 task_prefix=None if diagnostic_call.preserves_task_queues else execution.task_prefix,
             ),
@@ -851,6 +869,33 @@ def _validate_integrated_output(spec: Any, permutation: Any, topk_weights: Any) 
         raise ValueError("Pre-FC2 weighting requires the original Top-K probabilities and permutation.")
 
 
+def _prepare_routed_forward(workspace: MegaMoeWorkspace, plan: MegaMoePlan, metadata: RouteMetadata,
+                            routed_tokens: torch.Tensor) -> _ForwardExecution:
+    """Stage the original source and indices under the same serial workspace lease."""
+    spec = plan.spec
+    payload = (metadata.original_source if rdma.enabled(spec) and metadata.original_source is not None
+               else routed_tokens)
+    source_indices = None
+    if rdma.enabled(spec) and metadata.source_row_indices is not None:
+        source_indices = _workspace_tensor(workspace.source_indices, "source_indices")
+        source_indices[:metadata.source_row_indices.numel()].copy_(metadata.source_row_indices)
+    execution = _prepare_forward_execution(workspace, plan, payload, metadata.expert_capacity)
+    if rdma.enabled(spec):
+        execution = replace(execution, source_indices=source_indices)
+    return execution
+
+
+def _save_dispatch(plan: MegaMoePlan, execution: _ForwardExecution, capacity: int) -> torch.Tensor:
+    """Keep backward inputs alive while symmetric receive storage is reused by other layers."""
+    if rdma.enabled(plan.spec):
+        saved_dispatch = execution.dispatch[:capacity].clone()
+    elif plan.spec.dispatch_mode == "pull":
+        saved_dispatch = execution.dispatch
+    else:
+        execution.intermediates.down_proj.copy_(execution.dispatch[:capacity])
+        saved_dispatch = execution.intermediates.down_proj
+    return saved_dispatch
+
 
 class _MegaMoeFunction(torch.autograd.Function):
     """Autograd bridge for the in-place forward/backward custom ops."""
@@ -896,7 +941,7 @@ class _MegaMoeFunction(torch.autograd.Function):
             routed_tokens, _, unpermute_mapping = permutation
             if ctx.needs_input_grad[0] or topk_weights is not None:
                 permutation_inputs = (unpermute_mapping,)
-        ctx.source_rows = routed_tokens.shape[0]
+        ctx.source_rows = permutation[2].numel() if permutation is not None else routed_tokens.shape[0]
         ctx.token_rows = ctx.source_rows // spec.top_k
         ctx.has_permutation = permutation is not None
         ctx.has_unpermute = topk_weights is not None
@@ -916,12 +961,7 @@ class _MegaMoeFunction(torch.autograd.Function):
             generation = None if pool is None else getattr(pool, "weight_generation", None)
             ctx.replica_weight_generation = _remember_replica_generation(generation, ctx.replica_route, workspace)
             capacity = metadata.expert_capacity
-            execution = _prepare_forward_execution(
-                workspace,
-                plan,
-                routed_tokens,
-                capacity,
-            )
+            execution = _prepare_routed_forward(workspace, plan, metadata, routed_tokens)
             saved_in_kernel, prefixes = _saved_dispatch_launch(plan)
             execution = _with_task_prefix(execution, ctx.replica_route, prefixes)
             if spec.apply_probs_before_fc2:
@@ -934,11 +974,13 @@ class _MegaMoeFunction(torch.autograd.Function):
                 execution.source,
                 weight1,
                 weight2,
-                execution, pool, stream=workspace.lease_stream)
+                execution, pool, stream=workspace.lease_stream, save_dispatch=not rdma.enabled(spec))
             output = execution.combine[:ctx.source_rows]
             if not spec.apply_probs_before_fc2:
                 output = output.clone()
-            if spec.dispatch_mode == "pull":
+            if rdma.enabled(spec):
+                saved_dispatch = execution.dispatch[:capacity].clone()
+            elif spec.dispatch_mode == "pull":
                 saved_dispatch = execution.dispatch
             else:
                 if not saved_in_kernel:
@@ -1004,6 +1046,10 @@ class _MegaMoeFunction(torch.autograd.Function):
                 empty_experts=_empty_owner_experts(ctx, saved, has_replica_transfers),
                 local_bf16=use_local_gradient_bf16(plan, ctx.replica_route, provider, (saved.weight1, saved.weight2)),
             )
+            if rdma.enabled(plan.spec):
+                execution = replace(execution, intermediates=replace(
+                    execution.intermediates, gate_dx=_workspace_tensor(
+                        workspace.return_source_buffer, "return_source_buffer")[:saved.dispatch.shape[0]]))
             prefixes = (
                 plan.bwd_task_prefixes
                 if execution.diagnostics is plan.bwd_diagnostics
