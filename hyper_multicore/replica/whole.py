@@ -152,8 +152,8 @@ def place_whole_experts(plan: ExpertExecutionPlan, *, capacity_limit: int,
         return best, selected
 
     def prune_guests() -> None:
-        """Remove transfer costs while retaining every original capacity and admission bound."""
-        ceiling = capacity_limit
+        """Remove transfer costs without undoing the selected minimax receive peak."""
+        ceiling = min(capacity_limit, max(loads))
         if not capacity_required:
             ceiling = min(ceiling, baseline_peak - 1, baseline_peak - minimum_saved_rows,
                           int(baseline_peak * (1 - minimum_load_reduction)))
