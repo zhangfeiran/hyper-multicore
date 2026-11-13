@@ -1,0 +1,11 @@
+diff --git a/src/host/mem/shmem_mgr.cpp b/src/host/mem/shmem_mgr.cpp
+--- a/src/host/mem/shmem_mgr.cpp
++++ b/src/host/mem/shmem_mgr.cpp
+@@ -105,6 +105,7 @@
+     auto target_size = size_pos->size;
+     memory_range result_range{size_pos->offset + head_skip, aligned_size};
+     size_idle_tree_.erase(size_pos);
++    address_idle_tree_.erase(target_offset);
+ 
+     if (head_skip > 0) {
+         size_idle_tree_.emplace(memory_range{target_offset, head_skip});
