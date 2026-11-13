@@ -53,6 +53,10 @@ def _hot_replay_readback_enabled() -> bool:
     return value == "1"
 
 
+_FLOAT32_EXACT_COUNT_LIMIT = 2**24
+_MAX_HISTOGRAM_EXPERTS = 512
+
+
 @dataclass(frozen=True)
 class _HomeOnlyPlan:
     """Keep an ordinary-route decision without materializing virtual CPU quotas.
@@ -646,16 +650,25 @@ def _prepare_default_replica_route(
     return _mapped_replica_route(plan, rank, group, topk_ids, summary, reused, _route_cache)
 
 
+def _use_exact_count_histogram(ids: torch.Tensor, num_experts: int) -> bool:
+    """Bound every bin coordinate and nonnegative count before using an FP32 NPU histogram."""
+    return (ids.device.type == "npu" and ids.dtype == torch.int64
+            and 1 <= num_experts <= _MAX_HISTOGRAM_EXPERTS
+            and 0 < ids.numel() <= _FLOAT32_EXACT_COUNT_LIMIT)
+
+
 def _torch_replica_count_payload(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
     """Validate and count exactly when the optional native counter is unavailable."""
     ordered = (ids.float() if num_experts <= 2**24 else ids).sort(dim=1).values
     invalid = ((ids < 0) | (ids >= num_experts)).any()
     invalid = invalid | (ordered[:, 1:] == ordered[:, :-1]).any()
-    # The clamped IDs have a known range. A fixed integer histogram avoids
-    # bincount's device min/max scalar reads while retaining exact counts.
     clamped = ids.clamp(0, num_experts - 1).flatten()
-    counts = torch.zeros(num_experts, dtype=torch.int64, device=ids.device)
-    counts.scatter_add_(0, clamped, torch.ones_like(clamped))
+    if _use_exact_count_histogram(ids, num_experts):
+        # Unit-width bins preserve exact coordinates; every accumulated integer remains at most 2**24.
+        counts = torch.histc(clamped.float(), bins=num_experts, min=0, max=num_experts).to(torch.int64)
+    else:
+        counts = torch.zeros(num_experts, dtype=torch.int64, device=ids.device)
+        counts.scatter_add_(0, clamped, torch.ones_like(clamped))
     return torch.cat((counts, invalid.reshape(1).to(counts.dtype)))
 
 
