@@ -166,6 +166,11 @@
             "path": "hyper_multicore/shmem/_build/patches/bootstrap_client_disconnect.patch",
             "sha256": "3d14e41c0b14b61ee2f819b949790fe6fb7cb0de6a7a54885ef07701fc735c59",
             "purpose": "Keep each bootstrap server alive until session clients disconnect and propagate bounded close errors"
+          },
+          {
+            "path": "hyper_multicore/shmem/_build/patches/aligned_allocation_idle_tree.patch",
+            "sha256": "1a695a49419b049ae94f02ee88d7cd5f65e93821beb5f7809430dd948f523d25",
+            "purpose": "Remove the consumed aligned free range from both allocator indexes to prevent overlapping live allocations after heap repacks"
           }
         ],
         "packaging_policy": {
