@@ -57,7 +57,7 @@ def mxfp8_window_feature_available(feature: str) -> bool:
         raise RuntimeError("MX window capability receipt has an unsupported schema.")
     if receipt.get("object") != expected:
         raise RuntimeError("MX window capability receipt names an unexpected binary.")
-    binary = vendor / "op_impl/ai_core/tbe/kernel/ascend950/pangu_mxfp8_task_graph" / expected
+    binary = vendor / "op_impl/ai_core/tbe/kernel/arch35/pangu_mxfp8_task_graph" / expected
     if hashlib.sha256(binary.read_bytes()).hexdigest() != receipt.get("sha256"):
         raise RuntimeError("MX window capability receipt does not match the loaded vendor payload.")
     return feature in receipt.get("features", ())

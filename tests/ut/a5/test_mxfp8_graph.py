@@ -219,8 +219,8 @@ class TestMXFP8Graph(unittest.TestCase):
         """
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            vendor = root / "vendors/hyper_parallel_multicore_nn"
-            kernels = vendor / "op_impl/ai_core/tbe/kernel/ascend950/pangu_mxfp8_task_graph"
+            vendor = root / "vendors/hyper_multicore_nn"
+            kernels = vendor / "op_impl/ai_core/tbe/kernel/arch35/pangu_mxfp8_task_graph"
             kernels.mkdir(parents=True)
             binary = kernels / "PanguMxfp8TaskGraph_ed65f2bbd39f9cc68999acec5148f3f8.o"
             binary.write_bytes(b"frozen-window-payload")
