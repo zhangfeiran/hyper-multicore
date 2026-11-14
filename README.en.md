@@ -133,3 +133,4 @@ and are not part of these three hooks.
 | [Architecture](docs/architecture.md) | Runtime, scheduling and operator extension |
 | [SHMEM](docs/shmem.md) | Communication resources and lifecycle |
 | [Diagnostics](docs/profiling.md) | Profiling and tensor dumps |
+| [Bounded expert replicas (Chinese)](docs/expert_replica.md) | Usage, ownership, recomputation and protocol design |

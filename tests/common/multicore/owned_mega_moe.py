@@ -21,6 +21,7 @@ import torch
 
 from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
 from hyper_multicore.experimental import MegaMoeTuningOptions
+from hyper_multicore.replica.residency import mark_replica_weights_materialized
 
 
 class OwnedMegaMoeExperts(MegaMoeExperts):
@@ -30,7 +31,7 @@ class OwnedMegaMoeExperts(MegaMoeExperts):
         """Create the executor and optional model-owned test weights."""
         ep_size = kwargs.pop("ep_size", None)
         tuning = {name: kwargs.pop(name) for name in (
-            "dispatch_mode", "initial_capacity_factor",
+            "replica_slots_per_rank", "dispatch_mode", "initial_capacity_factor",
             "capacity_growth_factor", "dispatch_split", "combine_split",
         ) if name in kwargs}
         if tuning:
@@ -61,6 +62,7 @@ class OwnedMegaMoeExperts(MegaMoeExperts):
             for expert in range(local):
                 torch.nn.init.xavier_uniform_(self.gate_up_weight[expert])
                 torch.nn.init.xavier_uniform_(self.down_weight[expert])
+            mark_replica_weights_materialized(self.gate_up_weight, self.down_weight)
         else:
             self.register_parameter("gate_up_weight", None)
             self.register_parameter("down_weight", None)

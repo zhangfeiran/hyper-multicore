@@ -17,6 +17,7 @@
 import os
 from dataclasses import replace
 
+from hyper_multicore.replica.admission import reduction_basis_points, resolve_replica_admission
 
 from .event_refresh import event_refresh_intervals
 from .gradient_queue import ACTIVE_GRADIENT_PROJECTIONS, ADAPTIVE_GRADIENT_QUEUE
@@ -38,6 +39,17 @@ def qualify_topology_schedule(spec: MegaMoeSpec, rank_nodes: tuple[int, ...]) ->
     return spec
 
 
+def summary_admission(budget: int) -> int:
+    """Resolve the default summary shortcut independently of planner execution.
+
+    Args:
+        budget: Maximum guest slots per rank.
+
+    Returns:
+        Integer admission basis points, or zero when explicitly disabled.
+    """
+    enabled = os.environ.get("HYPER_MULTICORE_MOE_SUMMARY_HOME_ADMISSION", "1") == "1"
+    return reduction_basis_points(resolve_replica_admission(None)[0]) if budget and enabled else 0
 
 
 def execution_options(dispatch_mode: str, budget: int) -> dict:
@@ -79,6 +91,7 @@ def execution_options(dispatch_mode: str, budget: int) -> dict:
         raise ValueError("HYPER_MULTICORE_MOE_SAVE_DISPATCH_LANES must be an integer in [0, 128]") from error
     if not 0 <= copy_lanes <= 128:
         raise ValueError("HYPER_MULTICORE_MOE_SAVE_DISPATCH_LANES must be in [0, 128]")
+    gradient_outputs = _gradient_output_options(budget)
     cube, vector = event_refresh_intervals()
     result = {
         "_gradient_queue_order": order,
@@ -94,5 +107,32 @@ def execution_options(dispatch_mode: str, budget: int) -> dict:
         "_compact_communication": dispatch_mode == "push"
         and os.environ.get("HYPER_MULTICORE_MOE_COMPACT_COMMUNICATION") == "1",
         "_selective_owner_gradient_init": os.environ.get("HYPER_MULTICORE_MOE_OWNER_GRADIENT_INIT") != "full",
+        "_host_replica_metadata": os.environ.get("HYPER_MULTICORE_MOE_ROUTE_METADATA") != "device",
     }
+    result.update(gradient_outputs)
+    if (
+        budget > 1
+        and os.environ.get("HYPER_MULTICORE_SHMEM_HEAP_SIZE") is None
+        and os.environ.get("HYPER_MULTICORE_MOE_ADAPTIVE_REPLICA_INBOX") == "1"
+    ):
+        result["_replica_inbox_slots"] = 1
     return result
+
+
+def _gradient_output_options(budget: int) -> dict:
+    """Validate both output requests before exposing a coherent native capability choice."""
+    local_gradient = os.environ.get("HYPER_MULTICORE_REPLICA_LOCAL_BF16")
+    if local_gradient not in (None, "0", "1"):
+        raise ValueError("HYPER_MULTICORE_REPLICA_LOCAL_BF16 must be 0 or 1")
+    final_gradient = os.environ.get("HYPER_MULTICORE_REPLICA_FINAL_BF16")
+    if final_gradient not in (None, "0", "1"):
+        raise ValueError("HYPER_MULTICORE_REPLICA_FINAL_BF16 must be 0 or 1")
+    if final_gradient == "1" and local_gradient == "0":
+        raise ValueError("Final BF16 gradients require local BF16 output support")
+    return {
+        "_local_gradient_bf16": None if budget and local_gradient is None else bool(budget) and local_gradient == "1",
+        "_final_gradient_bf16": (
+            None if budget and final_gradient is None and local_gradient != "0"
+            else bool(budget) and final_gradient == "1"
+        ),
+    }

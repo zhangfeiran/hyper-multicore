@@ -119,3 +119,5 @@ Lizard、Markdownlint、Node 和 pre-commit 不固定版本；环境需满足所
 | [架构](docs/architecture.md) | 运行时、调度与算子扩展 |
 | [SHMEM](docs/shmem.md) | 通信资源与生命周期 |
 | [诊断工具](docs/profiling.md) | Profiling 与 tensor dump |
+| [有界专家副本](docs/expert_replica.md) | 公共用法、容量、权重与重算合同 |
+| [专家副本执行设计](docs/design/expert_replica_runtime.zh-CN.md) | 无表规划、ready/band/ACK及最终梯度协议 |

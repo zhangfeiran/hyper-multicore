@@ -237,6 +237,35 @@ class TestGradientQueue(unittest.TestCase):
             self.assertIs(resources.plan_for_tokens(768, "npu"), large)
             self.assertEqual(abi.call_count, 2)
 
+    def test_auto_requires_physical_marker_support_before_changing_replica_lanes(self) -> None:
+        """Old adapters may rotate ordinary lanes but cannot interpret physical markers."""
+        spec = MegaMoeSpec(
+            local_num_tokens=128,
+            hidden_size=1536,
+            intermediate_size=768,
+            num_experts=16,
+            top_k=2,
+            initial_capacity_factor=None,
+            receive_capacity=2048,
+            ep_size=4,
+            ep_group=None,
+            rank_id=0,
+            num_cube_cores=24,
+            _gradient_queue_order="auto",
+        )
+        module = "hyper_multicore.modules.mega_moe"
+        with (
+            patch(module + ".plan.torch.device", return_value=SimpleNamespace(type="npu")),
+            patch(module + ".plan.has_adaptive_gradient_native", side_effect=lambda version: version <= 3) as abi,
+        ):
+            self.assertEqual(
+                _resolve_gradient_queue(spec, "npu")._gradient_queue_order, "device_active_lanes_act_first"
+            )
+            physical = replace(spec, replica_slots_per_rank=2, num_experts=24)
+            self.assertEqual(_resolve_gradient_queue(physical, "npu")._gradient_queue_order, "original")
+            self.assertEqual([call.args[0] for call in abi.call_args_list], [3, 4])
+            cross_node = replace(spec, _gradient_queue_order="auto_w1")
+            self.assertEqual(_resolve_gradient_queue(cross_node, "npu")._gradient_queue_order, "device_active_w1_lanes")
 
     def test_w1_join_once_keeps_queue_and_uses_full_gate_event(self) -> None:
         """Every Cube joins before its first W1; later W1 tasks need no extra wait."""
@@ -347,6 +376,25 @@ class TestGradientQueue(unittest.TestCase):
                     reverse_w1_gradient_queue(config, graph, topology)
                     self.assertEqual(list(config.cube_task_indices), cube)
 
+    def test_default_queue_does_not_filter_ep_or_replica_budget_at_construction(self) -> None:
+        """The automatic policy is the public default for arbitrary geometries."""
+        cases = [(1, 0), (8, 0), (32, 0), (64, 0), (16, 2)]
+        for ep_size, budget in cases:
+            with self.subTest(ep_size=ep_size, budget=budget), patch.dict("os.environ", {}, clear=True):
+                module = MegaMoeExperts(
+                    hidden_size=1536,
+                    intermediate_size=768,
+                    top_k=2,
+                    num_experts=4 * ep_size,
+                    ep_size=ep_size,
+                    replica_slots_per_rank=budget,
+                    create_parameters=False,
+                    expert_weight_layout="EIO" if budget else "EOI",
+                    dispatch_split=256,
+                    combine_split=128,
+                )
+                self.addCleanup(module.close)
+                self.assertEqual(module._resource_group.specification["_gradient_queue_order"], "auto")
 
     def test_order_is_part_of_resource_identity(self) -> None:
         """Differently ordered layers must not share an execution resource group."""
@@ -358,3 +406,34 @@ class TestGradientQueue(unittest.TestCase):
         self.addCleanup(original.close)
         self.addCleanup(candidate.close)
         self.assertNotEqual(original._resource_group.compatibility_key, candidate._resource_group.compatibility_key)
+
+    def test_plan_changes_only_ordinary_backward(self) -> None:
+        """Forward and actual guest schedules must keep their original images."""
+        for slots in (0, 2):
+            with self.subTest(slots=slots):
+                spec = MegaMoeSpec(
+                    local_num_tokens=512,
+                    hidden_size=5120,
+                    intermediate_size=1792,
+                    num_experts=24 + 4 * slots,
+                    top_k=8,
+                    initial_capacity_factor=1.5,
+                    receive_capacity=6144,
+                    ep_size=4,
+                    ep_group=None,
+                    rank_id=1,
+                    num_cube_cores=24,
+                    replica_slots_per_rank=slots,
+                    logical_num_experts=24,
+                )
+                _, forward, _, backward = _build_runtime_artifacts(spec)
+                _, new_forward, _, new_backward = _build_runtime_artifacts(
+                    replace(spec, _gradient_queue_order="w1_reverse")
+                )
+                self.assertEqual(bytes(forward), bytes(new_forward))
+                if slots:
+                    self.assertEqual(bytes(backward), bytes(new_backward))
+                else:
+                    self.assertNotEqual(bytes(backward), bytes(new_backward))
+                    self.assertEqual(bytes(backward.vector_task_indices), bytes(new_backward.vector_task_indices))
+                    self.assertEqual(bytes(backward.all_tasks), bytes(new_backward.all_tasks))

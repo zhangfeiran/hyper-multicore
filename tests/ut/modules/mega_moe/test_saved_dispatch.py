@@ -24,6 +24,7 @@ import numpy as np
 
 from hyper_multicore.modules.mega_moe import saved_dispatch, plan as plan_module
 from hyper_multicore.modules.mega_moe.configuration import execution_options
+from hyper_multicore.modules.mega_moe.inactive_tasks import build_guest_task_prefixes, select_guest_task_prefix
 from hyper_multicore.modules.mega_moe.plan import _build_runtime_artifacts
 from hyper_multicore.modules.mega_moe.route import _numpy_route_metadata
 from hyper_multicore.modules.mega_moe.saved_dispatch import build_saved_dispatch, resolve_saved_dispatch
@@ -36,6 +37,7 @@ from tests.ut.modules.mega_moe.saved_dispatch_simulator import simulate
 def _spec(budget=0, compact=False):
     return MegaMoeSpec(
         4096, 128, 128, 4 * (2 + budget), 2, 1.25, 16384, 4, None, 0, 4,
+        replica_slots_per_rank=budget, logical_num_experts=8,
         _compact_schedule=compact, _compact_communication=compact,
     )
 
@@ -142,10 +144,27 @@ class TestSavedDispatch(unittest.TestCase):
         ):
             with self.subTest(ep=ep, budget=budget, compact=compact, nominal=nominal):
                 spec = replace(_spec(budget, compact), local_num_tokens=512, ep_size=ep,
-                               num_experts=ep * (2 + budget), nominal_schedule=nominal)
+                               num_experts=ep * (2 + budget), logical_num_experts=ep * 2, nominal_schedule=nominal)
                 configs = [build_saved_dispatch(_build_runtime_artifacts(replace(spec, rank_id=rank))[1], spec)
                            for rank in range(ep)]
                 simulate(configs, ep, spec.local_experts, 4)
+                if not budget:
+                    continue
+                mappings = tuple(tuple(range(rank * 2, rank * 2 + 2))
+                                 + ((0,) + (-1,) * (budget - 1) if rank % 3 else (-1,) * budget)
+                                 for rank in range(ep))
+                for local in (False, True):
+                    changed = []
+                    for rank, config in enumerate(configs):
+                        prefixes = build_guest_task_prefixes(config, home_experts=2, ep_size=ep,
+                                                            rank_local_communication=local)
+                        self.assertTrue(prefixes)
+                        prefix = select_guest_task_prefix(prefixes, mappings[rank], all_slot_to_logical=mappings)
+                        image = bytearray(serialize_runtime_config(config))
+                        for offset, data in prefix.patches:
+                            image[offset:offset + len(data)] = data
+                        changed.append(type(config).from_buffer_copy(image))
+                    simulate(changed, ep, spec.local_experts, 4)
 
     def test_missing_join_credits_are_detected_by_delayed_simulator(self):
         """A false dependency proof must fail even when all task IDs remain present."""
@@ -169,13 +188,15 @@ class TestSavedDispatch(unittest.TestCase):
         original_bytes = bytes(plan.fwd_runtime_config.tolist())
         fused_bytes = bytes(plan.fwd_saved_dispatch_config.tolist())
         self.assertNotEqual(original_bytes, fused_bytes)
+        self.assertTrue(plan.fwd_task_prefixes)
+        self.assertTrue(plan.fwd_saved_task_prefixes)
         self.assertGreater(len(fused_bytes), len(original_bytes))
         self.assertIs(plan.fwd_diagnostics.runtime_config, plan.fwd_runtime_config)
 
     def test_full_shape_ep32_schedules(self):
         """The complete performance shape progresses with 24 Cube and 48 AIV lanes."""
         for compact in (False, True):
-            spec = replace(_spec(6, compact), ep_size=32, num_experts=384,
+            spec = replace(_spec(6, compact), ep_size=32, num_experts=384, logical_num_experts=192,
                            hidden_size=5120, intermediate_size=1792, top_k=8, num_cube_cores=24,
                            receive_capacity=40960)
             configs = [build_saved_dispatch(_build_runtime_artifacts(replace(spec, rank_id=rank))[1], spec)

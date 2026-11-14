@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 from hyper_multicore._core_spec import get_device_core_spec
 
+from hyper_multicore.replica.capacity import ExpertReplicaConfig
 
 _COMMUNICATION_SPLIT = 128
 _DEFAULT_CAPACITY_FACTOR = 1.25
@@ -54,23 +55,30 @@ class MegaMoeSpec:
     swiglu_limit: float | None = None
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
+    replica_slots_per_rank: int = 0
+    logical_num_experts: int = 0
+    replica_transport: str = "shmem_signal_kernel_gradient_bands"
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
     batch_experts: bool = False
     nominal_schedule: bool = False
     apply_probs_before_fc2: bool = False
+    clamp_after_activation: bool = False
     _gradient_queue_order: str = "original"
     _compact_schedule: bool = False
-    _fuse_saved_dispatch: bool = False
-    _saved_dispatch_lanes: int = 0
     _cube_event_refresh_us: int = 0
     _vector_event_refresh_us: int = 0
     _batch_empty_dispatch: bool = False
     _batch_empty_combine: bool = False
     _selective_owner_gradient_init: bool = False
+    _local_gradient_bf16: bool | None = False
+    _final_gradient_bf16: bool | None = False
+    _host_replica_metadata: bool = True
+    _replica_inbox_slots: int | None = None
     _compact_communication: bool = False
     _communication_rows: int | None = None
-    clamp_after_activation: bool = False
+    _fuse_saved_dispatch: bool = False
+    _saved_dispatch_lanes: int = 0
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -84,8 +92,18 @@ class MegaMoeSpec:
 
     @property
     def local_experts(self) -> int:
-        """Return experts owned by this expert-parallel rank."""
+        """Return execution slots on this rank, including enabled guest slots."""
         return self.num_experts // self.ep_size
+
+    @property
+    def maximum_receive_capacity(self) -> int:
+        """Return the bound for dynamic growth without requiring preallocation."""
+        if not self.replica_slots_per_rank:
+            return _align_capacity(self.ep_size * self.routed_slots)
+        upper = ExpertReplicaConfig(self.logical_num_experts, self.ep_size, 0).maximum_receive_rows(
+            self.local_num_tokens, self.top_k
+        )
+        return upper if self.dispatch_mode == "pull" else max(upper, self.receive_capacity)
 
     @property
     def routed_slots(self) -> int:
@@ -95,11 +113,7 @@ class MegaMoeSpec:
 
 def _align_capacity(capacity: int) -> int:
     """Align receive capacity to the baseline compute tile, independent of communication tiles."""
-    return (
-        (capacity + _COMMUNICATION_SPLIT - 1)
-        // _COMMUNICATION_SPLIT
-        * _COMMUNICATION_SPLIT
-    )
+    return (capacity + _COMMUNICATION_SPLIT - 1) // _COMMUNICATION_SPLIT * _COMMUNICATION_SPLIT
 
 
 def _resolve_receive_capacity(
@@ -115,11 +129,21 @@ def _resolve_receive_capacity(
 
 def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> tuple[int, int]:
     """Return geometric and minimum capacities without exceeding the lossless bound."""
-    upper = _align_capacity(spec.ep_size * spec.routed_slots)
+    upper = spec.maximum_receive_capacity
     if required > upper:
         raise ValueError("MegaMoe route exceeds the lossless token bound")
     requested = max(required, math.ceil(min(upper, current * spec.capacity_growth_factor)))
-    return min(upper, _align_capacity(requested)), _align_capacity(required)
+    return (min(upper, _align_capacity(requested)), _align_capacity(required))
+
+
+def initial_receive_capacity(specification: Mapping[str, Any]) -> int:
+    """Resolve the receive reservation independently of the physical guest slot cap."""
+    capacity = _resolve_receive_capacity(
+        specification["initial_capacity_factor"],
+        specification["local_num_tokens"] * specification["top_k"],
+        specification["ep_size"],
+    )
+    return capacity
 
 
 def _resolve_capacity_factors(
@@ -136,9 +160,11 @@ def _resolve_capacity_factors(
         return None, None
     factors = {
         "initial_capacity_factor": (
-            _DEFAULT_CAPACITY_FACTOR if initial_capacity_factor is None else initial_capacity_factor),
+            _DEFAULT_CAPACITY_FACTOR if initial_capacity_factor is None else initial_capacity_factor
+        ),
         "capacity_growth_factor": (
-            _DEFAULT_CAPACITY_FACTOR if capacity_growth_factor is None else capacity_growth_factor),
+            _DEFAULT_CAPACITY_FACTOR if capacity_growth_factor is None else capacity_growth_factor
+        ),
     }
     for name, value in factors.items():
         valid_type = isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -151,10 +177,7 @@ def _resolve_capacity_factors(
     return float(factors["initial_capacity_factor"]), float(factors["capacity_growth_factor"])
 
 
-def bind_mega_moe_spec(
-    specification: Mapping[str, Any],
-    tensor: torch.Tensor,
-) -> MegaMoeSpec:
+def bind_mega_moe_spec(specification: Mapping[str, Any], tensor: torch.Tensor) -> MegaMoeSpec:
     """Bind hardware and process-group values to the first NPU input.
 
     Args:
@@ -173,10 +196,7 @@ def bind_mega_moe_spec(
     if device.type != "npu":
         raise ValueError(f"MegaMoeExperts requires an NPU input, got {device}.")
     if tensor.dtype != torch.bfloat16:
-        raise TypeError(
-            f"MegaMoeExperts supports BF16 activations, got {tensor.dtype}."
-        )
-
+        raise TypeError(f"MegaMoeExperts supports BF16 activations, got {tensor.dtype}.")
     ep_group = specification["ep_group"]
     ep_size = specification["ep_size"]
     if dist.is_initialized():
@@ -186,9 +206,7 @@ def bind_mega_moe_spec(
         rank_id = dist.get_rank(ep_group)
     else:
         if ep_group is not None:
-            raise RuntimeError(
-                "ep_group cannot be used before torch.distributed initialization."
-            )
+            raise RuntimeError("ep_group cannot be used before torch.distributed initialization.")
         group_size = 1
         rank_id = 0
     if group_size != ep_size:
@@ -205,16 +223,15 @@ def bind_mega_moe_spec(
     top_k = specification["top_k"]
     initial_capacity_factor = specification["initial_capacity_factor"]
     swiglu_limit = specification["swiglu_limit"]
-    receive_capacity = _resolve_receive_capacity(
-        initial_capacity_factor,
-        local_num_tokens * top_k,
-        ep_size,
-    )
+    receive_capacity = initial_receive_capacity(specification)
     return MegaMoeSpec(
         local_num_tokens=local_num_tokens,
         hidden_size=specification["hidden_size"],
         intermediate_size=specification["intermediate_size"],
         num_experts=specification["num_experts"],
+        logical_num_experts=specification.get("logical_num_experts", specification["num_experts"]),
+        replica_slots_per_rank=specification.get("replica_slots_per_rank", 0),
+        replica_transport=specification.get("replica_transport", "shmem_signal_kernel_gradient_bands"),
         top_k=top_k,
         initial_capacity_factor=initial_capacity_factor,
         receive_capacity=receive_capacity,
@@ -233,14 +250,18 @@ def bind_mega_moe_spec(
         batch_experts=specification.get("batch_experts", False),
         nominal_schedule=specification.get("nominal_schedule", False),
         apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
+        clamp_after_activation=specification.get("clamp_after_activation", False),
         _gradient_queue_order=specification.get("_gradient_queue_order", "original"),
-        _fuse_saved_dispatch=specification.get("_fuse_saved_dispatch", False),
-        _saved_dispatch_lanes=specification.get("_saved_dispatch_lanes", 0),
         _cube_event_refresh_us=specification.get("_cube_event_refresh_us", 0),
         _vector_event_refresh_us=specification.get("_vector_event_refresh_us", 0),
         _batch_empty_dispatch=specification.get("_batch_empty_dispatch", False),
         _batch_empty_combine=specification.get("_batch_empty_combine", False),
         _selective_owner_gradient_init=specification.get("_selective_owner_gradient_init", False),
+        _local_gradient_bf16=specification.get("_local_gradient_bf16", False),
+        _final_gradient_bf16=specification.get("_final_gradient_bf16", False),
+        _replica_inbox_slots=specification.get("_replica_inbox_slots"),
+        _host_replica_metadata=specification.get("_host_replica_metadata", True),
         _compact_communication=specification.get("_compact_communication", False),
-        clamp_after_activation=specification.get("clamp_after_activation", False),
+        _fuse_saved_dispatch=specification.get("_fuse_saved_dispatch", False),
+        _saved_dispatch_lanes=specification.get("_saved_dispatch_lanes", 0),
     )
