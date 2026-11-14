@@ -20,6 +20,7 @@
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
+#include "runtime/empty_dispatch.h"
 #include "common/mega_moe/transport.h"
 #include "common/mega_moe/task_options.h"
 #include "common/mega_moe/routing_probabilities.h"
@@ -30,6 +31,10 @@ namespace MulticoreRuntime {
 
 class KernelWorker : public KernelWorkerBase<KernelWorker> {
  public:
+  __aicore__ inline uint64_t NormalTraceStorageBytes() const {
+    return getExtraValueFromTiling(input_list[TILING_IDX], 8);
+  }
+
   // input_list layout for hyper_mega_moe (forward):
   //   [23] = tiling params  [24] = all_event_counters  [25] = diagnostic_buffer  [16] = gmm_workspace
   static constexpr uint32_t TILING_IDX   = 23;
@@ -63,6 +68,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         break;
       case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
         ExecuteShmemPutMem(task_desc);
+        break;
+      case TaskType::TASK_SAVE_DISPATCH:
+        ExecuteSaveDispatch(task_desc);
         break;
       case TaskType::TASK_SHMEM_GET_MEM:
         ExecuteMoeShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc, input_list, input_list[TILING_IDX]);
@@ -273,6 +281,42 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     }
   }
 
+  __aicore__ inline void ExecuteSaveDispatch(const TaskDesc &task) {
+#ifndef HMC_RUNTIME_CUBE
+    const int64_t local = getExtraValueFromTiling(input_list[TILING_IDX], 2) /
+                          getExtraValueFromTiling(input_list[TILING_IDX], 1);
+    const int64_t hidden = getExtraValueFromTiling(input_list[TILING_IDX], 3);
+    const int64_t lanes = task.task_split_num / local;
+    const int64_t expert = task.task_index / lanes;
+    const int64_t active = task.task_split_value > 0 ? task.task_split_value : lanes;
+    const int64_t physical_lane = task.task_index % lanes;
+    const int64_t copy_lane = (physical_lane * active + lanes - 1) / lanes;
+    if (active <= 0 || active > lanes) {
+      AscendC::Trap();
+    }
+    // Spread active copies across AIVs. Every scheduled lane still contributes
+    // its original join credit, including those without a data movement.
+    if (copy_lane >= active || copy_lane * lanes / active != physical_lane) {
+      return;
+    }
+    const auto groups = reinterpret_cast<__gm__ int64_t *>(input_list[6]);
+    const int64_t begin = expert == 0 ? 0 : groups[expert - 1];
+    const int64_t rows = groups[expert] - begin;
+    const int64_t split = (rows + active - 1) / active;
+    const int64_t first = copy_lane * split;
+    if (first >= rows) {
+      return;
+    }
+    const int64_t count = rows - first < split ? rows - first : split;
+    const int64_t offset = (begin + first) * hidden * sizeof(DTYPE_DISPATCH_TARGET);
+    // GMM1 only reads X. Its shared completion fence also counts this local
+    // copy, so GMM2 cannot overwrite symmetric X until the owned save is done.
+    hyper_multicore::shmem::data_plane::get_pipelined<DTYPE_DISPATCH_TARGET>(
+      input_list[11] + offset, input_list[0] + offset, count * hidden,
+      hyper_multicore::shmem::data_plane::my_pe(), 0);
+#endif
+  }
+
   __aicore__ inline void ExecuteShmemPutMem(TaskDesc task_desc) {
     GM_ADDR signal = input_list[EVENT_IDX];
 
@@ -297,11 +341,16 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       partition_rows = (rows + single_expert_task_num - 1) / single_expert_task_num;
     }
     int64_t send_data_size_ = partition_rows * hidden_size;
-    const int64_t start = (task_desc.task_index % single_expert_task_num) * send_data_size_;
+    const int32_t value = task_desc.task_index % single_expert_task_num;
+    const int64_t start = static_cast<int64_t>(value) * send_data_size_;
     const int64_t end = start + send_data_size_;
     if (start >= size_) {
-      aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, 1, ACLSHMEM_SIGNAL_ADD,
-                          target_pe);
+      const int32_t credit = EmptyDispatchCredit(task_desc.extra_value_0, value, single_expert_task_num,
+                                                 start, size_, send_data_size_);
+      if (credit != 0) {
+        aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, credit,
+                           ACLSHMEM_SIGNAL_ADD, target_pe);
+      }
       return;
     } else {
       if (end > size_) {

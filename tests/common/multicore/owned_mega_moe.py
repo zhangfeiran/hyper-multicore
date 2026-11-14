@@ -15,6 +15,7 @@
 """Test-only owner for exercising MegaMoe under an ordinary model boundary."""
 
 from typing import Any
+from unittest.mock import patch
 
 import torch
 
@@ -27,8 +28,10 @@ class OwnedMegaMoeExperts(MegaMoeExperts):
 
     def __init__(self, *, create_parameters: bool = True, expert_weight_layout: str = "EIO", **kwargs: Any) -> None:
         """Create the executor and optional model-owned test weights."""
+        ep_size = kwargs.pop("ep_size", None)
         tuning = {name: kwargs.pop(name) for name in (
-            "dispatch_mode", "initial_capacity_factor", "capacity_growth_factor", "dispatch_split", "combine_split",
+            "dispatch_mode", "initial_capacity_factor",
+            "capacity_growth_factor", "dispatch_split", "combine_split",
         ) if name in kwargs}
         if tuning:
             if "tuning_options" in kwargs:
@@ -41,7 +44,12 @@ class OwnedMegaMoeExperts(MegaMoeExperts):
             if "numerics_options" in kwargs:
                 raise TypeError("Pass test numerical fields or numerics_options, not both")
             kwargs["numerics_options"] = MegaMoeNumericsOptions(**numerics)
-        super().__init__(**kwargs)
+        if ep_size is None:
+            super().__init__(**kwargs)
+        else:
+            # CPU shape tests model an explicit group without initializing HCCL.
+            with patch("hyper_multicore.modules.mega_moe.module._resolve_ep_size", return_value=ep_size):
+                super().__init__(**kwargs)
         self.expert_weight_layout = expert_weight_layout
         if create_parameters:
             hidden, intermediate, local = self.hidden_size, self.intermediate_size, self.local_experts

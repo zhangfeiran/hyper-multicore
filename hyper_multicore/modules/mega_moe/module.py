@@ -31,11 +31,15 @@ from hyper_multicore import _collective, shmem
 from hyper_multicore.modules.mega_moe.numerics import MegaMoeNumericsOptions
 from hyper_multicore.experimental import MegaMoeTuningOptions
 
+from hyper_multicore.shmem._topology import _local_node_identity, _node_ids
+
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import _INVALID_WEIGHT_MASK, prepare_topk_route, restore_topk_output
+
+from .configuration import execution_options, qualify_topology_schedule
 from .spec import (
     _COMMUNICATION_SPLIT,
     _resolve_capacity_factors,
@@ -108,8 +112,10 @@ class _MegaMoeExecutionResources:
         self.spec = bind_mega_moe_spec(bound_specification, tensor)
         self._token_capacity = self.spec.local_num_tokens
         self._plans = {}
+        self.rank_nodes = (0,) * self.spec.ep_size
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
+        self.spec = qualify_topology_schedule(self.spec, self.rank_nodes)
         reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
         added_specifications = self.heap_manager.reserve(
@@ -188,18 +194,24 @@ class _MegaMoeExecutionResources:
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
                   "dispatch_split", "combine_split", "swiglu_limit", "clamp_after_activation",
-                  "apply_probs_before_fc2", "expert_weight_layout", "ep_size", "auto_tokens")
+                  "apply_probs_before_fc2", "expert_weight_layout", "ep_size", "auto_tokens", "_gradient_queue_order",
+                  "_cube_event_refresh_us", "_vector_event_refresh_us", "_batch_empty_dispatch",
+                  "_batch_empty_combine", "_compact_communication", "_selective_owner_gradient_init",
+                  "_fuse_saved_dispatch", "_saved_dispatch_lanes")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout,
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
         # Resource groups must have the same order as their symmetric allocations.
+        manifest += (_local_node_identity(),)
         manifests = [None] * self.spec.ep_size
         dist.all_gather_object(manifests, manifest, group=self.spec.ep_group)
-        if any(value != manifests[0] for value in manifests):
+        if any(value[:-1] != manifests[0][:-1] for value in manifests):
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
+        self.rank_nodes = _node_ids([value[-1] for value in manifests])
 
     def plan_for_tokens(self, tokens: int, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
-                        batch_experts: bool = False, nominal_schedule: bool = False) -> Any:
+                        batch_experts: bool = False, nominal_schedule: bool = False,
+                        maximum_edge_rows: int | None = None) -> Any:
         """Reuse one covering plan per geometric bucket within committed capacity.
 
         Args:
@@ -209,6 +221,7 @@ class _MegaMoeExecutionResources:
                 gradients. Autograd and the caller control the final gradient dtype.
             batch_experts: Internal override for batched expert tasks.
             nominal_schedule: Internal override for compact lane selection.
+            maximum_edge_rows: Validated group maximum source-to-expert segment.
 
         Returns:
             Immutable plan covering the requested rows without enlarging storage.
@@ -222,12 +235,21 @@ class _MegaMoeExecutionResources:
             key = (key, "batched_experts")
         if nominal_schedule:
             key = (key, "nominal_schedule")
+        communication_rows = None
+        if self.spec._compact_communication and maximum_edge_rows is not None:
+            if not 0 <= maximum_edge_rows <= tokens:
+                raise ValueError("MegaMoe route exceeds the schedule's per-edge token capacity")
+            edge_bucket = 1 << (max(_COMMUNICATION_SPLIT, maximum_edge_rows) - 1).bit_length()
+            if edge_bucket < tokens:
+                communication_rows = edge_bucket
+                key = (key, edge_bucket)
         plan = self._plans.get(key)
         if plan is None or plan.spec.plan_tokens < tokens:
             schedule_tokens = min(bucket, self._token_capacity)
             options = {} if weight_grad_dtype is None else {"weight_grad_dtype": weight_grad_dtype}
             plan = build_mega_moe_plan(
-                replace(self.spec, schedule_tokens=schedule_tokens, batch_experts=batch_experts,
+                replace(self.spec, schedule_tokens=schedule_tokens, _communication_rows=communication_rows,
+                        batch_experts=batch_experts,
                         nominal_schedule=nominal_schedule), device, **options)
             # INT32 route bounds allow at most 25 buckets starting at 128 rows.
             # A growing partial bucket replaces its plan; backward keeps the old object.
@@ -325,6 +347,7 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": tuning.dispatch_split,
             "combine_split": tuning.combine_split,
         }
+        specification.update(execution_options(tuning.dispatch_mode, 0))
         specification["auto_tokens"] = True
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
@@ -625,7 +648,8 @@ class MegaMoeExperts(MulticoreModule):
                 )
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
-            plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+            plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device,
+                                             maximum_edge_rows=route.metadata.maximum_edge_rows)
             if not torch.is_grad_enabled():
                 return _execute_mega_moe_without_autograd(
                     topk_weights, *weights, route, plan, resources.workspace,

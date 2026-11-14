@@ -89,8 +89,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
 
   auto runtimeShape = context->GetInputShape(20);
   auto eventShape = context->GetInputShape(21);
+  auto diagnosticShape = context->GetInputShape(22);
   OP_CHECK_NULL_WITH_CONTEXT(context, runtimeShape);
   OP_CHECK_NULL_WITH_CONTEXT(context, eventShape);
+  OP_CHECK_NULL_WITH_CONTEXT(context, diagnosticShape);
   int64_t runtimeBytes = runtimeShape->GetStorageShape().GetShapeSize();
   int64_t eventBytes = eventShape->GetStorageShape().GetShapeSize();
   if (runtimeBytes < MIN_RUNTIME_CONFIG_BYTES || runtimeBytes >= MAX_RUNTIME_CONFIG_BYTES_EXCLUSIVE ||
@@ -100,6 +102,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   }
   tiling.set_runtimeConfigBytes(runtimeBytes);
   tiling.set_eventCounterBytes(eventBytes);
+  tiling.set_diagnosticBufferBytes(diagnosticShape->GetStorageShape().GetShapeSize());
 
   auto rawTilingData = context->GetRawTilingData();
   OP_CHECK_NULL_WITH_CONTEXT(context, rawTilingData);

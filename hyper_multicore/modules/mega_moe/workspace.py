@@ -110,6 +110,7 @@ class ProbabilityWorkspace:
     """Cache scalar-plane aliases for one allocation and one immutable plan stride."""
 
     def __init__(self, buffer: torch.Tensor, stride: int) -> None:
+        """Bind scalar aliases to the current symmetric allocation and route stride."""
         self.buffer = buffer
         self.stride = stride
         self.planes = (buffer if buffer.shape[1] == stride else
@@ -163,6 +164,7 @@ class MegaMoeWorkspace:
     capacity_floor: int = 0
     heap_manager: Any | None = field(default=None, repr=False)
     route_cache: Any | None = field(default=None, repr=False)
+    route_header_cache: Any | None = field(default=None, repr=False)
     route_header_cache: Any | None = field(default=None, repr=False)
     route_cache_probe_after: int = field(default=0, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
@@ -520,6 +522,7 @@ class MegaMoeWorkspace:
             ))
             root_group = self._root_group()
             self.closing = True
+            self.route_header_cache = None
             self.route_cache = None
             self.route_header_cache = None
             self.planned_route_cache = None

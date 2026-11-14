@@ -135,7 +135,7 @@ class TestReadyHandshakeConfig(unittest.TestCase):
         self.assertEqual(rebuilt.ready_event, values.all_event_num + 3)
         self.assertGreater(rebuilt.ready_event, 1024)
         self.assertEqual(rebuilt.all_event_num_triggers[rebuilt.ready_event], 1)
-        self.assertEqual(event_workspace_bytes(64, 1024), 1104 * 4 + 2 * 65 * 64)
+        self.assertEqual(event_workspace_bytes(64, 1024), 1120 * 4 + 2 * 65 * 64)
         with self.assertRaisesRegex(ValueError, "event_capacity"):
             configure_ready_handshake(allocate_runtime_config(16), values)
 
@@ -145,7 +145,7 @@ class TestReadyHandshakeConfig(unittest.TestCase):
         capacity = mega_moe_event_capacity(values.all_expert_num, values.ep)
         config = allocate_runtime_config(16, capacity)
         configure_ready_handshake(config, values)
-        self.assertEqual(capacity, 1136)
+        self.assertEqual(capacity, 1168)
         self.assertEqual(config.ready_event, 1114)
         self.assertLessEqual(config.ready_event + 8, capacity)
 

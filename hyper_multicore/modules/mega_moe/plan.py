@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -53,6 +53,8 @@ from hyper_multicore.scheduler.config import (
     FAST_DEPENDENCY_POLL_INTERVAL_US,
     TaskSplitValue,
 )
+from hyper_multicore.torch import ops as multicore_ops
+from hyper_multicore.scheduler.runtime import serialize_runtime_config
 from hyper_multicore.scheduler.graph import ComputeGraph
 
 from .diagnostics import _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
@@ -63,6 +65,15 @@ from .probability import (
 from .schedule_policy import (
     MegaMoeSchedulePolicy, compact_graph,
 )
+from .gradient_queue import (
+    ACT_FIRST_GRADIENT_PROJECTIONS, ACTIVE_GRADIENT_PROJECTIONS, ADAPTIVE_GRADIENT_QUEUE,
+    has_adaptive_gradient_native, mark_active_gradient_lanes, mark_device_gradient_queue,
+    require_device_gradient_native, reverse_w1_gradient_queue,
+)
+from .empty_dispatch import mark_empty_combine, mark_empty_dispatch, require_empty_dispatch_native
+from .event_refresh import apply_event_refresh
+from .saved_dispatch import saved_dispatch_images, resolve_saved_dispatch
+from .backward.storage import join_w1_phase_once, prioritize_activation_gradient
 from .spec import MegaMoeSpec
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
 
@@ -84,6 +95,7 @@ class MegaMoePlan:
     w1_grad_tiling: Any
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
+    fwd_saved_dispatch_config: Any = None
     reuse_backward_dispatch: bool = False
     weight_grad_dtype: torch.dtype | None = None
     _recorded_streams: set = field(default_factory=set, repr=False, compare=False)
@@ -153,37 +165,113 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
         all_expert_num=spec.num_experts,
         top_k=spec.top_k,
         dispatch_mode=spec.dispatch_mode,
+        communication_rows=spec._communication_rows,
     )
 
 
-def _build_runtime_artifacts(
-    spec: MegaMoeSpec, weight_grad_dtype: torch.dtype | None = None,
-) -> tuple[Any, Any, Any, Any]:
-    """Build forward/backward graphs and their serialized RuntimeConfig objects."""
-    task_values = _build_task_values(spec)
-    forward_graph = build_forward_graph(
-        task_values,
-        dispatch_sv=spec.dispatch_split,
-        swiglu_sv=spec.swiglu_split,
-        combine_sv=spec.combine_split,
-        hidden_size=spec.hidden_size,
-        intermediate_size=spec.intermediate_size,
-        num_cube_cores=spec.num_cube_cores,
-        swiglu_limit=spec.swiglu_limit,
-        clamp_after_activation=spec.clamp_after_activation,
-        apply_probs_before_fc2=spec.apply_probs_before_fc2,
-        expert_weight_layout=spec.expert_weight_layout,
+
+def _apply_gradient_order(spec, task_values, backward_data, backward_graph):
+    """Keep original queue geometry when no explicit gradient policy is selected."""
+    adaptive = spec._gradient_queue_order == ADAPTIVE_GRADIENT_QUEUE
+    join_once = adaptive or spec._gradient_queue_order in (
+        "w1_join_once",
+        "device_w1_asc_join_once",
+        "device_w1_asc_join_rotate",
     )
-    compact = (spec.dispatch_mode == "push" and spec.intermediate_size < 2048
-               and compact_graph(forward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule))
-    forward_graph.propagate_splits(task_values)
-    attach_mega_moe_l1_view_resolvers(forward_graph)
-    forward_data = build_forward_config(
-        forward_graph,
-        task_values,
-        spec.rank_id,
-        spec.num_cube_cores,
+    if join_once:
+        if not join_w1_phase_once(backward_data, spec.local_experts, spec.num_cube_cores, apply=not adaptive):
+            raise ValueError("W1 phase join requires the canonical owner-only backward queue")
+    if spec._gradient_queue_order.startswith("device_"):
+        mark_device_gradient_queue(backward_data, backward_graph, spec._gradient_queue_order)
+    if spec._gradient_queue_order == "w1_reverse":
+        reverse_w1_gradient_queue(backward_data, backward_graph, task_values)
+
+
+def _apply_execution_policies(spec, task_values, forward_data, backward_data, backward_graph):
+    """Apply validated execution options after constructing the ordinary immutable graph."""
+    _apply_gradient_order(spec, task_values, backward_data, backward_graph)
+    if spec._cube_event_refresh_us or spec._vector_event_refresh_us:
+        for runtime in (forward_data, backward_data):
+            apply_event_refresh(runtime, spec._cube_event_refresh_us, spec._vector_event_refresh_us)
+    if spec._batch_empty_dispatch and spec.dispatch_mode == "push":
+        mark_empty_dispatch(forward_data)
+        mark_empty_dispatch(backward_data)
+    if spec._batch_empty_combine and spec.dispatch_mode == "push":
+        options = {
+            "ep_size": spec.ep_size,
+            "local_experts": spec.local_experts,
+            "home_experts": spec.local_experts,
+        }
+        mark_empty_combine(forward_data, size_position=15, **options)
+        mark_empty_combine(backward_data, size_position=16, **options)
+
+
+def _resolve_compact_schedule(spec, device, automatic):
+    """Retain explicit research schedules and older adapters on their existing path."""
+    compatible = (automatic and spec.dispatch_mode == "push" and spec.expert_weight_layout == "EIO"
+                  and spec._gradient_queue_order in ("original", "device_active_w1_lanes")
+                  and spec.intermediate_size < 2048
+                  and not (spec._batch_empty_dispatch or spec._batch_empty_combine))
+    if not compatible or torch.device(device).type != "npu":
+        return spec
+    multicore_ops._load_native()  # pylint: disable=protected-access
+    version = getattr(torch.ops.hyper_multicore, "mega_moe_compact_version", None)
+    return replace(spec, _compact_schedule=version is not None and version() >= 1)
+
+
+def _soc_name(device: torch.device) -> str:
+    """Read the actual device family without importing calibration policy."""
+    return str(torch.npu.get_device_name(device)) if device.type == "npu" else ""
+
+
+def _resolve_gradient_queue(spec: MegaMoeSpec, device: Any) -> MegaMoeSpec:
+    """Resolve automatic scheduling using only the runtime ABI and projection."""
+    order = spec._gradient_queue_order
+    if order in ("auto", "auto_w1"):
+        abi = 3
+        supported = torch.device(device).type == "npu" and has_adaptive_gradient_native(abi)
+        if order == "auto":
+            candidate = "device_active_lanes_act_first"
+        else:
+            candidate = "device_active_w1_lanes"
+        return replace(spec, _gradient_queue_order=candidate if supported else "original")
+    if order in ACTIVE_GRADIENT_PROJECTIONS:
+        require_device_gradient_native(order)
+        return spec
+    if order.startswith("device_"):
+        require_device_gradient_native(order)
+    return spec
+
+
+def _qualify_gradient_order(spec, baseline, backward_config, projections, automatic):
+    """Prove complete gradient waves and receive-reader completion before reordering."""
+    act_first = spec._gradient_queue_order in ACT_FIRST_GRADIENT_PROJECTIONS
+    if projections and (
+        not mark_active_gradient_lanes(
+            backward_config, spec.local_experts, spec.num_cube_cores, projections=projections
+        )
+    ):
+        if act_first and (not automatic):
+            raise ValueError("ActGrad priority requires complete gradient tile waves")
+        act_first = False
+        spec = baseline
+    if act_first and (
+        not prioritize_activation_gradient(backward_config, spec.local_experts, spec.num_cube_cores)
+    ):
+        if not automatic:
+            raise ValueError("ActGrad priority requires a canonical owner-only backward graph")
+        act_first = False
+        spec = replace(spec, _gradient_queue_order="device_active_lanes")
+    original_reuse = can_reuse_backward_dispatch(
+        backward_config, spec.local_experts, spec.num_cube_cores, act_first=act_first
     )
+    if act_first and (not original_reuse):
+        raise ValueError("ActGrad priority failed to prove dispatch buffer reuse")
+    return (spec, act_first, original_reuse)
+
+
+def _build_backward_runtime_graph(spec, task_values, weight_grad_dtype, compact):
+    """Lower backward operands and numerical widths before runtime queue construction."""
     backward_graph = build_backward_graph(
         task_values,
         dispatch_sv=spec.dispatch_split,
@@ -204,6 +292,36 @@ def _build_runtime_artifacts(
         compact_graph(backward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule)
     backward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(backward_graph)
+    return backward_graph
+
+
+def _build_runtime_artifacts(
+    spec: MegaMoeSpec, weight_grad_dtype: torch.dtype | None = None,
+) -> tuple[Any, Any, Any, Any]:
+    """Build forward/backward graphs and their serialized RuntimeConfig objects."""
+    task_values = _build_task_values(spec)
+    forward_graph = build_forward_graph(
+        task_values,
+        dispatch_sv=spec.dispatch_split,
+        swiglu_sv=spec.swiglu_split,
+        combine_sv=spec.combine_split,
+        hidden_size=spec.hidden_size,
+        intermediate_size=spec.intermediate_size,
+        num_cube_cores=spec.num_cube_cores,
+        swiglu_limit=spec.swiglu_limit,
+        clamp_after_activation=spec.clamp_after_activation,
+        apply_probs_before_fc2=spec.apply_probs_before_fc2,
+        expert_weight_layout=spec.expert_weight_layout,
+    )
+    compact_requested = spec._compact_schedule or (
+        not spec._fuse_saved_dispatch and spec.dispatch_mode == "push" and spec.intermediate_size < 2048
+        and spec._gradient_queue_order == "original" and not (spec._batch_empty_dispatch or spec._batch_empty_combine))
+    compact = compact_requested and compact_graph(
+        forward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule)
+    forward_graph.propagate_splits(task_values)
+    attach_mega_moe_l1_view_resolvers(forward_graph)
+    forward_data = build_forward_config(forward_graph, task_values, spec.rank_id, spec.num_cube_cores)
+    backward_graph = _build_backward_runtime_graph(spec, task_values, weight_grad_dtype, compact)
     backward_data = build_backward_config(
         backward_graph,
         task_values,
@@ -217,8 +335,11 @@ def _build_runtime_artifacts(
         batch_experts=spec.batch_experts,
         dependency_poll_interval=FAST_DEPENDENCY_POLL_INTERVAL_US,
     )
-    for graph, config in ((forward_graph, forward_data), (backward_graph, backward_data)):
-        policy.apply(config, graph, task_values, spec.num_cube_cores)
+    policy.apply(forward_data, forward_graph, task_values, spec.num_cube_cores)
+    policy.apply(backward_data, backward_graph, task_values, spec.num_cube_cores)
+    if compact and not spec.batch_experts:
+        forward_data.cube_single_group = 1
+    _apply_execution_policies(spec, task_values, forward_data, backward_data, backward_graph)
     return forward_graph, forward_data, backward_graph, backward_data
 
 
@@ -250,6 +371,14 @@ def _prepare_diagnostics(
     )
 
 
+def _saved_dispatch_resources(spec, config, device):
+    """Keep ordinary diagnostics and optional saved-input buffer roles independent."""
+    if not spec._fuse_saved_dispatch:
+        return config, {}
+    original, saved = saved_dispatch_images(config, spec)
+    return original, {"fwd_saved_dispatch_config": _tensor_from_bytes(serialize_runtime_config(saved), device)}
+
+
 def build_mega_moe_plan(
     spec: MegaMoeSpec, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
 ) -> MegaMoePlan:
@@ -265,8 +394,19 @@ def build_mega_moe_plan(
     """
     if weight_grad_dtype not in (None, torch.float32):
         raise ValueError("Partial expert gradients support only the native dtype or FP32")
+    if spec._batch_empty_combine and not _soc_name(torch.device(device)).startswith("Ascend910_93"):
+        raise ValueError("Empty Combine credit batching currently requires Ascend910C")
+    if spec._batch_empty_dispatch or spec._batch_empty_combine:
+        require_empty_dispatch_native()
+    automatic = spec._gradient_queue_order in ("auto", "auto_w1")
+    spec = _resolve_compact_schedule(_resolve_gradient_queue(spec, device), device, automatic)
+    spec = resolve_saved_dispatch(spec, device)
+    projections = ACTIVE_GRADIENT_PROJECTIONS.get(spec._gradient_queue_order)
+    baseline = replace(spec, _gradient_queue_order="original") if projections else spec
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(
-        spec, weight_grad_dtype)
+        baseline, weight_grad_dtype)
+    spec, act_first, _ = _qualify_gradient_order(spec, baseline, backward_config, projections, automatic)
+    forward_config, saved_options = _saved_dispatch_resources(spec, forward_config, device)
     fwd_diagnostics, bwd_diagnostics = _prepare_diagnostics(
         spec, forward_graph, forward_config, backward_graph, backward_config, device,
     )
@@ -277,11 +417,13 @@ def build_mega_moe_plan(
                        else spec.local_experts),
         "num_cube_cores": spec.num_cube_cores,
     }
+    backward_gmm_options = {**gmm_options, "num_groups": spec.local_experts}
     return MegaMoePlan(
         spec=spec,
         weight_grad_dtype=weight_grad_dtype,
+        **saved_options,
         reuse_backward_dispatch=can_reuse_backward_dispatch(
-            backward_config, spec.local_experts, spec.num_cube_cores,
+            backward_config, spec.local_experts, spec.num_cube_cores, act_first=act_first,
         ),
         forward_graph=forward_graph,
         fwd_diagnostics=fwd_diagnostics,
@@ -306,21 +448,21 @@ def build_mega_moe_plan(
         backward_graph=backward_graph,
         bwd_diagnostics=bwd_diagnostics,
         act_grad_tiling=_tensor_from_bytes(
-            get_act_grad_tiling_bytes(backward_graph.get_op("act_grad").split_value, **gmm_options),
+            get_act_grad_tiling_bytes(backward_graph.get_op("act_grad").split_value, **backward_gmm_options),
             device,
         ),
         gate_grad_tiling=_tensor_from_bytes(
-            get_gate_grad_tiling_bytes(backward_graph.get_op("gate_grad").split_value, **gmm_options),
+            get_gate_grad_tiling_bytes(backward_graph.get_op("gate_grad").split_value, **backward_gmm_options),
             device,
         ),
         w1_grad_tiling=_tensor_from_bytes(
             get_w1_grad_tiling_bytes(backward_graph.get_op("w1_grad").split_value,
-                                    expert_weight_layout=spec.expert_weight_layout, **gmm_options),
+                                    expert_weight_layout=spec.expert_weight_layout, **backward_gmm_options),
             device,
         ),
         w2_grad_tiling=_tensor_from_bytes(
             get_w2_grad_tiling_bytes(backward_graph.get_op("w2_grad").split_value,
-                                    expert_weight_layout=spec.expert_weight_layout, **gmm_options),
+                                    expert_weight_layout=spec.expert_weight_layout, **backward_gmm_options),
             device,
         ),
         swiglu_grad_tiling=_tensor_from_bytes(

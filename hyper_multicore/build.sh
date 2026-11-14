@@ -526,6 +526,10 @@ PYCONTEXT
                 --ops-transformer-source "${HP_OPS_TRANSFORMER_SOURCE}" \
                 --work-dir "${ASSEMBLY_ROOT}"
 
+            COMPONENT_CACHE_CONTEXT="${ASSEMBLY_ROOT}/component-cache-context.json"
+            "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/component_cli.py" kernel-context \
+                --root "${PROJECT_ROOT}" --sdk "${SHMEM_INSTALL_ROOT}" --source "${SOURCE_ROOT}" \
+                --output "${COMPONENT_CACHE_CONTEXT}"
             echo "INFO: building isolated ${cann_soc} vendor input from ${SOURCE_ROOT}"
             CURRENT_REASON_CODE="CANN_VENDOR_BUILD_FAILED"
             set +e
@@ -540,7 +544,8 @@ PYCONTEXT
                     -DASCEND_PYTHON_EXECUTABLE="${PYTHON_BIN}" \
                     -DHP_MULTICORE_SOURCE_ROOT="${SOURCE_ROOT}" \
                     -DHP_SHMEM_SDK_ROOT="${SHMEM_INSTALL_ROOT}/shmem" \
-                    -DHP_VENDOR_STAGE_ROOT="${VENDOR_STAGE_ROOT}"
+                    -DHP_VENDOR_STAGE_ROOT="${VENDOR_STAGE_ROOT}" \
+                    -DHP_COMPONENT_CACHE_CONTEXT="${COMPONENT_CACHE_CONTEXT}"
                 cmake --build "${VENDOR_BUILD_ROOT}" --parallel "${NATIVE_JOBS}"
                 cmake --build "${VENDOR_BUILD_ROOT}" --parallel "${NATIVE_JOBS}" \
                     --target binary
@@ -561,7 +566,8 @@ PYCONTEXT
             CURRENT_REASON_CODE="CANN_VENDOR_VALIDATION_FAILED"
             validate_multicore_vendor "${VENDOR_CANDIDATE}" "${cann_soc}" "${KERNEL_LOG}"
             if [[ -n "${HP_VENDOR_CACHE_ROOT:-}" ]]; then
-                vendor_cache built --request "${VENDOR_REQUEST}" --candidate "${VENDOR_CANDIDATE}" --started "${VENDOR_STARTED}"
+                vendor_cache built --request "${VENDOR_REQUEST}" --candidate "${VENDOR_CANDIDATE}" --started "${VENDOR_STARTED}" \
+                    --component-directory "${ASSEMBLY_ROOT}"
             fi
             exit 0
         done <<< "${ARCH_GROUPS}"
@@ -576,6 +582,7 @@ PYCONTEXT
             PER_SOC_VENDOR_INPUTS+=("--input" "${cann_soc}=${candidate}")
             PER_SOC_HOST_INPUT_IDENTITIES+=("--host-input-identity" "${cann_soc}=${HP_VENDOR_HOST_IDENTITY}")
         done <<< "${ARCH_GROUPS}"
+
         VENDOR_ROOT="${OUTPUT_ROOT}/vendors/hyper_multicore_nn"
         mkdir -p "$(dirname "${VENDOR_ROOT}")"
         CURRENT_REASON_CODE="CANN_VENDOR_MERGE_FAILED"

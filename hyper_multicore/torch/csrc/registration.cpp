@@ -12,6 +12,11 @@
 #include <torch/library.h>
 
 TORCH_LIBRARY(hyper_multicore, m) {
+  m.def("mega_moe_saved_dispatch_version() -> int", []() -> int64_t { return 3; });
+  m.def("mega_moe_normal_trace_version() -> int", []() -> int64_t { return 1; });
+  m.def("mega_moe_compact_version() -> int", []() -> int64_t { return 1; });
+  m.def("mega_moe_adaptive_gradient_version() -> int", []() -> int64_t { return 3; });
+  m.def("mega_moe_empty_dispatch_version() -> int", []() -> int64_t { return 1; });
   m.def("moe_token_permute_out(Tensor tokens, Tensor indices, Tensor(a!) output, Tensor(b!) mapping) "
         "-> (Tensor(a!), Tensor(b!))");
   m.def(

@@ -77,6 +77,11 @@ class DiagnosticCall:
         """Return the event-counter region cleared by the execution owner."""
         return self.arguments.clear_event_counters
 
+    @property
+    def preserves_task_queues(self) -> bool:
+        """Report whether a prepared capture requires the original physical queue."""
+        return False
+
     def __enter__(self) -> DiagnosticCall:
         """Enter the native launch boundary."""
         return self

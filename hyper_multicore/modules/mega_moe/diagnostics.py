@@ -92,26 +92,42 @@ def _resolve_expert_owner(
     raise ValueError(f"MegaMoe operator type has no expert owner rule: {operator.op_type}")
 
 
+def _diagnostic_graph(graph: ComputeGraph, config: RuntimeConfigC) -> ComputeGraph:
+    """Retain static diagnostic progress without the normal ready-queue bypass."""
+    if config.vector_ready_queue:
+        count = config.task_index_num[1]
+        config.vector_task_indices[:count] = sorted(config.vector_task_indices[:count])
+    return graph
+
+
 def _mega_moe_owner_options(
     topology: TaskSplitValue,
     *,
     num_cube_cores: int,
+    compact_queues: bool = False,
 ) -> dict[str, Any]:
-    """Supply only MegaMoe's owner semantics to the shared diagnostics adapter."""
+    """Supply MegaMoe ownership and compact diagnostic scheduling."""
     if not isinstance(topology, TaskSplitValue):
         raise TypeError(f"topology must be TaskSplitValue, got {type(topology).__name__}")
     if not isinstance(num_cube_cores, int) or isinstance(num_cube_cores, bool) or num_cube_cores <= 0:
         raise ValueError(f"num_cube_cores must be a positive integer, got {num_cube_cores!r}")
     context = _MegaMoeDiagnosticContext(topology=topology, num_cube_cores=num_cube_cores)
-    return {
+    options = {
         "owner_label": MEGA_MOE_OWNER_LABEL,
         "owner_resolver": _resolve_expert_owner,
         "owner_context": context,
     }
+    if compact_queues:
+        options["graph_adapter"] = _diagnostic_graph
+    return options
+
 
 
 def _adapt_mega_moe_diagnostic_graph(graph: ComputeGraph, config: RuntimeConfigC) -> ComputeGraph:
     """Describe scheduled tasks on a diagnostic-only copy of the native graph."""
+    if config.vector_ready_queue:
+        count = config.task_index_num[1]
+        config.vector_task_indices[:count] = sorted(config.vector_task_indices[:count])
     graph = deepcopy(graph)
     queues = (config.cube_task_indices, config.vector_task_indices, config.mix_task_indices)
     scheduled = {int(task_id) for queue, count in zip(queues, config.task_index_num[:3])

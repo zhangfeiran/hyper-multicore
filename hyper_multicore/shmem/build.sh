@@ -163,6 +163,7 @@ for required_tool in cmake find gcc g++ grep make readelf readlink sed; do
             "Required SHMEM build tool not found on PATH: ${required_tool}." 4
     fi
 done
+if [[ "${CLEAN:-off}" == "on" ]]; then export HP_VENDOR_CACHE_CLEAN=1; fi
 source "${PROJECT_ROOT}/hyper_multicore/shmem/_build/shmem_sdk.sh"
 SHMEM_SDK_MANIFEST="${HP_SHMEM_HANDOFF:-${COMMON_ROOT}/sdk.json}"
 mkdir -p "$(dirname "${SHMEM_SDK_MANIFEST}")"
@@ -188,6 +189,14 @@ function build_backend() {
     # Build the private SHMEM ops library against the prepared SDK.
     CCSRC_OPS_BUILD_DIR="${HP_SHMEM_WORK_ROOT}/ccsrc-ops"
     CURRENT_REASON_CODE="SHMEM_OPS_BUILD_FAILED"
+    OPS_COMPONENT_REQUEST="${HP_SHMEM_WORK_ROOT}/component-request-shmem-ops.json"
+    OPS_COMPONENT_OUTPUT="${HP_SHMEM_WORK_ROOT}/component-shmem-ops"
+    "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/component_cli.py" prepare \
+        --root "${PROJECT_ROOT}" --kind shmem-ops --sdk "${SHMEM_INSTALL_ROOT}" \
+        --output "${OPS_COMPONENT_OUTPUT}" --request "${OPS_COMPONENT_REQUEST}"
+    if "${PYTHON_BIN}" -c 'import json,sys; sys.exit(not json.load(open(sys.argv[1]))["reused"])' "${OPS_COMPONENT_REQUEST}"; then
+        cp -a "${OPS_COMPONENT_OUTPUT}/." "${OPS_INSTALL_DIR}/"
+    else
     cmake -S "${PROJECT_ROOT}/hyper_multicore/shmem/ccsrc/ops" \
         -B "${CCSRC_OPS_BUILD_DIR}" \
         -DCMAKE_BUILD_TYPE=Release \
@@ -196,6 +205,9 @@ function build_backend() {
         -DCMAKE_INSTALL_PREFIX="${OPS_INSTALL_DIR}"
     cmake --build "${CCSRC_OPS_BUILD_DIR}" --parallel "${NATIVE_JOBS}"
     cmake --install "${CCSRC_OPS_BUILD_DIR}"
+        mkdir -p "${OPS_COMPONENT_OUTPUT}/lib"
+        cp -a "${OPS_INSTALL_DIR}/lib/${backend}" "${OPS_COMPONENT_OUTPUT}/lib/"
+    fi
     SHMEM_OPS_LIB="${OPS_INSTALL_DIR}/lib/${backend}/libhyper_multicore_shmem_ops.so"
     if [[ ! -s "${SHMEM_OPS_LIB}" ]]; then
         fail "EXPECTED_ARTIFACT_MISSING" \
@@ -237,6 +249,7 @@ function build_backend() {
         fi
     done < <(find "${OPS_INSTALL_DIR}/lib/${backend}" -type f -name '*.so' -print)
 
+    "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/component_cli.py" stage --request "${OPS_COMPONENT_REQUEST}"
     "${PYTHON_BIN}" - "${SHMEM_SDK_MANIFEST}" "${backend}" "${HP_SHMEM_INSTALL_ROOT}" \
         "${HP_SHMEM_TOOLCHAIN_KEY}" "${backend_socs}" "${sdk_soc_type}" <<'PYHANDOFF'
 import json

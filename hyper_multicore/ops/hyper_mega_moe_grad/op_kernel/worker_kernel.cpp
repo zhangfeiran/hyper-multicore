@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -20,10 +20,12 @@
 #include "swi_glu_grad/swi_glu_grad.cpp"
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
+#include "runtime/empty_dispatch.h"
 #include "runtime/worker_kernel.h"
 #include "common/mega_moe/transport.h"
 #include "common/mega_moe/task_options.h"
 #include "common/mega_moe/routing_probabilities.h"
+#include "runtime/gradient_order_policy.h"
 
 using namespace AscendC;
 
@@ -43,6 +45,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     static_cast<uint32_t>(offsetof(SwiGluTilingData, rowLen));
   static constexpr int64_t SWIGLU_DYNAMIC_FIELDS_BYTES =
     offsetof(SwiGluTilingData, baseRowLen) + sizeof(uint32_t) - SWIGLU_DYNAMIC_FIELDS_OFFSET;
+
   static constexpr uint32_t GMM_BASE_M_OFFSET = static_cast<uint32_t>(
     offsetof(GMMTilingData, gmmBaseParams) + offsetof(GMMBaseParams, m));
   static constexpr uint32_t GMM_MATMUL_M_OFFSET = static_cast<uint32_t>(
@@ -54,7 +57,39 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   static constexpr int64_t GMM_MATMUL_K_FIELDS_BYTES =
     offsetof(TCubeTiling, singleCoreK) + sizeof(int32_t) - offsetof(TCubeTiling, Ka);
 
+  __aicore__ inline void ResolveTaskDescriptor(TaskId &task_id, TaskDesc &task) {
+#ifdef HMC_RUNTIME_CUBE
+    if ((task.extra_value_0 & GRADIENT_ORDER_MAGIC_MASK) != GRADIENT_ORDER_MAGIC) return;
+    if (task.extra_value_0 == GRADIENT_LANE_MARKER || task.extra_value_0 == GRADIENT_ACTIVE_LANE_MARKER) return;
+    const uint32_t policy = (task.extra_value_0 >> 20) & 0xF;
+    const uint32_t join_event = task.extra_value_0 & GRADIENT_ORDER_EVENT_MASK;
+    const bool original_w1 = task.outputs[0].input_position == 18;
+    const uint32_t experts = task.inputs[2].dim[0];
+    ValidateGradientTask(task, experts, policy);
+    PrepareGradientOrder(task, experts, policy);
+    if (SkipGradientShape(policy, original_w1)) return;
+    const uint32_t original_expert = task.task_index / this->core_num;
+    const uint32_t lane = task.task_index % this->core_num;
+    const uint32_t own_base = task_id - task.task_index;
+    uint32_t selected = task_id;
+    if (policy == 4) {
+      if (!gradient_join_) return;
+      const uint32_t gate_base = original_w1 ? task.tiling_data_offset : own_base;
+      const uint32_t w1_base = original_w1 ? own_base : task.tiling_data_offset;
+      const uint32_t ordinal = original_expert + (original_w1 ? experts : 0);
+      selected = (ordinal % 2 ? w1_base : gate_base) + (ordinal / 2) * this->core_num + lane;
+    } else {
+      selected = own_base + gradient_order_[original_expert] * this->core_num + lane;
+    }
+    if (selected >= this->runtime_task_capacity) AscendC::Trap();
+    getTaskDesc(this->runtimeConfigPtr, &task, selected);
+    task_id = selected;
+    ApplyGradientJoin(task, policy, join_event, original_expert);
+#endif
+  }
+
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
+
     if (!IsMoeTaskOptionsValid(task_desc, WORKSPACE_IDX)) AscendC::Trap();
     switch (task_desc.task_type) {
       case TaskType::TASK_BEGIN_TASK_GRAPH:
@@ -80,6 +115,70 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
  private:
+  __aicore__ inline bool SkipGradientShape(uint32_t policy, bool original_w1) const {
+    return policy == GRADIENT_SHAPE_POLICY && (!gradient_join_ || !original_w1);
+  }
+
+  __aicore__ inline void ApplyGradientJoin(TaskDesc &task, uint32_t policy, uint32_t join_event,
+                                          uint32_t original_expert) {
+#ifdef HMC_RUNTIME_CUBE
+    if (policy == 3 || policy >= 6) {
+      if (join_event >= this->runtime_event_capacity) AscendC::Trap();
+      task.dependent_event = (policy == 3 || original_expert == 0) ? join_event : EVENT_INVALID_ID;
+    }
+#endif
+  }
+
+  bool gradient_order_ready_ = false;
+  bool gradient_join_ = false;
+  uint32_t active_w1_ = 0;
+  uint32_t active_w2_ = 0;
+  int64_t gradient_rows_[GRADIENT_ORDER_MAX_EXPERTS];
+  uint32_t gradient_order_[GRADIENT_ORDER_MAX_EXPERTS];
+
+  __aicore__ inline void ValidateGradientTask(const TaskDesc &task, uint32_t experts, uint32_t policy) {
+    if (task.task_type != TaskType::TASK_GROUPED_MATMUL ||
+        experts == 0 || experts > GRADIENT_ORDER_MAX_EXPERTS || policy < 1 || policy == 5 ||
+        policy > GRADIENT_SHAPE_POLICY) AscendC::Trap();
+    const uint32_t position = task.outputs[0].input_position;
+    if (position != 18 && !(position == 12 && policy == 4) &&
+        !(position == 6 && policy == GRADIENT_SHAPE_POLICY)) AscendC::Trap();
+  }
+
+  __aicore__ inline uint32_t GradientLaneExpert(const TaskDesc &task, uint32_t expert) {
+    const uint32_t mode = task.extra_value_0 & (GRADIENT_ORDER_MAGIC_MASK | 0x00F00000U);
+    if (mode != GRADIENT_LANE_MARKER && mode != GRADIENT_ACTIVE_LANE_MARKER &&
+        mode != (GRADIENT_ORDER_MAGIC | (7U << 20)) &&
+        !(mode == GRADIENT_SHAPE_MARKER && gradient_join_)) {
+      return GRADIENT_LANE_DISABLED;
+    }
+    const uint32_t position = task.outputs[0].input_position;
+    if (!getTransposeData(task.inputs[0].transpose_flag) ||
+        (position != 6 && position != 18)) AscendC::Trap();
+    // Called only for nonempty experts. All workers visit the same phase
+    // sequence, so the first real GEMM keeps the original lane assignment.
+    if (mode == GRADIENT_ACTIVE_LANE_MARKER) {
+      const uint32_t ordinal = position == 6 ? active_w2_++ : active_w1_++;
+      return ordinal == 0 ? GRADIENT_LANE_DISABLED : ordinal;
+    }
+    return expert;
+  }
+
+  __aicore__ inline void PrepareGradientOrder(const TaskDesc &task, uint32_t experts, uint32_t policy) {
+    if (gradient_order_ready_) return;
+    GlobalTensor<int64_t> glist;
+    glist.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[2].input_position]), experts);
+    int64_t previous = 0;
+    for (uint32_t i = 0; i < experts; ++i) {
+      const int64_t current = glist.GetValue(i);
+      if (current < previous) AscendC::Trap();
+      gradient_rows_[i] = current - previous;
+      previous = current;
+    }
+    gradient_join_ = BuildGradientExpertOrder(gradient_rows_, experts, policy, gradient_order_);
+    gradient_order_ready_ = true;
+  }
+
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
     union {
       uint32_t bits;
@@ -230,21 +329,78 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     }
   }
 
-  __aicore__ inline void PrepareGroupedMatmulList(
-      GlobalTensor<int64_t> &groups, GlobalTensor<int64_t> &scratch, GM_ADDR scratch_address,
-      int64_t experts, uint32_t index, int64_t rows, bool batched, bool single_group) {
-    if (single_group) {
-      scratch.SetValue(0, rows);
-      cacheWriteThrough(scratch_address, sizeof(int64_t));
-    } else {
-      for (uint32_t expert = 0; expert < experts; ++expert) {
-        scratch.SetValue(expert, batched ? groups.GetValue(expert) : (expert >= index ? rows : 0));
-      }
-      cacheWriteThrough(scratch_address, experts * sizeof(int64_t));
+  __aicore__ inline void PrepareOwnerGroupedTiling(const TaskDesc &task_desc, GM_ADDR grouped_list_real,
+      uint32_t expert_num_single_rank, uint32_t data_index, int64_t value, GM_ADDR tiling_data_addr) {
+    GlobalTensor<int64_t> grouped_list_tensor_real;
+    grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
+
+    const bool batched = GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED ||
+                         GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED_READY;
+    const auto *source = reinterpret_cast<__gm__ const int64_t *>(
+        input_list[task_desc.inputs[2].input_position] +
+        task_desc.inputs[2].base_ptr_offset * task_desc.inputs[2].data_type);
+    for (uint32_t i = 0; i < expert_num_single_rank; i++) {
+      grouped_list_tensor_real.SetValue(i, batched ? source[i] : (i >= data_index ? value : 0));
     }
+    cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
+
+    __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
+    if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
+      tilingdata_data->mmTilingData.Ka = value;
+      tilingdata_data->mmTilingData.Kb = value;
+      tilingdata_data->mmTilingData.singleCoreK = value;
+      cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
+    } else {
+      tilingdata_data->gmmBaseParams.m = value;
+      tilingdata_data->mmTilingData.M = value;
+      tilingdata_data->mmTilingData.singleCoreM = value;
+      cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
+      cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
+    }
+    PipeBarrier<PIPE_ALL>();
   }
 
-  __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {
+  __aicore__ inline bool UsesOwnerEoiGradient(const TaskDesc &task) const {
+    // EOI writes directly into parameter layout; preserve its validated group-list path.
+    const uint32_t position = task.outputs[0].input_position;
+    return ((position == 18 && task.inputs[0].input_position == 10) ||
+            (position == 6 && task.inputs[0].input_position == 0));
+  }
+
+
+
+  struct GroupedCall {
+    GM_ADDR groups;
+    int64_t rows;
+    bool single_group;
+    uint32_t expert;
+    uint32_t lane;
+  };
+
+  __aicore__ inline GroupedCall PrepareGroupedCall(const TaskDesc &task, uint32_t experts,
+      uint32_t expert, int64_t rows, GM_ADDR tiling) {
+    const bool batched = GetGroupedMatmulTaskMode(task) == GroupedMatmulTaskMode::BATCHED ||
+                         GetGroupedMatmulTaskMode(task) == GroupedMatmulTaskMode::BATCHED_READY;
+    if (UsesOwnerEoiGradient(task) || batched) {
+      GM_ADDR groups = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
+      PrepareOwnerGroupedTiling(task, groups, experts, expert, rows, tiling);
+      return {groups, 0, false, UINT32_MAX, GRADIENT_LANE_DISABLED};
+    }
+    return {nullptr, rows, false, expert, GradientLaneExpert(task, expert)};
+  }
+
+  __aicore__ inline int64_t ReadExpertRows(const TaskDesc &task_desc,
+      GlobalTensor<int64_t> &groups, uint32_t experts, uint32_t expert) {
+    const bool batched = GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED || GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED_READY;
+    if (batched && GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED) {
+      for (uint32_t expert = 1; expert < experts; ++expert) {
+        this->WaitForDependency(task_desc.dependent_event + expert, task_desc.extra_value_2);
+      }
+    }
+    return groups.GetValue(batched ? experts - 1 : expert);
+  }
+
+  __aicore__ inline void ExecuteGroupedMatmul(TaskDesc &task_desc) {
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
       DynamicData dynamic_data;
       getDynamicData(this->runtimeConfigPtr, &(dynamic_data));
@@ -257,64 +413,37 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         int64_t expert_num_single_rank = expert_num / ep;
         grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
 
-        GM_ADDR grouped_list_real = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
-        GlobalTensor<int64_t> grouped_list_tensor_real;
-        grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
         uint32_t data_index = task_desc.task_index / this->core_num;
-        const bool batched = IsBatchedGroupedMatmulTask(task_desc);
-        if (batched && GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED) {
-          for (uint32_t expert = 1; expert < expert_num_single_rank; ++expert) {
-            this->WaitForDependency(task_desc.dependent_event + expert, task_desc.extra_value_2);
-          }
-        }
-        int64_t value = grouped_list_tensor.GetValue(batched ? expert_num_single_rank - 1 : data_index);
+
+        int64_t value = ReadExpertRows(task_desc, grouped_list_tensor, expert_num_single_rank, data_index);
         int64_t start = 0;
         if (data_index != 0) {
           value = value - grouped_list_tensor.GetValue(data_index - 1);
           start = grouped_list_tensor.GetValue(data_index - 1);
         }
-        if (value == 0) {
-          return;
-        }
-        const bool single_group = GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::SINGLE_GROUP;
-        PrepareGroupedMatmulList(grouped_list_tensor, grouped_list_tensor_real, grouped_list_real,
-                                 expert_num_single_rank, data_index, value, batched, single_group);
-
+        if (value == 0) return;
         GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
-        __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
-        if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
-          tilingdata_data->mmTilingData.Ka = value;
-          tilingdata_data->mmTilingData.Kb = value;
-          tilingdata_data->mmTilingData.singleCoreK = value;
-          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
-        } else {
-          tilingdata_data->gmmBaseParams.m = value;
-          tilingdata_data->mmTilingData.M = value;
-          tilingdata_data->mmTilingData.singleCoreM = value;
-          cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
-          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
-        }
-        PipeBarrier<PIPE_ALL>();
+        const GroupedCall call = PrepareGroupedCall(task_desc, expert_num_single_rank, data_index, value,
+                                                     tiling_data_addr);
+        int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
+                                   ? start * task_desc.inputs[0].dim[1] * task_desc.inputs[0].data_type
+                                   : task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type;
+        int64_t input_1_offset = task_desc.inputs[1].dynamic_shape == 1
+                                   ? start * task_desc.inputs[1].dim[1] * task_desc.inputs[1].data_type
+                                   : task_desc.inputs[1].base_ptr_offset * task_desc.inputs[1].data_type;
+        int64_t output_0_offset = task_desc.outputs[0].dynamic_shape == 1
+                                    ? start * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
+                                    : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
 
-        int64_t input_0_offset = GmmRowOffset(task_desc.inputs[0], start);
-        int64_t input_1_offset = GmmRowOffset(task_desc.inputs[1], start);
-        int64_t output_0_offset = GmmRowOffset(task_desc.outputs[0], start);
-
-        if (single_group && task_desc.inputs[1].dynamic_shape != 1) {
-          input_1_offset = static_cast<int64_t>(data_index) * task_desc.inputs[1].dim[1] *
-                           task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
-        }
-        if (single_group && task_desc.outputs[0].dynamic_shape != 1) {
-          output_0_offset = static_cast<int64_t>(data_index) * task_desc.inputs[0].dim[1] *
-                            task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
-        }
+        GM_ADDR weight_base = input_list[task_desc.inputs[1].input_position];
+        GM_ADDR output_base = input_list[task_desc.outputs[0].input_position];
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position] + input_1_offset, nullptr, nullptr, nullptr,
-                       nullptr, nullptr, grouped_list_real, nullptr,
-                       input_list[task_desc.outputs[0].input_position] + output_0_offset, input_list[WORKSPACE_IDX],
+                       weight_base + input_1_offset, nullptr, nullptr, nullptr,
+                       nullptr, nullptr, call.groups, nullptr,
+                       output_base + output_0_offset, input_list[WORKSPACE_IDX],
                        tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
                        getTransposeData(task_desc.inputs[1].transpose_flag),
-                        task_desc.outputs[0].data_type == sizeof(float));
+                       task_desc.outputs[0].data_type == sizeof(float), call.rows, call.single_group, call.expert, call.lane);
       }
       return;
     }
@@ -344,11 +473,16 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       partition_rows = (rows + single_expert_task_num - 1) / single_expert_task_num;
     }
     int64_t send_data_size_ = partition_rows * hidden_size;
-    const int64_t start = (task_desc.task_index % single_expert_task_num) * send_data_size_;
+    const int32_t value = task_desc.task_index % single_expert_task_num;
+    const int64_t start = static_cast<int64_t>(value) * send_data_size_;
     const int64_t end = start + send_data_size_;
     if (start >= size_) {
-      aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, 1, ACLSHMEM_SIGNAL_ADD,
-                          target_pe);
+      const int32_t credit = EmptyDispatchCredit(task_desc.extra_value_0, value, single_expert_task_num,
+                                                 start, size_, send_data_size_);
+      if (credit != 0) {
+        aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, credit,
+                           ACLSHMEM_SIGNAL_ADD, target_pe);
+      }
       return;
     } else {
       if (end > size_) {

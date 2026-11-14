@@ -176,7 +176,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
         self.assertEqual(allocate.call_count, 4)
-        self.assertEqual(workspace.event_counter_bytes, 1104 * 4)
+        self.assertEqual(workspace.event_counter_bytes, 1120 * 4)
         for tensor in (workspace.forward_event_counters, workspace.backward_event_counters):
             self.assertEqual(tensor.numel(), event_workspace_bytes(spec.ep_size, spec.num_experts))
         for allocation in allocate.call_args_list:
@@ -214,7 +214,7 @@ class TestReadyEventWorkspace(unittest.TestCase):
     @patch.object(workspace_module.shmem, "host_barrier")
     def test_initializes_once_and_preserves_ready_tail_per_direction(self, mock_barrier, mock_free) -> None:
         """Clear stale task counters without clearing a later peer signal."""
-        workspace = MegaMoeWorkspace(shared=True, event_counter_bytes=1104 * 4)
+        workspace = MegaMoeWorkspace(shared=True, event_counter_bytes=1120 * 4)
         events = [torch.full((event_workspace_bytes(64, 1024),), 123, dtype=torch.uint8) for _ in range(2)]
         workspace.forward_event_counters, workspace.backward_event_counters = events
         for forward, tensor in zip((True, False), events):

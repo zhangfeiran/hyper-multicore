@@ -22,6 +22,7 @@ from queue import Queue, Empty
 import re
 import json
 import os
+from typing import Any
 from pathlib import Path
 import platform
 import shutil
@@ -32,6 +33,7 @@ import threading
 import time
 from . import artifacts as HELPERS, framework_environments as FRAMEWORK
 from . import vendor_cache as VENDOR
+from . import component_cache as COMPONENTS, component_inputs as COMPONENT_INPUTS
 from . import command_runner as CONSOLE, build_workspace as WORKSPACE
 from ._bootstrap import load_module
 from .command_runner import message
@@ -45,8 +47,14 @@ ROOT = Path(__file__).resolve().parents[2]
 NATIVE = ROOT / "build/native"
 
 MANIFEST = load_module("native_manifest")
+ADAPTER_TEST_TARGETS = (
+    "hyper_multicore_shmem_native_config_test",
+    "hyper_multicore_shmem_native_log_test",
+    "hyper_multicore_shmem_native_device_identity_test",
+)
 
-def probe_identity(python: Path, socs: str, run: BuildContext, *, source=None, expected=None) -> dict:
+
+def probe_identity(python: Path, socs: str, run: BuildContext, *, source: Any=None, expected: Any=None) -> dict:
     """Collect framework identity and installed versions in the target process."""
     code = (
         "import json,sys; from pathlib import Path; sys.path.insert(0,str(Path(sys.argv[1]).parent)); "
@@ -80,7 +88,7 @@ def probe_identity(python: Path, socs: str, run: BuildContext, *, source=None, e
     return identity
 
 
-def adapter_environment(python: Path, *, isolated=False) -> dict:
+def adapter_environment(python: Path, *, isolated: Any=False) -> dict:
     """Allow newer framework compilers without changing the CANN vendor toolchain."""
     env = FRAMEWORK.build_environment(python, isolated=isolated)
     if "HYPER_MULTICORE_FRAMEWORK_CXX" in env:
@@ -103,7 +111,7 @@ def build_framework(python: Path, identity: dict, common: Path, sdks: dict[str, 
     env = adapter_environment(python, isolated=run.isolated)
     compile_adapter(python, directory / "torch", payload, "torch",
                     [f"-DHP_MULTICORE_VENDOR_ROOT={common / 'lib/vendors/hyper_multicore_nn'}"],
-                    args, run, env, identifier)
+                    args, run, env, identifier, identity, None, common)
     validate_elf(payload / "libhyper_multicore_torch.so", identity["host_arch"], run.commands, env)
     for backend, sdk in sdks.items():
         selected_env = shmem_environment(env, common, sdk)
@@ -111,15 +119,18 @@ def build_framework(python: Path, identity: dict, common: Path, sdks: dict[str, 
         compile_adapter(python, directory / "shmem" / backend, output, "shmem",
                         [f"-DSHMEM_OPS_LIB={common / sdk['shmem_root'] / 'libhyper_multicore_shmem_ops.so'}",
                          f"-DHP_SHMEM_SOC_TYPE={sdk['sdk_soc_type']}"],
-                        args, run, selected_env, identifier + "-" + backend)
+                        args, run, selected_env, identifier + "-" + backend, identity, sdk, common)
         with run.commands.scope("Load"):
             load_backend(python, payload, common, sdk, backend, run, selected_env, identifier)
         validate_elf(output / "hyper_multicore_shmem_torch.so", identity["host_arch"], run.commands, selected_env)
     record = {**identity, **paths, "id": identifier,
               "native_build_identity": {k: identity[k] for k in ("build_commit", "source_sha256", "build_fingerprint")}}
+    components = [json.loads(path.read_text()) for path in directory.rglob("component-request-*.json")]
+    record["component_sources"] = [COMPONENTS.provenance(item) for item in components]
     write_json(directory / "identity.json", record)
     run.commands.add_event({"stage": "adapter", "pta_version": identity["pta_version"],
-                           "architectures": list(sdks), "compiled": True, "compiler_jobs": args.jobs})
+                           "architectures": list(sdks), "compiled": any(not item["reused"] for item in components),
+                           "compiler_jobs": args.jobs})
     return payload, record
 
 
@@ -127,6 +138,7 @@ def shmem_environment(env: dict[str, str], common: Path, sdk: dict) -> dict[str,
     """Use one backend's exact SDK for compilation and ELF dependency checks."""
     selected = env.copy()
     root = common / sdk["shmem_root"]
+    selected["HP_SHMEM_SOC_TYPE"] = sdk["sdk_soc_type"]
     selected.update(SHMEM_HOME_PATH=sdk["install_root"], SHMEM_SOURCE_DIR=str(Path(sdk["install_root"]) / "shmem"))
     selected["LD_LIBRARY_PATH"] = os.pathsep.join(
         [str(root), str(root / "shmem"), selected.get("LD_LIBRARY_PATH", "")])
@@ -134,20 +146,52 @@ def shmem_environment(env: dict[str, str], common: Path, sdk: dict) -> dict[str,
 
 
 def compile_adapter(python: Path, work: Path, output: Path, kind: str, extra: list[str],
-                    args: argparse.Namespace, run: BuildContext, env: dict[str, str], identifier: str) -> None:
+                    args: argparse.Namespace, run: BuildContext, env: dict[str, str], identifier: str,
+                    identity: dict, sdk: dict | None, common: Path) -> None:
     """Compile, test and install one real framework adapter."""
     source = "hyper_multicore/shmem/ccsrc" if kind == "shmem" else "hyper_multicore/torch"
     with run.commands.scope(kind.title()):
+        scan_started = time.monotonic()
+        selected_sdk = None if sdk is None else Path(sdk["install_root"])
+        inputs, observed, enabled = COMPONENT_INPUTS.component_inputs(
+            ROOT, kind, selected_sdk, identity, common, env)
+        if sdk is not None:
+            inputs["backend"] = {key: sdk[key] for key in ("sdk_soc_type", "shmem_root", "npu_arch")}
+        scanned = time.monotonic() - scan_started
+        request = work.parent / ("component-request-" + work.name + "-" + kind + ".json")
+        cached = work.parent / ("component-" + work.name + "-" + kind)
+        hit = COMPONENTS.prepare(request, kind, inputs, observed, COMPONENT_INPUTS.origin(ROOT), cached,
+                                 clean=getattr(args, "clean", False), enabled=enabled)
+        receipt = json.loads(request.read_text())
+        receipt["input_scan_seconds"] = scanned
+        write_json(request, receipt)
         run.commands(["cmake", "-S", str(ROOT / source), "-B", str(work),
                       "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                       f"-DPython3_EXECUTABLE={python}", f"-DCMAKE_INSTALL_PREFIX={output}", *extra],
                      label=f"configure-{identifier}-{kind}", env=env)
-        run.commands(["cmake", "--build", str(work), "--parallel", str(args.jobs), "--verbose"],
-                     label=f"compile-{identifier}-{kind}", env=env)
+        library = "hyper_multicore_shmem_torch.so" if kind == "shmem" else "libhyper_multicore_torch.so"
+        if hit:
+            output.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(cached / library, output / library)
+            if kind == "shmem":
+                for target in ADAPTER_TEST_TARGETS:
+                    shutil.copy2(cached / target, work / target)
+        else:
+            run.commands(["cmake", "--build", str(work), "--parallel", str(args.jobs), "--verbose"],
+                         label=f"compile-{identifier}-{kind}", env=env)
         if kind == "shmem":
             run.commands(["ctest", "--test-dir", str(work), "--output-on-failure"],
                          label=f"ctest-{identifier}", env=env)
-        run.commands(["cmake", "--install", str(work)], label=f"install-adapter-{identifier}-{kind}", env=env)
+        if not hit:
+            run.commands(["cmake", "--install", str(work)], label=f"install-adapter-{identifier}-{kind}", env=env)
+            cached.mkdir()
+            shutil.copy2(output / library, cached / library)
+            if kind == "shmem":
+                for target in ADAPTER_TEST_TARGETS:
+                    shutil.copy2(work / target, cached / target)
+            COMPONENTS.stage(request)
+        run.commands.add_event({"stage": "component-adapter", "kind": kind, "reused": hit,
+                                "pta_version": identity["pta_version"], "compiled": not hit})
 
 
 def load_backend(python: Path, payload: Path, common: Path, sdk: dict, backend: str,
@@ -182,7 +226,7 @@ def validate_toolchain() -> None:
         raise ValueError(f"Missing native build tools: {missing}")
 
 
-def build(args, publication) -> Path:
+def build(args: Any, publication: Any) -> Path:
     """Publish only unchanged source builds; maintenance cannot undo a commit."""
     run = BuildContext(ROOT, NATIVE)
     transaction = SourceGuard(ROOT)
@@ -191,6 +235,34 @@ def build(args, publication) -> Path:
     publication.committed = True
     finish_maintenance(args, run, result)
     return result.payload
+
+
+def vendor_component_sources(requests: list[dict]) -> list[dict]:
+    """Preserve snapshot history while reporting zero per-operator compile work on a whole-vendor hit."""
+    components = []
+    for request in requests:
+        if request["reused"]:
+            for item in request.get("origin", {}).get("components", []):
+                timings = {name: item.get(name, 0.0) for name in
+                           ("compile_seconds", "lookup_seconds", "input_scan_seconds")}
+                components.append({**item, **dict.fromkeys(timings, 0.0), "reused": True,
+                                   "snapshot_measurements": timings, "reused_via": "vendor-snapshot"})
+    return components
+
+
+def record_component_sources(run: BuildContext, common: Path, sdk: dict, outputs: list,
+                             payload: Path, info: dict) -> None:
+    """Gather SDK, operator and adapter provenance from this build's private workspaces."""
+    component_directories = (common.parent, *[output.parent for output in outputs],
+                             *[Path(item["install_root"]).parent for item in sdk.values()])
+    run.component_requests = sorted({path for directory in component_directories
+                                     for path in directory.rglob("component-request-*.json")})
+    component_sources = [COMPONENTS.provenance(json.loads(path.read_text())) for path in run.component_requests]
+    component_sources.extend(vendor_component_sources(run.vendor_requests))
+    if component_sources:
+        info["component_sources"] = component_sources
+        write_json(payload / "build_info.json", info)
+        run.events.extend({"stage": "component-cache", **item} for item in info["component_sources"])
 
 
 def _build(args, run: BuildContext, transaction: SourceGuard) -> BuildResult:
@@ -216,6 +288,7 @@ def _build(args, run: BuildContext, transaction: SourceGuard) -> BuildResult:
     if run.vendor_requests:
         info["vendor_sources"] = [{k: r[k] for k in ("soc", "origin", "reused")} for r in run.vendor_requests]
         write_json(payload / "build_info.json", info)
+    record_component_sources(run, common, sdk, outputs, payload, info)
     wheel = None if args.native_only else package_wheel(pythons[0], run, payload, info, transaction)
     transaction.check_source()
     if wheel is not None:
@@ -229,11 +302,13 @@ def _build(args, run: BuildContext, transaction: SourceGuard) -> BuildResult:
     return BuildResult(selected, pythons, len(records), started)
 
 
-def finish_maintenance(args, run: BuildContext, result: BuildResult):
+def finish_maintenance(args: Any, run: BuildContext, result: BuildResult) -> Any:
     """The artifact transaction committed; reclamation can no longer invalidate its result."""
     pythons, frameworks, started = result.pythons, result.frameworks, result.started
     maintenance_started = time.monotonic()
     try:
+        with measured(run.events, "component-cache-validation-publication"):
+            COMPONENTS.publish(run.component_requests)
         VENDOR.publish(ROOT, run.vendor_requests)
         run.events.extend({"stage": "vendor-cache-publication", "soc": r["soc"],
                            "elapsed_seconds": r["publish_seconds"]}
@@ -254,7 +329,7 @@ def finish_maintenance(args, run: BuildContext, result: BuildResult):
     build_progress_summary(args, run, frameworks, time.monotonic() - started)
 
 
-def prepare_frameworks(args, run: BuildContext):
+def prepare_frameworks(args: Any, run: BuildContext) -> Any:
     """Only matrix mode selects exact pairs; local builds use the caller's environment."""
     run.isolated = args.all
     config = ROOT / "hyper_multicore/_build/frameworks.lock.json"
@@ -283,7 +358,7 @@ def prepare_frameworks(args, run: BuildContext):
     return targets, pythons, identities
 
 
-def report_cann_reference(reference, actual):
+def report_cann_reference(reference: Any, actual: Any) -> Any:
     """The matrix reference is informational, never an environment admission gate."""
     if reference:
         message(f"CANN reference: {reference}; actual: {actual}")
@@ -294,7 +369,7 @@ def report_cann_reference(reference, actual):
         message(f"CANN actual: {actual}")
 
 
-def report_local_framework(python: Path):
+def report_local_framework(python: Path) -> Any:
     """Show installed framework facts before capability probes, without importing them."""
     message("Using locally installed framework; no environment creation or installation")
     message(f"  {'Python':<14}: {python}")
@@ -304,12 +379,13 @@ def report_local_framework(python: Path):
         message(f"  {label + ' path':<14}: {package['root']}")
 
 
-def prepare_matrix_environments(targets, run, base, socs, source):
+def prepare_matrix_environments(targets: Any, run: Any, base: Any, socs: Any, source: Any) -> Any:
     """Prepare and verify each target once, including its actual installed package versions."""
     message(f"Framework environment storage: {FRAMEWORK.environment_directory(NATIVE)}")
     pythons, identities = [], []
 
-    def collect(python, expected):
+    def collect(python: Any, expected: Any) -> Any:
+        """Probe one requested framework target."""
         identities.append(probe_identity(python, socs, run, source=source, expected=expected))
         return run.frameworks[str(python)].packages
 
@@ -321,19 +397,24 @@ def prepare_matrix_environments(targets, run, base, socs, source):
     return pythons, identities
 
 
-def build_progress_summary(args, run, frameworks: int, elapsed: float):
+def build_progress_summary(args: Any, run: Any, frameworks: int, elapsed: float) -> Any:
     """Report actual work instead of cross-build cache decisions."""
     message(f"Build succeeded in {elapsed:.1f}s; built common resources and {frameworks} framework variants")
     if run.vendor_requests:
         reused = sum(r["reused"] for r in run.vendor_requests)
-        message(f"Vendor snapshots: reused {reused}, compiled {len(run.vendor_requests) - reused}; SDK/ops rebuilt")
+        message(f"Vendor snapshots: reused {reused}, compiled {len(run.vendor_requests) - reused}")
+    components = [json.loads(path.read_text()) for path in getattr(run, "component_requests", [])]
+    if components:
+        reused = sum(item["reused"] for item in components)
+        message(f"Direct component artifacts: reused {reused}, compiled {len(components) - reused}; "
+                "configuration, load and ELF checks retained")
     if args.all:
         created = sum(event.get("stage", "").startswith("venv-") for event in run.events)
         message(f"Framework environments: created {created}, reused {frameworks - created}")
     message(f"Build log: {run.directory / 'build.log'}")
 
 
-def build_common(args, run: BuildContext, python: Path):
+def build_common(args: Any, run: BuildContext, python: Path) -> Any:
     """Use caller CANN tools for SDK/ops and cached vendor resources in either mode."""
     directory = NATIVE / "common" / WORKSPACE.safe_component(platform.machine())
     WORKSPACE.reset_workspace(directory, ROOT)
@@ -417,7 +498,8 @@ def build_vendors(command: list[str], pending: list[str], jobs: int,
         pool.shutdown(wait=True, cancel_futures=True)
 
 
-def build_adapter(index, count, python, identity, jobs, args, run, common, sdk, transaction):
+def build_adapter(index: int, count: int, python: Path, identity: dict, jobs: int, args: argparse.Namespace,
+                  run: BuildContext, common: Path, sdk: dict, transaction: SourceGuard) -> tuple:
     """Build one framework variant with private arguments and thread-local diagnostic labels."""
     selected = copy(args)
     selected.jobs = jobs
@@ -444,7 +526,8 @@ def build_adapter(index, count, python, identity, jobs, args, run, common, sdk, 
                                 "status": CONSOLE.command_status(0, error), "compiler_jobs": jobs})
 
 
-def parallel_adapters(args, run, pythons, identities, common, sdk, transaction, budgets):
+def parallel_adapters(args: argparse.Namespace, run: BuildContext, pythons: list, identities: list,
+                      common: Path, sdk: dict, transaction: SourceGuard, budgets: list) -> list:
     """Bind quotas to fixed workers so out-of-order completion cannot oversubscribe jobs."""
     targets = Queue()
     for index, (python, identity) in enumerate(zip(pythons, identities)):
@@ -453,7 +536,8 @@ def parallel_adapters(args, run, pythons, identities, common, sdk, transaction, 
     progress = threading.Lock()
     completed = 0
 
-    def slot(jobs):
+    def slot(jobs: Any) -> Any:
+        """Compile queued framework targets within one job budget."""
         nonlocal completed
         while not run.commands.cancelled.is_set():
             try:
@@ -486,7 +570,8 @@ def parallel_adapters(args, run, pythons, identities, common, sdk, transaction, 
     return results
 
 
-def build_adapters(args, run: BuildContext, pythons, identities, common, sdk, transaction: SourceGuard):
+def build_adapters(args: argparse.Namespace, run: BuildContext, pythons: list, identities: list,
+                   common: Path, sdk: dict, transaction: SourceGuard) -> tuple:
     """Compile framework variants within the shared job budget and preserve matrix order."""
     count = len(identities)
     budgets = compiler_budgets(count, args.jobs) if args.all else [args.jobs]
@@ -503,7 +588,8 @@ def build_adapters(args, run: BuildContext, pythons, identities, common, sdk, tr
     return list(outputs), list(records)
 
 
-def assemble_payload(args, run_id, identities, outputs, records, common, architectures):
+def assemble_payload(args: argparse.Namespace, run_id: str, identities: list, outputs: list,
+                     records: list, common: Path, architectures: dict) -> tuple:
     """Assemble and validate one selected payload without changing runtime registration policy."""
     staging = NATIVE / "staging" / run_id
     payload = staging / "hyper_multicore"
@@ -547,7 +633,7 @@ def assemble_payload(args, run_id, identities, outputs, records, common, archite
     return payload, info
 
 
-def package_wheel(python: Path, run: BuildContext, payload: Path, info: dict, transaction: SourceGuard):
+def package_wheel(python: Path, run: BuildContext, payload: Path, info: dict, transaction: SourceGuard) -> Any:
     """Validate the complete wheel and source state before atomically publishing its path."""
     env = FRAMEWORK.build_environment(python, isolated=run.isolated)
     env["HYPER_MULTICORE_NATIVE_OUTPUT_ROOT"] = str(payload)
@@ -589,7 +675,7 @@ def publish_build_payload(payload: Path, run_id: str, transaction: SourceGuard) 
     return selected
 
 
-def parse_arguments(argv=None):
+def parse_arguments(argv: Any=None) -> Any:
     """Resolve source-check defaults without importing frameworks or reading the matrix."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--all", action="store_true",
@@ -645,7 +731,7 @@ def main() -> None:
         raise SystemExit(1) from None
 
 
-def run_locked_build(args, publication=None):
+def run_locked_build(args: Any, publication: Any=None) -> Any:
     """Only a locked real attempt owns output cleanup and its diagnostic transcript."""
     publication = publication or WORKSPACE.BuildOutputs(ROOT / "dist", NATIVE / "payload/hyper_multicore")
     with publication:
@@ -669,7 +755,7 @@ def run_locked_build(args, publication=None):
                 raise SystemExit(1) from error
 
 
-def framework_failure(identity: dict, args, python: Path, error: RuntimeError) -> str:
+def framework_failure(identity: dict, args: Any, python: Path, error: RuntimeError) -> str:
     """Keep the real compiler diagnostic and an actionable C++20 retry command."""
     compiler = os.environ.get("HYPER_MULTICORE_FRAMEWORK_CXX", os.environ.get("CXX", "c++"))
     detail = (f"Framework build/load failed: Torch={identity['torch_version']}, PTA={identity['pta_version']}"

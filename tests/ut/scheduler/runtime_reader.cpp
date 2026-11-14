@@ -59,6 +59,7 @@ extern "C" void read_transport_and_kernel_task_types(uint32_t *result) {
   result[1] = static_cast<uint32_t>(Runtime::TaskType::TASK_MHC_POST);
   result[2] = static_cast<uint32_t>(Runtime::TaskType::TASK_GATE_SOFTPLUS);
   result[3] = static_cast<uint32_t>(Runtime::TaskType::TASK_GATE_GRAD_ZEROS);
+  result[4] = static_cast<uint32_t>(Runtime::TaskType::TASK_SAVE_DISPATCH);
 }
 
 extern "C" bool valid_runtime(uint8_t *image, uint64_t bytes, uint64_t event_bytes) {
@@ -129,6 +130,7 @@ extern "C" void read_task_option_values(uint32_t *result) {
   result[12] = static_cast<uint32_t>(Runtime::MegaMoeTransportPayload::TOKENS);
   result[13] = static_cast<uint32_t>(Runtime::MegaMoeTransportPayload::TOKENS_WITH_PROBABILITIES);
   result[14] = static_cast<uint32_t>(Runtime::MegaMoeTransportPayload::TOKENS_WITH_PROBABILITY_GRADIENTS);
+  result[15] = static_cast<uint32_t>(Runtime::TaskType::TASK_SAVE_DISPATCH);
 }
 
 extern "C" void read_protocol_profile(uint8_t *image, uint32_t *result) {

@@ -26,20 +26,18 @@
 #define HYPER_MULTICORE_CORE_MULTICORE_OPS_RUNTIME_WORKER_KERNEL_H_
 
 #include "kernel_operator.h"
+#include "core_type.h"
 #include "shmem.h"
 #include "runtime_config.hpp"
 #include "runtime_storage_bounds.h"
 #include "cycle_trace_recorder.h"
+#include "normal_task_trace.h"
 #include "l1_tensor_dump.h"
 #include "vector_ready_queue.h"
 
 
 using namespace AscendC;  // NOLINT(build/namespaces)
 
-#if (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)) || \
-    ((!defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510) && defined(__DAV_C220_CUBE__))
-#define HMC_RUNTIME_CUBE
-#endif
 
 namespace MulticoreRuntime {
 
@@ -133,6 +131,11 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void Process() {
+    const auto header = reinterpret_cast<__gm__ RuntimeHeader *>(runtimeConfigPtr);
+    if (header->padding[0] == NORMAL_TASK_TRACE_TAG) {
+      normal_trace_.Init(input_list[Derived::DIAGNOSTIC_IDX],
+                         static_cast<Derived *>(this)->NormalTraceStorageBytes(), header, worker_id_);
+    }
     ReadyHandshakeMeta meta;
     bool has_ready = LoadReadyHandshakeMeta(&meta);
     pull_protocol_ = meta.completion_event != 0;
@@ -151,9 +154,13 @@ class KernelWorkerBase {
     if (meta.completion_event != 0) {
       CompleteDeviceReads(meta);
     }
+    normal_trace_.Finish();
   }
 
  protected:
+  __aicore__ inline uint64_t NormalTraceStorageBytes() const { return 0; }
+  NormalTaskTrace normal_trace_;
+
   // Share the compute call site across diagnostics. Replicating the entire
   // inlined task dispatcher for each mode exceeds the AIV scalar stack limit.
   __aicore__ inline void ProcessTasks(DiagnosticMode mode, CycleTraceRecorder &recorder) {
@@ -259,7 +266,7 @@ class KernelWorkerBase {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
   __aicore__ inline void CompleteDeviceReads(const ReadyHandshakeMeta &meta) {
 #ifndef HMC_RUNTIME_CUBE
-    if (!IsActiveVectorWorker()) {
+    if (GetVectorScheduleIndex() == INVALID_VECTOR_SCHEDULE_INDEX) {
       return;
     }
 #endif
@@ -298,7 +305,7 @@ class KernelWorkerBase {
 #ifdef HMC_RUNTIME_CUBE
     WaitForDependency(meta.ready_event);
 #else
-    if (!IsActiveVectorWorker()) {
+    if (GetVectorScheduleIndex() == INVALID_VECTOR_SCHEDULE_INDEX) {
       return;
     }
     if (this->worker_id_ == 1) {
@@ -388,6 +395,8 @@ class KernelWorkerBase {
 #endif
   }
 
+  __aicore__ inline void ResolveTaskDescriptor(TaskId &, TaskDesc &) {}
+
   __aicore__ inline void CaptureL1TaskTensors(TaskId task_id, uint32_t phase) {
     MulticoreRuntime::CaptureL1TaskTensors(input_list[Derived::DIAGNOSTIC_IDX], input_list, task_id, phase, worker_id_);
   }
@@ -397,13 +406,26 @@ class KernelWorkerBase {
       AscendC::Trap();
     }
     getTaskDesc(this->runtimeConfigPtr, &task_desc, task_id);
+    static_cast<Derived *>(this)->ResolveTaskDescriptor(task_id, task_desc);
     if ((task_desc.dependent_event != EVENT_INVALID_ID && task_desc.dependent_event >= runtime_event_capacity) ||
         static_cast<uint64_t>(task_desc.trigger_event) + ATOMIC_ADD_VALUE_LEN > runtime_event_capacity) {
       AscendC::Trap();
     }
   }
 
+  __aicore__ inline uint64_t NormalTraceNow() const {
+    return normal_trace_.Enabled() ? normal_trace_.Now() : 0;
+  }
+
+  __aicore__ inline void RecordNormalTrace(TaskId task_id, const TaskDesc &task, uint64_t selected,
+                                          uint64_t observed, uint64_t computed) {
+    if (normal_trace_.Enabled()) {
+      normal_trace_.Record(task_id, task, selected, observed, computed, normal_trace_.Now());
+    }
+  }
+
   __aicore__ inline void ExecuteTask(TaskId task_id, DiagnosticMode mode, CycleTraceRecorder &recorder) {
+    const uint64_t selected = NormalTraceNow();
     TaskDesc task_desc;
     LoadTaskDescriptor(task_id, task_desc);
     const bool profile = mode == DiagnosticMode::PROFILE;
@@ -417,9 +439,11 @@ class KernelWorkerBase {
                         start, recorder.Now());
       }
     }
+    const uint64_t observed = NormalTraceNow();
     if (dump) CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_BEFORE);
     const uint64_t compute_start = profile ? recorder.Now() : 0;
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
+    const uint64_t computed = NormalTraceNow();
     if (profile) {
       const uint64_t compute_end = recorder.Now();
       uint32_t desc_id = getTaskProfileDescId(this->runtimeConfigPtr, task_id);
@@ -440,6 +464,7 @@ class KernelWorkerBase {
                         start, recorder.Now());
       }
     }
+    RecordNormalTrace(task_id, task_desc, selected, observed, computed);
   }
 
   __aicore__ inline void WaitForDependency(uint32_t event_index, uint32_t poll_interval_us = 0) {
@@ -487,9 +512,7 @@ class KernelWorkerBase {
 
   bool pull_protocol_ = false;
   uint32_t worker_id_ = 0;
-#if !(defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510)
   bool ready_queue_ = false;
-#endif
   uint32_t grouped_matmul_group_list_offset_ = 0;
   uint32_t task_num = 0;
   uint32_t runtime_task_capacity = 0;

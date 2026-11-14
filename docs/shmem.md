@@ -443,3 +443,7 @@ SHMEM没有独立对外构建开关。根 `bash build.sh` 必须构建 Torch Mul
 首次使用SHMEM时查询可见逻辑设备0的架构，并按绝对路径加载对应SDK、ops和binding，不创建NPU上下文。
 进程可见设备须属于同一架构；Runtime初始化仍校验调用方当前设备。制品不携带RPATH或RUNPATH，
 `set_env.bash`激活vendor路径，SHMEM库不通过全局搜索路径选择。详见[构建与使用](build.md)。
+
+`put` 和 `get` 可显式传入 `use_sdma=True`，在当前 NPU stream 上复制到直接映射的 peer。
+该选项要求 CANN 能映射对应的对称地址；无法映射时返回错误。默认调用保留原来的 SHMEM RMA 路径。
+返回仍然只表示已经入队，接收方需使用对应 ready/ACK 协议确认数据完成。

@@ -14,6 +14,8 @@
 # ============================================================================
 """Fast source-build checks using temporary data and no framework or device runtime."""
 
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from contextlib import contextmanager, ExitStack, nullcontext, redirect_stderr, redirect_stdout
 import fcntl
 import hashlib
@@ -44,6 +46,9 @@ BOOTSTRAP = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = BOOTSTRAP
 SPEC.loader.exec_module(BOOTSTRAP)
 BUILD = BOOTSTRAP.load_module("build_controller")
+CACHE = BOOTSTRAP.load_module("component_cache")
+INPUTS = BOOTSTRAP.load_module("component_inputs")
+KERNEL = BOOTSTRAP.load_module("kernel_cache")
 PUBLICATION = BOOTSTRAP.load_module("build_publication")
 FRAMEWORK = BOOTSTRAP.load_module("framework_environments")
 VENDOR = BOOTSTRAP.load_module("vendor_cache")
@@ -52,7 +57,7 @@ ARTIFACTS = BOOTSTRAP.load_module("artifacts")
 MERGE = BOOTSTRAP.load_module("merge_multicore_vendors")
 
 
-def write(path, text="fixture"):
+def write(path: Any, text: Any="fixture") -> Any:
     """Create one small fixture without touching checkout outputs."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -64,10 +69,32 @@ def git(directory: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(directory), *args], text=True).strip()
 
 
+class _AdapterCommands:
+    """Provide the build command interface around an observable fixture callback."""
+
+    def __init__(self, callback: Any) -> None:
+        """Retain the fixture callback used to observe command execution."""
+        self.callback = callback
+
+    def __call__(self, command: list[str], **kwargs: Any) -> Any:
+        """Run one fixture command with the original arguments."""
+        return self.callback(command, **kwargs)
+
+    @staticmethod
+    def scope(_name: str) -> Any:
+        """Keep a command scope without changing fixture behavior."""
+        return nullcontext()
+
+    @staticmethod
+    def add_event(_event: dict) -> None:
+        """Accept stage records without coupling assertions to timing."""
+        return None
+
+
 class BuildChecks(unittest.TestCase):
     """Protect dependency requests, cached kernels, output commits and owned paths."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Keep every filesystem effect and environment setting local to this check."""
         self.resources = ExitStack()
         self.addCleanup(self.resources.close)
@@ -183,6 +210,16 @@ class BuildChecks(unittest.TestCase):
                     write(Path(kwargs["env"]["HP_SHMEM_HANDOFF"]), json.dumps({"architectures": self.handoff}))
                     return json.dumps({"ops_nn_source": "nn", "ops_transformer_source": "transformer",
                                        "host_input_identity": "f" * 64, "pending": list(self.handoff)})
+                if command[:2] == ["cmake", "--install"]:
+                    configured = next(c for c in reversed(self.calls) if c[:2] == ["cmake", "-S"])
+                    output = Path(next(arg.split("=", 1)[1] for arg in configured
+                                       if arg.startswith("-DCMAKE_INSTALL_PREFIX=")))
+                    kind = "shmem" if "shmem" in str(command[2]) else "torch"
+                    write(output / ("hyper_multicore_shmem_torch.so" if kind == "shmem"
+                                    else "libhyper_multicore_torch.so"))
+                    if kind == "shmem":
+                        for target in BUILD.ADAPTER_TEST_TARGETS:
+                            write(Path(command[2]) / target)
                 return None
 
         previous_common = None
@@ -204,7 +241,9 @@ class BuildChecks(unittest.TestCase):
                     patch.multiple(BUILD, ROOT=self.root, NATIVE=self.root / "native", _source_identity=lambda _: {},
                                    adapter_environment=lambda *a, **kw: {}, validate_elf=lambda *a: None,
                                    load_backend=lambda *a: None), \
-                    patch.object(FRAMEWORK, "cann_tool_environment", return_value={}):
+                    patch.object(FRAMEWORK, "cann_tool_environment", return_value={}), \
+                    patch.object(BUILD.COMPONENT_INPUTS, "component_inputs", return_value=({}, {}, False)), \
+                    patch.object(BUILD.COMPONENT_INPUTS, "origin", return_value={}):
                 if mismatch:
                     with self.assertRaises(ValueError):
                         BUILD.build_common(args, run, Path(sys.executable))
@@ -390,6 +429,11 @@ while not Path(sys.argv[1]).exists():
                      "build_utils.py", "command_runner.py"):
             relative = "hyper_multicore/_build/" + name
             write(project / relative, (ROOT / relative).read_text())
+        write(project / "hyper_multicore/_build/component_cli.py",
+              "import json, pathlib, sys\n"
+              "if sys.argv[1] == 'prepare':\n"
+              " p = pathlib.Path(sys.argv[sys.argv.index('--request')+1]); "
+              "p.parent.mkdir(parents=True, exist_ok=True); p.write_text(json.dumps({'reused': False}))\n")
         tools = directory / "tools"
         for name in ("bisheng", "cmake", "gcc", "g++"):
             write(tools / name, '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TOOL_CALLS"\n').chmod(0o755)
@@ -658,7 +702,8 @@ time.sleep(30)
                               "dependencies_extra": ["https://mirror.example/simple"]}}
         commands = []
 
-        def run(command, **_kwargs):
+        def run(command: Any, **_kwargs: Any) -> Any:
+            """Run the isolated framework fixture command."""
             commands.append(command)
             if "--dest" in command:
                 name, version = command[-1].split("==")
@@ -670,7 +715,8 @@ time.sleep(30)
             if "--report" in command:
                 write(Path(command[command.index("--report") + 1]), '{"install": []}')
 
-        def probe(python, expected):
+        def probe(python: Any, expected: Any) -> Any:
+            """Return the controlled framework identity."""
             self.assertEqual(python.parent.parent.parent, self.root / "envs")
             self.assertEqual(expected, {"torch": "1.0.0", "torch-npu": "1.0.0"})
             probes.append(expected)
@@ -766,7 +812,7 @@ time.sleep(30)
             self.assertFalse(json.loads(request.read_text(encoding="utf-8"))["reused"])
 
     @contextmanager
-    def staged_build(self):
+    def staged_build(self) -> Any:
         """Run actual publication with only expensive preparation and native workers replaced."""
         candidate = write(self.root / "staging/candidate/new.so").parent
         wheel = write(self.root / "staging/candidate.whl")
@@ -776,7 +822,8 @@ time.sleep(30)
         replacements = {
             "ROOT": self.root, "NATIVE": self.root / "native", "validate_toolchain": lambda: None,
             "prepare_frameworks": lambda *_: ([], [Path(sys.executable)], [{}]),
-            "build_common": lambda *_: (self.root / "common", self.root / "sdk"),
+            "build_common": lambda *_: (self.root / "common",
+                                        {"arch22": {"install_root": str(self.root / "sdk/install")}}),
             "build_adapters": lambda *_: ([], [{"pta_version": "fixture"}]),
             "assemble_payload": lambda *_: (candidate, {}), "package_wheel": lambda *_: wheel,
         }
@@ -792,6 +839,37 @@ time.sleep(30)
             self.assertFalse(outputs.committed)
             self.assertFalse(outputs.payload.exists())
             self.assertFalse(list(outputs.distribution.iterdir()))
+
+    def test_adapter_hit_restores_all_ctest_executables(self):
+        """Warm SHMEM configuration executes all native checks without compiling again."""
+        work, output = self.root / "variant/shmem/arch22", self.root / "payload"
+        calls = []
+
+        def commands(command: list[str], **_kwargs: Any) -> None:
+            """Observe the actual CTest invocation and its restored executables."""
+            calls.append(command)
+            if command[0] == "ctest":
+                self.assertTrue(all((work / name).is_file() for name in BUILD.ADAPTER_TEST_TARGETS))
+
+        run = SimpleNamespace(commands=_AdapterCommands(commands))
+        sdk = {"install_root": str(self.root / "sdk"), "sdk_soc_type": "Ascend910B",
+               "shmem_root": "shmem/lib/arch22", "npu_arch": 2201}
+        cached = work.parent / "component-arch22-shmem"
+        for name in ("hyper_multicore_shmem_torch.so", *BUILD.ADAPTER_TEST_TARGETS):
+            write(cached / name)
+        receipt = work.parent / "component-request-arch22-shmem.json"
+        write(receipt, "{}")
+        with patch.object(BUILD, "ROOT", self.root), \
+                patch.object(INPUTS, "component_inputs", return_value=({}, {}, True)), \
+                patch.object(INPUTS, "origin", return_value={}), \
+                patch.object(CACHE, "prepare", return_value=True):
+            work.mkdir(parents=True)
+            BUILD.compile_adapter(Path(sys.executable), work, output, "shmem", [],
+                                  SimpleNamespace(jobs=1), run, {}, "fixture",
+                                  {"pta_version": "fixture"}, sdk, self.root)
+        self.assertTrue((output / "hyper_multicore_shmem_torch.so").is_file())
+        self.assertFalse(any(command[:2] == ["cmake", "--build"] for command in calls))
+        self.assertEqual(sum(command[0] == "ctest" for command in calls), 1)
 
     def test_maintenance_failure_retains_committed_outputs(self):
         """Maintenance cannot undo the successfully committed artifact pair."""
@@ -845,6 +923,274 @@ time.sleep(30)
                 PUBLICATION.validate_wheel_payload(archive, members, payload, info)
             with self.assertRaisesRegex(ValueError, "membership mismatch"):
                 PUBLICATION.validate_wheel_payload(archive, [], payload, info)
+
+
+class TestComponentCache(unittest.TestCase):
+    """Only completed, unchanged components from committed builds may become shared hits."""
+
+    def setUp(self) -> None:
+        """Prepare isolated component inputs and register deterministic cleanup."""
+        self.root = Path(tempfile.mkdtemp(prefix="hyper-multicore-component-check-"))
+        self.addCleanup(shutil.rmtree, self.root)
+        self.environment = patch.dict(os.environ, {"HYPER_MULTICORE_NATIVE_CACHE": str(self.root / "cache")})
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        self.source = write(self.root / "source.cpp", "input")
+        self.inputs = {"abi": "cp311-abi1", "source": CACHE.sha256(self.source)}
+
+    def _request(self, name="first", *, inputs=None, clean=False):
+        request = self.root / name / "request.json"
+        output = self.root / name / "output"
+        hit = CACHE.prepare(request, "operator", inputs or self.inputs,
+                            {str(self.source): CACHE.sha256(self.source)}, {"root": name, "commit": name},
+                            output, clean=clean)
+        return request, output, hit
+
+    def _staged(self, name="first", **kwargs):
+        request, output, hit = self._request(name, **kwargs)
+        self.assertFalse(hit)
+        write(output / "kernel.o", "binary")
+        write(output / "kernel.json", "metadata")
+        CACHE.stage(request)
+        return request
+
+    def test_staging_is_not_publication(self):
+        self._staged()
+        _, _, hit = self._request("second")
+        self.assertFalse(hit)
+
+    def test_cross_location_hit_preserves_actual_producer(self):
+        request = self._staged()
+        CACHE.publish([request])
+        restored, output, hit = self._request("other-worktree")
+        self.assertTrue(hit)
+        receipt = json.loads(restored.read_text())
+        self.assertEqual(receipt["origin"]["commit"], "first")
+        self.assertEqual(receipt["current_origin"]["root"], "other-worktree")
+        self.assertEqual(CACHE.files_in(output), receipt["files"])
+
+    def test_source_and_abi_changes_miss(self):
+        CACHE.publish([self._staged()])
+        for index, changed in enumerate(({**self.inputs, "abi": "cp310-abi0"},
+                                         {**self.inputs, "source": "different"})):
+            with self.subTest(index=index):
+                self.assertFalse(self._request(str(index), inputs=changed)[2])
+
+    def test_clean_bypasses_without_destroying_shared_entry(self):
+        CACHE.publish([self._staged()])
+        self.assertFalse(self._request("clean", clean=True)[2])
+        self.assertTrue(self._request("later")[2])
+
+    def test_missing_corrupt_or_extra_members_are_misses(self):
+        request = self._staged()
+        CACHE.publish([request])
+        record = json.loads(request.read_text())
+        entry = Path(record["cache_root"]) / record["name"] / record["key"]
+        for index, action in enumerate(("corrupt", "missing", "extra")):
+            CACHE.publish([request])
+            if action == "corrupt":
+                (entry / "payload/kernel.o").write_text("damaged")
+            elif action == "missing":
+                (entry / "payload/kernel.json").unlink()
+            else:
+                write(entry / "payload/extra", "unexpected")
+            self.assertFalse(self._request(f"damaged-{index}")[2])
+
+    def test_input_change_refuses_publication(self):
+        request = self._staged()
+        self.source.write_text("changed during compilation")
+        with self.assertRaisesRegex(ValueError, "input changed"):
+            CACHE.publish([request])
+        self.assertFalse(self._request("after-failure")[2])
+
+    def test_staged_output_change_refuses_publication(self):
+        request = self._staged()
+        receipt = json.loads(request.read_text())
+        (Path(receipt["staged"]) / "kernel.o").write_text("changed")
+        with self.assertRaisesRegex(ValueError, "Staged component changed"):
+            CACHE.publish([request])
+
+    def test_redirected_cache_is_not_followed(self):
+        external = self.root / "external"
+        external.mkdir()
+        (self.root / "cache").symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "Symlinked"):
+            self._request()
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_redirected_output_is_not_followed(self):
+        CACHE.publish([self._staged()])
+        external = self.root / "external"
+        external.mkdir()
+        (self.root / "second").mkdir()
+        (self.root / "second/output").symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "Redirected"):
+            self._request("second")
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_simultaneous_publishers_produce_one_complete_entry(self):
+        requests = [self._staged("producer-a"), self._staged("producer-b")]
+        with ThreadPoolExecutor(2) as pool:
+            list(pool.map(lambda request: CACHE.publish([request]), requests))
+        request, _, hit = self._request("reader")
+        self.assertTrue(hit)
+        self.assertIn(json.loads(request.read_text())["origin"]["commit"], {"producer-a", "producer-b"})
+
+    def test_launcher_preserves_make_jobserver_descriptors(self):
+        reader, writer = os.pipe()
+        try:
+            with patch.dict(os.environ, {"MAKEFLAGS": f"-j12 --jobserver-auth={reader},{writer}"}):
+                code = f"import os;os.fstat({reader});os.write({writer},b'x')"
+                self.assertEqual(KERNEL.run_command([sys.executable, "-c", code]), 0)
+            self.assertEqual(os.read(reader, 1), b"x")
+        finally:
+            os.close(reader)
+            os.close(writer)
+
+    def test_whole_vendor_hit_separates_snapshot_timing_from_current_work(self):
+        component = {"name": "operator", "key": "key", "origin": {"commit": "producer"},
+                     "files": {"kernel.o": "sha"}, "reused": False, "compile_seconds": 312.0,
+                     "lookup_seconds": 0.2, "input_scan_seconds": 0.5}
+        before = deepcopy(component)
+        request = {"reused": True, "origin": {"components": [component]}}
+        result = BUILD.vendor_component_sources([request])[0]
+        self.assertEqual(result["compile_seconds"], 0.0)
+        self.assertEqual(result["lookup_seconds"], 0.0)
+        self.assertEqual(result["snapshot_measurements"]["compile_seconds"], 312.0)
+        self.assertEqual(result["origin"], component["origin"])
+        self.assertEqual(component, before)
+        self.assertEqual(BUILD.vendor_component_sources([{**request, "reused": False}]), [])
+
+
+class TestSelectedInputs(unittest.TestCase):
+    """Verify real file changes invalidate keys and unsupported compiler injection disables reuse."""
+
+    def setUp(self) -> None:
+        """Prepare isolated component inputs and register deterministic cleanup."""
+        self.root = Path(tempfile.mkdtemp(prefix="hyper-multicore-component-check-"))
+        self.addCleanup(shutil.rmtree, self.root)
+        self.cann = self.root / "toolkit"
+        write(self.cann / "opp/version.info", "Version=fixture")
+        self.header = write(self.cann / "include/header.h", "header")
+        self.compiler = write(self.root / "compiler", "compiler")
+        write(self.root / "hyper_multicore/_build/recipe.py", "recipe")
+        write(self.root / "hyper_multicore/build.sh", "build")
+        write(self.root / "hyper_multicore/shmem/build.sh", "shmem")
+        self.env = {"ASCEND_HOME_PATH": str(self.cann), "PATH": "/unused"}
+
+    def _inputs(self, environment=None):
+        with patch.object(INPUTS.shutil, "which", return_value=str(self.compiler)), \
+                patch.object(INPUTS, "host_toolchain"):
+            return INPUTS.base_inputs(self.root, environment=environment or self.env)
+
+    def test_actual_header_or_compiler_edit_invalidates(self):
+        before = CACHE.fingerprint(self._inputs()[0])
+        self.header.write_text("changed header")
+        after_header = CACHE.fingerprint(self._inputs()[0])
+        self.assertNotEqual(before, after_header)
+        self.compiler.write_text("changed compiler")
+        self.assertNotEqual(after_header, CACHE.fingerprint(self._inputs()[0]))
+
+    def test_missing_version_record_disables_cache_without_rejecting_build_inputs(self):
+        (self.cann / "opp/version.info").unlink()
+        inputs, _, enabled = self._inputs()
+        self.assertFalse(enabled)
+        self.assertIsNone(inputs["files"]["cann/version"])
+
+    def test_unsupported_identity_probe_disables_cache_without_rejecting_compiler(self):
+        with patch.object(INPUTS.shutil, "which", return_value=str(self.compiler)), \
+                patch.object(INPUTS, "host_toolchain", side_effect=ValueError("unrecognized compiler output")):
+            _, _, enabled = INPUTS.base_inputs(self.root, environment=self.env)
+        self.assertFalse(enabled)
+
+    def test_cmake_prefix_is_hashed_and_custom_flags_disable_reuse(self):
+        prefix = self.root / "cmake-prefix"
+        module = write(prefix / "Config.cmake", "original")
+        environment = {**self.env, "CMAKE_PREFIX_PATH": str(prefix)}
+        before, _, enabled = self._inputs(environment)
+        self.assertTrue(enabled)
+        module.write_text("changed")
+        self.assertNotEqual(CACHE.fingerprint(before), CACHE.fingerprint(self._inputs(environment)[0]))
+        self.assertFalse(self._inputs({**self.env, "CXXFLAGS": "-include /external/header.h"})[2])
+
+    def test_compiler_discovered_system_headers_and_runtime_are_hashed(self):
+        header = write(self.root / "system-include/vector", "system header")
+        runtime = write(self.root / "libstdc++.so", "runtime")
+
+        def _command(args, **_kwargs):
+            if args[1].startswith("-print-file-name="):
+                return SimpleNamespace(stdout=str(runtime) + "\n")
+            return SimpleNamespace(stderr=("#include <...> search starts here:\n "
+                                           + str(header.parent) + "\nEnd of search list.\n"))
+
+        def _snapshot():
+            inputs = {"files": {}, "tools": {"g++": {"path": str(self.compiler)}}}
+            with patch.object(INPUTS.subprocess, "run", side_effect=_command):
+                INPUTS.host_toolchain(inputs, {}, {})
+            return CACHE.fingerprint(inputs)
+
+        before = _snapshot()
+        header.write_text("new system header")
+        after = _snapshot()
+        self.assertNotEqual(before, after)
+        runtime.write_text("new runtime")
+        self.assertNotEqual(after, _snapshot())
+
+
+class TestKernelClosure(unittest.TestCase):
+    """A GMM edit invalidates the two MoE closures and leaves unrelated operators reusable."""
+
+    def setUp(self) -> None:
+        """Prepare isolated component inputs and register deterministic cleanup."""
+        self.root = Path(tempfile.mkdtemp(prefix="hyper-multicore-component-check-"))
+        self.addCleanup(shutil.rmtree, self.root)
+
+    def _context(self, location):
+        root = self.root / location
+        source = root / "assembled"
+        for name in INPUTS.OPERATORS.values():
+            write(source / name / "op_kernel/worker.cpp", "same worker")
+        for name in ("hyper_mega_moe", "hyper_mega_moe_grad"):
+            write(source / name / "op_kernel/grouped_matmul/gmm.cpp", "same gmm")
+        cfg = "".join(f"[{op}]\nopFile.value={name}\n" for op, name in INPUTS.OPERATORS.items())
+        write(root / "autogen/config.ini", cfg)
+        write(root / "info.json", "{}")
+        return {"root": str(root), "sdk": str(root / "sdk"), "source": str(source),
+                "inputs": {"files": {}, "toolchain": "same"}, "observations": {}}
+
+    def _key(self, context, operation):
+        root = Path(context["root"])
+        command = [sys.executable, "/toolkit/ascendc_compile_kernel.py", f"--op-type={operation}",
+                   "--enable-binary=True", f"--src-file={context['source']}/entry.cpp",
+                   "--compute-unit=ascend910_93", f"--config-ini={root}/autogen/config.ini",
+                   f"--json-file={root}/info.json", f"--auto-gen-path={root}/autogen",
+                   f"--output-path={root}/binary"]
+        inputs, _, _, _ = KERNEL.kernel_request(context, command)
+        return CACHE.fingerprint(inputs)
+
+    def test_same_content_at_other_location_hits_all_operators(self):
+        first, second = self._context("a"), self._context("b")
+        for operation in INPUTS.OPERATORS:
+            with self.subTest(operation=operation):
+                self.assertEqual(self._key(first, operation), self._key(second, operation))
+
+    def test_gmm_change_only_invalidates_moe(self):
+        context = self._context("a")
+        before = {operation: self._key(context, operation) for operation in INPUTS.OPERATORS}
+        for name in ("hyper_mega_moe", "hyper_mega_moe_grad"):
+            write(Path(context["source"]) / name / "op_kernel/grouped_matmul/gmm.cpp", "changed gmm")
+        for operation in INPUTS.OPERATORS:
+            with self.subTest(operation=operation):
+                changed = self._key(context, operation) != before[operation]
+                self.assertEqual(changed, operation in {"HyperMegaMoe", "HyperMegaMoeGrad"})
+
+    def test_toolchain_and_sdk_identity_changes_invalidate_kernel(self):
+        context = self._context("a")
+        before = self._key(context, "HyperMegaMoe")
+        for field in ("toolchain", "sdk"):
+            changed = deepcopy(context)
+            changed["inputs"][field] = "changed"
+            self.assertNotEqual(before, self._key(changed, "HyperMegaMoe"))
 
 
 if __name__ == "__main__":

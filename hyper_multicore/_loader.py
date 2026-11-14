@@ -26,6 +26,8 @@ import platform
 import sys
 from types import ModuleType
 from contextlib import contextmanager
+from collections.abc import Iterator
+from dataclasses import dataclass
 from threading import RLock
 
 from hyper_multicore._native_manifest import (
@@ -34,8 +36,17 @@ from hyper_multicore._native_manifest import (
 
 _VENDOR_NAME = "hyper_multicore_nn"
 _NATIVE_LOCK = RLock()
-_selection = None
-_native_failure = None
+
+
+@dataclass
+class _NativeState:
+    """Keep selection and terminal failure mutable under the native-registration lock."""
+
+    selection: dict | None = None
+    failure: BaseException | None = None
+
+
+_native_state = _NativeState()
 _loaded_kinds = set()
 _ACL_DEV_ATTR_NPU_ARCH = 601
 
@@ -85,6 +96,10 @@ def load_torch_npu() -> ModuleType:
             f"[HYPER-MULTICORE-PTA-NOT-INSTALLED] Python={sys.executable}; install torch-npu "
             "for your Torch/CANN environment. Inspect hyper_multicore_build_info for packaged branches. "
             f"{diagnostic_context()}"
+        ) from error
+    except (ImportError, OSError, RuntimeError) as error:
+        raise NativeComponentUnavailableError(
+            f"[HYPER-MULTICORE-PTA-IMPORT-FAILED] {diagnostic_context()}: {error}"
         ) from error
     try:
         return importlib.import_module("torch_npu")
@@ -163,11 +178,10 @@ def _runtime_identity() -> dict:
 
 def validate_native_compatibility() -> dict:
     """Choose an internally validated framework variant; external post/CANN values do not gate it."""
-    global _selection
     actual = _runtime_identity()  # Import the framework outside our native-registration lock.
     with _NATIVE_LOCK:
-        if _selection is not None:
-            return _selection
+        if _native_state.selection is not None:
+            return _native_state.selection
         root = _component_root().parent
         try:
             info = json.loads((root / "build_info.json").read_text(encoding="utf-8"))
@@ -178,8 +192,10 @@ def validate_native_compatibility() -> dict:
             raise NativeComponentUnavailableError(
                 f"[HYPER-MULTICORE-ABI-MISMATCH] root={root} runtime={actual}: {error}"
             ) from error
-        _selection = {"root": root, "variant": variant, "actual": actual, "build_info": info, "manifest": manifest}
-        return _selection
+        _native_state.selection = {
+            "root": root, "variant": variant, "actual": actual, "build_info": info, "manifest": manifest,
+        }
+        return _native_state.selection
 
 
 def query_npu_arch() -> int:
@@ -206,39 +222,39 @@ def select_native_shmem(selected: dict) -> tuple[str, dict]:
 def native_ready(kind: str) -> bool:
     """Check terminal state even when a previously loaded adapter takes its fast path."""
     with _NATIVE_LOCK:
-        if _native_failure is not None:
+        if _native_state.failure is not None:
             raise NativeComponentUnavailableError(
-                f"[HYPER-MULTICORE-INITIALIZATION-FAILED] Restart the process: {_native_failure}"
-            ) from _native_failure
+                f"[HYPER-MULTICORE-INITIALIZATION-FAILED] Restart the process: {_native_state.failure}"
+            ) from _native_state.failure
         return kind in _loaded_kinds
 
 
 @contextmanager
-def native_loading(kind: str):
+def native_loading(kind: str) -> Iterator[bool]:
     """Serialize initial registration and make partial native initialization failures terminal."""
-    global _native_failure
     with _NATIVE_LOCK:
-        if _native_failure is not None:
+        if _native_state.failure is not None:
             raise NativeComponentUnavailableError(
-                f"[HYPER-MULTICORE-INITIALIZATION-FAILED] Restart the process: {_native_failure}"
-            ) from _native_failure
+                f"[HYPER-MULTICORE-INITIALIZATION-FAILED] Restart the process: {_native_state.failure}"
+            ) from _native_state.failure
         if kind in _loaded_kinds:
             yield False
             return
         try:
             yield True
         except BaseException as error:
-            _native_failure = error
+            _native_state.failure = error
             raise
         _loaded_kinds.add(kind)
 
 
 def native_context() -> str:
     """Describe the fixed adapter and runtime without hiding the original loader failure."""
-    if _selection is None:
+    if _native_state.selection is None:
         return diagnostic_context()
-    record = next(v for v in _selection["build_info"]["variants"] if v["id"] == _selection["variant"]["id"])
-    return f"runtime={_selection['actual']} adapter={_selection['variant']} built={record}"
+    selected = _native_state.selection
+    record = next(v for v in selected["build_info"]["variants"] if v["id"] == selected["variant"]["id"])
+    return f"runtime={_native_state.selection['actual']} adapter={_native_state.selection['variant']} built={record}"
 
 
 def preload_vendor_library(vendor_root: Path) -> None:

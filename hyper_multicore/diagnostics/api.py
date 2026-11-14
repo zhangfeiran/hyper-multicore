@@ -78,12 +78,21 @@ class MegaKernelDiagnostics:
 
 
 def prepare_mega_kernel_diagnostics(
-    graph: ComputeGraph | None, runtime_config: RuntimeConfigC, *, kernel_name: str,
-    parameter_count: int, device: torch.device | str, rank: int = 0, owner_label: str = "Owner",
+    graph: ComputeGraph | None,
+    runtime_config: RuntimeConfigC,
+    *,
+    kernel_name: str,
+    parameter_count: int,
+    device: torch.device | str,
+    rank: int = 0,
+    owner_label: str = "Owner",
     owner_resolver: Callable[[OperatorNode, TaskDescC, Any], int | None] | None = None,
     owner_context: Any = None,
-    execution_mode: str = "event_driven", vector_worker_stride: int = 2,
+    execution_mode: str = "event_driven",
+    vector_worker_stride: int = 2,
     graph_adapter: Callable[[Any, RuntimeConfigC], ComputeGraph] | None = None,
+    extra_aiv_records: int = 0,
+    extra_aic_records: int = 0,
 ) -> MegaKernelDiagnostics:
     """Prepare only normal execution storage and defer all diagnostic graph work.
 
@@ -105,6 +114,9 @@ def prepare_mega_kernel_diagnostics(
         graph_adapter: Optional lazy business-owned binding of graph ports to the
             real native ABI. It receives a private Host config; ordinary storage
             and the caller's graph must remain unchanged.
+
+        extra_aiv_records: Per-worker records emitted outside the normal vector queue.
+        extra_aic_records: Additional producer records inside scheduled Cube tasks.
 
     Returns:
         Adapter used by any MegaKernel; dynamic view resolvers remain dump-owned.
@@ -131,11 +143,26 @@ def prepare_mega_kernel_diagnostics(
         raise ValueError(f"invalid execution mode: {execution_mode!r}")
     if vector_worker_stride not in (1, 2):
         raise ValueError("vector_worker_stride must be 1 or 2")
+    for name, value in (("extra_aiv_records", extra_aiv_records), ("extra_aic_records", extra_aic_records)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
     runtime = PreparedDiagnosticRuntime(
-        graph, runtime_config, DiagnosticSpec(
-            kernel_name, owner_label, owner_resolver, owner_context,
-            execution_mode, vector_worker_stride, graph_adapter,
+        graph,
+        runtime_config,
+        DiagnosticSpec(
+            kernel_name,
+            owner_label,
+            owner_resolver,
+            owner_context,
+            execution_mode,
+            vector_worker_stride,
+            graph_adapter,
+            extra_aiv_records,
+            extra_aic_records,
         ),
-        parameter_count=parameter_count, tensor_factory=tensor_factory, rank=rank, device_id=device_id,
+        parameter_count=parameter_count,
+        tensor_factory=tensor_factory,
+        rank=rank,
+        device_id=device_id,
     )
     return MegaKernelDiagnostics(runtime)

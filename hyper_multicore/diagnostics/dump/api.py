@@ -16,31 +16,34 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from hyper_multicore.diagnostics.common.call import DiagnosticCall, LaunchArguments, LaunchContext
+from hyper_multicore.diagnostics.common.schedule import DiagnosticAction
 from hyper_multicore.diagnostics.common.session import (
     _activate_session,
     _deactivate_session,
 )
-from hyper_multicore.diagnostics.common.call import DiagnosticCall, LaunchArguments, LaunchContext
-from hyper_multicore.diagnostics.common.schedule import DiagnosticAction
-from hyper_multicore.diagnostics.dump.layout import _SAFE_FILE_NAME, _stage_names
 from hyper_multicore.diagnostics.dump.l0 import (
-    _GraphTensor, _TensorSnapshot, _describe_graph_tensors, _snapshot_tensor, _write_l0_stage_files,
+    _describe_graph_tensors,
+    _GraphTensor,
+    _snapshot_tensor,
+    _TensorSnapshot,
+    _write_l0_stage_files,
 )
 from hyper_multicore.diagnostics.dump.l1 import (
-    _L1Snapshot,
-    _PreparedL1Dump,
     _decode_l1_dump,
+    _L1Snapshot,
     _prepare_l1_dump,
+    _PreparedL1Dump,
 )
-
+from hyper_multicore.diagnostics.dump.layout import _SAFE_FILE_NAME, _stage_names
 
 __all__ = [
     "TensorDumpConfig",
@@ -96,6 +99,25 @@ def _normalize_non_negative_int_filter(
 
 def _normalize_ranks(value: int | Collection[int] | None) -> tuple[int, ...] | None:
     return _normalize_non_negative_int_filter(value, name="ranks")
+
+
+def _validate_storage_budget(device_memory_budget_mb: int, max_bytes_per_tensor: int | None) -> None:
+    """Keep invalid dump budgets from reaching device allocation or capture."""
+    if not isinstance(device_memory_budget_mb, int) or isinstance(
+        device_memory_budget_mb,
+        bool,
+    ):
+        raise TypeError("device_memory_budget_mb must be a positive integer")
+    if device_memory_budget_mb <= 0:
+        raise ValueError("device_memory_budget_mb must be positive")
+    if max_bytes_per_tensor is not None:
+        if not isinstance(max_bytes_per_tensor, int) or isinstance(
+            max_bytes_per_tensor,
+            bool,
+        ):
+            raise TypeError("max_bytes_per_tensor must be a positive integer or None")
+        if max_bytes_per_tensor <= 0:
+            raise ValueError("max_bytes_per_tensor must be positive")
 
 
 @dataclass(frozen=True)
@@ -172,24 +194,9 @@ class TensorDumpConfig:
         )
         core_ids = _normalize_non_negative_int_filter(self.core_ids, name="core_ids")
         io = _normalize_string_filter(self.io, name="io", allowed=_VALID_IO)
-        if not isinstance(self.device_memory_budget_mb, int) or isinstance(
-            self.device_memory_budget_mb,
-            bool,
-        ):
-            raise TypeError("device_memory_budget_mb must be a positive integer")
-        if self.device_memory_budget_mb <= 0:
-            raise ValueError("device_memory_budget_mb must be positive")
-        if self.max_bytes_per_tensor is not None:
-            if not isinstance(self.max_bytes_per_tensor, int) or isinstance(
-                self.max_bytes_per_tensor,
-                bool,
-            ):
-                raise TypeError("max_bytes_per_tensor must be a positive integer or None")
-            if self.max_bytes_per_tensor <= 0:
-                raise ValueError("max_bytes_per_tensor must be positive")
+        _validate_storage_budget(self.device_memory_budget_mb, self.max_bytes_per_tensor)
         if level == "L1" and all(
-            value is None
-            for value in (stages, task_ids, stage_task_indices, owner_ids, tensor_names)
+            value is None for value in (stages, task_ids, stage_task_indices, owner_ids, tensor_names)
         ):
             raise ValueError("L1 Tensor dump requires at least one stage, task, owner, or Tensor filter")
 
@@ -271,6 +278,11 @@ class _TensorDumpCall(DiagnosticCall):
         self._parameters = parameters
         self._prepared_l1 = prepared_l1
         self.finished = False
+
+    @property
+    def preserves_task_queues(self) -> bool:
+        """Keep every task whose L1 pre/post capture was prepared."""
+        return self._prepared_l1 is not None
 
     def complete(self) -> None:
         """Capture post-launch values after a successful native launch."""

@@ -59,6 +59,17 @@ class MegaMoeSpec:
     batch_experts: bool = False
     nominal_schedule: bool = False
     apply_probs_before_fc2: bool = False
+    _gradient_queue_order: str = "original"
+    _compact_schedule: bool = False
+    _fuse_saved_dispatch: bool = False
+    _saved_dispatch_lanes: int = 0
+    _cube_event_refresh_us: int = 0
+    _vector_event_refresh_us: int = 0
+    _batch_empty_dispatch: bool = False
+    _batch_empty_combine: bool = False
+    _selective_owner_gradient_init: bool = False
+    _compact_communication: bool = False
+    _communication_rows: int | None = None
     clamp_after_activation: bool = False
 
     @property
@@ -222,5 +233,14 @@ def bind_mega_moe_spec(
         batch_experts=specification.get("batch_experts", False),
         nominal_schedule=specification.get("nominal_schedule", False),
         apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
+        _gradient_queue_order=specification.get("_gradient_queue_order", "original"),
+        _fuse_saved_dispatch=specification.get("_fuse_saved_dispatch", False),
+        _saved_dispatch_lanes=specification.get("_saved_dispatch_lanes", 0),
+        _cube_event_refresh_us=specification.get("_cube_event_refresh_us", 0),
+        _vector_event_refresh_us=specification.get("_vector_event_refresh_us", 0),
+        _batch_empty_dispatch=specification.get("_batch_empty_dispatch", False),
+        _batch_empty_combine=specification.get("_batch_empty_combine", False),
+        _selective_owner_gradient_init=specification.get("_selective_owner_gradient_init", False),
+        _compact_communication=specification.get("_compact_communication", False),
         clamp_after_activation=specification.get("clamp_after_activation", False),
     )

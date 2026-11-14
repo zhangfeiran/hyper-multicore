@@ -19,14 +19,15 @@ Combines:
 - TaskSplitValue / init_task_split_value  — TP/EP/seq topology + per-rank counters
 - ctypes.Structure mirrors of runtime_head.hpp — passed as binary blobs to C++ kernels
 """
+
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
 
 # ── Constants (match runtime_head.hpp exactly) ────────────────────────────────
-MAX_TENSOR_DIMS      = 4
-MAX_INPUTS_PER_TASK  = 4
+MAX_TENSOR_DIMS = 4
+MAX_INPUTS_PER_TASK = 4
 MAX_OUTPUTS_PER_TASK = 4
 
 MIN_EVENT_CAPACITY  = 1024
@@ -36,11 +37,11 @@ MIN_GROUP_LIST_CAPACITY = 512
 GROUP_LIST_CACHE_LINE_BYTES = 128
 ATOMIC_ADD_VALUE_LEN = 8
 READY_CACHE_LINE_BYTES = 64
-INVALID_PROFILE_DESC_ID  = 0xFFFFFFFF
+INVALID_PROFILE_DESC_ID = 0xFFFFFFFF
 INVALID_PROFILE_OWNER_ID = 0xFFFFFFFF
 DEFAULT_DEPENDENCY_POLL_INTERVAL_US = 0
 FAST_DEPENDENCY_POLL_INTERVAL_US = 5
-EVENT_INVALID_ID         = 0xFFFFFFFF
+EVENT_INVALID_ID = 0xFFFFFFFF
 RUNTIME_PROTOCOL_VERSION = 1
 
 
@@ -58,7 +59,7 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
         raise ValueError("num_experts must be positive and divisible by ep_size")
     # Ready and worker completion follow termination with separate atomic lanes.
     final_event = num_experts + 3 * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
-    required = final_event + ATOMIC_ADD_VALUE_LEN
+    required = final_event + 2 * ATOMIC_ADD_VALUE_LEN + num_experts // ep_size
     return max(MIN_EVENT_CAPACITY, (required + 15) // 16 * 16)
 
 
@@ -118,6 +119,7 @@ class TaskType(IntEnum):
     TASK_GATE_GRAD_ADD_SELECTED           = 139
     TASK_GATE_GRAD_ZEROS                  = 140
     TASK_SHMEM_GET_MEM              = 141
+    TASK_SAVE_DISPATCH              = 142
 
 
 class EventType(IntEnum):
@@ -140,6 +142,7 @@ class DynamicType(IntEnum):
 
 
 # ── ctypes Structures (mirror runtime_head.hpp) ───────────────────────────────
+
 
 class TensorDescC(ctypes.Structure):
     """Serialized tensor address and shape descriptor."""
@@ -229,7 +232,8 @@ class RuntimeConfigC(ctypes.Structure):
         ("completion_event", ctypes.c_uint32),
         ("protocol_version", ctypes.c_uint32),
         ("vector_ready_queue", ctypes.c_uint32),
-        ("_padding", ctypes.c_uint32 * 5),
+        ("cube_single_group", ctypes.c_uint32),
+        ("_padding", ctypes.c_uint32 * 4),
     ]
 
 
@@ -270,6 +274,7 @@ class SwiGluTilingDataC(ctypes.Structure):
 
 # ── Topology + runtime counters ───────────────────────────────────────────────
 
+
 @dataclass
 class TaskSplitValue:
     """
@@ -286,6 +291,7 @@ class TaskSplitValue:
     all_expert_num: int = 32
     top_k:          int = 8
     dispatch_mode: str = "push"
+    communication_rows: int | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         """Reject topology values that would invalidate runtime arithmetic."""
@@ -309,6 +315,13 @@ class TaskSplitValue:
             raise ValueError(
                 f"all_expert_num ({self.all_expert_num}) must be divisible by ep ({self.ep})."
             )
+        rows = self.communication_rows
+        if rows is not None and (
+            not isinstance(rows, int) or isinstance(rows, bool) or not 0 < rows <= self.per_expert_seq_to_other
+        ):
+            raise ValueError("communication_rows must be within the per-edge token capacity")
+        if rows is not None and self.dispatch_mode != "push":
+            raise ValueError("communication_rows is only supported for Push")
 
     # ── Derived properties ────────────────────────────────────────────────────
     @property
@@ -335,6 +348,12 @@ class TaskSplitValue:
     def per_expert_seq_to_other(self) -> int:
         """Sequence length per expert when sending to other ranks."""
         return self.seq_all // (self.ep * self.top_k)
+
+    def communication_tiles(self, split_rows: int) -> int:
+        """Cover the agreed edge bound without changing the full-token schedule."""
+        if self.communication_rows is None:
+            return self.per_expert_seq_to_other // split_rows
+        return (self.communication_rows + split_rows - 1) // split_rows
 
     @property
     def all_event_num(self) -> int:
@@ -424,15 +443,16 @@ def _validate_runtime_task_queues(cfg: RuntimeConfigC, event_capacity: int) -> N
             if task_id < 0 or task_id >= len(cfg.all_tasks):
                 raise ValueError(f"invalid runtime task id {task_id}")
             task = cfg.all_tasks[task_id]
-            dependency_out_of_range = (
-                task.dependent_event != 0xFFFFFFFF
-                and task.dependent_event >= event_capacity
-            )
+            dependency_out_of_range = task.dependent_event != 0xFFFFFFFF and task.dependent_event >= event_capacity
             trigger_out_of_range = task.trigger_event + ATOMIC_ADD_VALUE_LEN > event_capacity
             if dependency_out_of_range or trigger_out_of_range:
-                raise ValueError(
-                    f"task {task_id} references an event outside allocated capacity {event_capacity}"
-                )
+                raise ValueError(f"task {task_id} references an event outside allocated capacity {event_capacity}")
+            if (
+                task.task_type == TaskType.TASK_GROUPED_MATMUL
+                and task.extra_value_1
+                and task.extra_value_1 + ATOMIC_ADD_VALUE_LEN > event_capacity
+            ):
+                raise ValueError(f"task {task_id} producer event exceeds allocated capacity {event_capacity}")
 
 
 def validate_runtime_config(

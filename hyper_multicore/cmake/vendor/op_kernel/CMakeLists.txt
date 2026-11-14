@@ -74,3 +74,13 @@ npu_op_kernel_sources(ascendc_kernels
 npu_op_package_add(${package_name}
     LIBRARY ascendc_kernels
 )
+
+if(HP_COMPONENT_CACHE_CONTEXT)
+    set(hp_kernel_launcher
+        "\"${ASCEND_PYTHON_EXECUTABLE}\" \"${CMAKE_CURRENT_LIST_DIR}/../../../_build/kernel_cache.py\" --context \"${HP_COMPONENT_CACHE_CONTEXT}\" --")
+    foreach(hp_op IN ITEMS HyperMegaMoe HyperMegaMoeGrad HyperMegaMhc HyperMegaMhcGrad
+            HyperMegaGateRoute HyperMegaGateRouteGrad)
+        set_property(TARGET ${hp_op}_${ASCEND_COMPUTE_UNIT}
+            PROPERTY RULE_LAUNCH_CUSTOM "${hp_kernel_launcher}")
+    endforeach()
+endif()

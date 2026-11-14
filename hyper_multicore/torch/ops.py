@@ -87,8 +87,9 @@ def _load_native() -> None:
             dispatch_alias = schema.arguments[0].alias_info.before_set
             input_grad_alias = schema.arguments[12].alias_info.before_set
             if not dispatch_alias or dispatch_alias != input_grad_alias:
-                raise RuntimeError("adapter does not declare backward dispatch storage reuse; "
-                                   "rebuild the Torch adapter")
+                raise RuntimeError(
+                    "adapter does not declare backward dispatch storage reuse; rebuild the Torch adapter"
+                )
         except (AttributeError, OSError, RuntimeError) as error:
             raise NativeComponentUnavailableError(
                 "[HP-NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED] component=multicore framework=torch "
@@ -801,8 +802,8 @@ def mega_moe_with_diagnostic_buffer(
     all_event_counters :
         Event synchronization counter tensor.
     diagnostic_buffer :
-        Ordinary NPU memory receiving either profiling records or L1 dump
-        snapshots, selected by runtime_config. Unused in ordinary/L0 mode.
+        Independent NPU memory receiving profiling records, L1 snapshots, or
+        explicitly requested ordinary-task trace records, selected by runtime_config.
     rank_id, ep, expert_num, hidden_size, seq_size :
         Topology / shape attributes.
     """
@@ -1057,8 +1058,9 @@ def zero_empty_expert_gradients(
     torch.ops.hyper_multicore.zero_empty_expert_grad_(first, second, cumulative_groups)
 
 
-def route_offsets(counts: torch.Tensor, rank: int, ub_bytes: int,
-                  hidden_size: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+def route_offsets(
+    counts: torch.Tensor, rank: int, ub_bytes: int, hidden_size: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Build row and element descriptors through the normal framework adapter."""
     _load_native()
     return torch.ops.hyper_multicore.route_offsets(counts, rank, ub_bytes, hidden_size)

@@ -104,6 +104,7 @@ enum class TaskType : uint32_t {
   TASK_GATE_GRAD_ADD_SELECTED = 139,
   TASK_GATE_GRAD_ZEROS = 140,
   TASK_SHMEM_GET_MEM = 141,
+  TASK_SAVE_DISPATCH = 142,
 };
 
 enum class EventType : uint32_t {
@@ -188,7 +189,8 @@ struct RuntimeHeader {
   uint32_t completion_event;
   uint32_t protocol_version;
   uint32_t vector_ready_queue;
-  uint32_t padding[5];
+  uint32_t cube_single_group;
+  uint32_t padding[4];
 };
 
 static_assert(sizeof(RuntimeHeader) == 64);

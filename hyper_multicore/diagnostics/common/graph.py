@@ -38,6 +38,9 @@ class DiagnosticSpec:
     vector_worker_stride: int = 2
     graph_adapter: Callable[[Any, RuntimeConfigC], ComputeGraph] | None = None
 
+    extra_aiv_records: int = 0
+    extra_aic_records: int = 0
+
 
 @dataclass(frozen=True)
 class GraphDiagnosticMetadata:
@@ -120,6 +123,20 @@ def _validate_parameter_position(position: int, parameter_count: int, label: str
         raise ValueError(f"{label} parameter position {position!r} is outside ABI parameter_count={parameter_count}")
 
 
+def _validate_tensor_spec(tensor_spec: Any) -> None:
+    """Validate a port independently of its operator and binding position."""
+    if not isinstance(tensor_spec.name, str) or not tensor_spec.name.strip():
+        raise ValueError("TensorSpec.name must be a non-empty string")
+    if any(isinstance(dim, bool) or not isinstance(dim, int) or dim < 0 for dim in tensor_spec.shape):
+        raise ValueError(f"Tensor {tensor_spec.name!r} shape must contain non-negative integers")
+    if (
+        isinstance(tensor_spec.dtype_size, bool)
+        or not isinstance(tensor_spec.dtype_size, int)
+        or tensor_spec.dtype_size <= 0
+    ):
+        raise ValueError(f"Tensor {tensor_spec.name!r} dtype_size must be a positive integer")
+
+
 def _validate_operator(operator: OperatorNode, parameter_count: int) -> None:
     """Validate graph operand names, shapes and native ABI bindings."""
     if isinstance(operator.task_num, bool) or not isinstance(operator.task_num, int) or operator.task_num < 0:
@@ -131,13 +148,7 @@ def _validate_operator(operator: OperatorNode, parameter_count: int) -> None:
         _validate_parameter_position(tensor_spec.param_position, parameter_count, tensor_spec.name)
         if position != tensor_spec.param_position:
             raise ValueError(f"operator {operator.name!r} param_positions disagrees with Tensor {tensor_spec.name!r}")
-        if not isinstance(tensor_spec.name, str) or not tensor_spec.name.strip():
-            raise ValueError("TensorSpec.name must be a non-empty string")
-        if any(isinstance(dim, bool) or not isinstance(dim, int) or dim < 0 for dim in tensor_spec.shape):
-            raise ValueError(f"Tensor {tensor_spec.name!r} shape must contain non-negative integers")
-        if (isinstance(tensor_spec.dtype_size, bool) or not isinstance(tensor_spec.dtype_size, int)
-                or tensor_spec.dtype_size <= 0):
-            raise ValueError(f"Tensor {tensor_spec.name!r} dtype_size must be a positive integer")
+        _validate_tensor_spec(tensor_spec)
 
 
 def _validate_task_ports(

@@ -40,9 +40,7 @@ from hyper_multicore.modules.mega_moe.backward.storage import can_reuse_backward
 from hyper_multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
 )
-from hyper_multicore.modules.mega_moe.forward.gen_runtime_data import (
-    build_config_for_rank as build_forward_config,
-)
+from hyper_multicore.modules.mega_moe.forward.gen_runtime_data import build_config_for_rank as build_forward_config
 from hyper_multicore.modules.mega_moe.forward.graph import (
     build_forward_graph,
 )
@@ -71,6 +69,17 @@ FORMER_TASK_LIMIT = 25600
 
 class TestRuntimeSerialization(unittest.TestCase):
     """Cover bounds independently of any accelerator library."""
+
+    def test_execution_flags_survive_runtime_serialization(self) -> None:
+        """The device must execute the same queue and GMM modes as the host plan."""
+        for ready_queue, single_group in ((0, 0), (1, 0), (0, 1), (1, 1)):
+            with self.subTest(ready_queue=ready_queue, single_group=single_group):
+                cfg = allocate_runtime_config(17)
+                cfg.vector_ready_queue = ready_queue
+                cfg.cube_single_group = single_group
+                image = serialize_runtime_config(cfg)
+                self.assertEqual(struct.unpack_from("<2I", image, 40), (ready_queue, single_group))
+                self.assertEqual(image[48:RUNTIME_HEADER_BYTES], bytes(16))
 
     def test_host_arrays_follow_capacity_for_every_graph(self) -> None:
         """Small graphs must not retain the former fixed task/queue arrays."""
@@ -149,17 +158,18 @@ class TestRuntimeSerialization(unittest.TestCase):
     def test_real_graphs_expand_event_storage(self) -> None:
         """Expand events for a valid topology with 16 experts per rank."""
         for graph_builder, config_builder in (
-            (build_forward_graph, build_forward_config), (build_backward_graph, build_backward_config),
+            (build_forward_graph, build_forward_config),
+            (build_backward_graph, build_backward_config),
         ):
             with self.subTest(graph=graph_builder.__name__):
                 values = TaskSplitValue(tp=1, ep=64, seq_size=128, all_expert_num=1024, top_k=2)
                 graph = graph_builder(values, hidden_size=128, intermediate_size=128, num_cube_cores=20)
                 graph.propagate_splits(values)
                 cfg = config_builder(graph, values, 63, 20)
-                self.assertEqual(len(cfg.all_event_num_triggers), 1104)
-                self.assertEqual(len(cfg.all_events), 1104)
+                self.assertEqual(len(cfg.all_event_num_triggers), 1120)
+                self.assertEqual(len(cfg.all_events), 1120)
                 image = serialize_runtime_config(cfg)
-                self.assertEqual(struct.unpack_from("<I", image, 12)[0], 1104)
+                self.assertEqual(struct.unpack_from("<I", image, 12)[0], 1120)
 
     def test_expert_scratch_bounds_are_checked_before_allocation_or_copy(self) -> None:
         """Reject overflow and metadata whose lists exceed the host allocation."""
@@ -170,7 +180,6 @@ class TestRuntimeSerialization(unittest.TestCase):
         cfg.dynamic_data.dynamic_group_size = 17
         with self.assertRaisesRegex(ValueError, "group-list scratch"):
             serialize_runtime_config(cfg)
-
 
     def test_backward_storage_reuse_requires_all_reader_dependencies(self) -> None:
         """Allow managed plans, but reject changed queues, joins and additional receive readers."""
@@ -243,15 +252,15 @@ class TestRuntimeCppReader(unittest.TestCase):
 
     def test_mega_moe_task_encodings_match_cpp(self) -> None:
         """Named payloads keep their existing wire values on both sides of the ABI."""
-        values = (ctypes.c_uint32 * 15)()
+        values = (ctypes.c_uint32 * 16)()
         self.reader.read_task_option_values.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
         self.reader.read_task_option_values.restype = None
         self.reader.read_task_option_values(values)
         expected = tuple(int(value) for value in (
             *GroupedMatmulTaskMode, *SwiGluClampPosition, *SwiGluTaskIteration, *ShmemTaskPartition,
-            *MegaMoeActivationWeighting, *MegaMoeTransportPayload,
+            *MegaMoeActivationWeighting, *MegaMoeTransportPayload, TaskType.TASK_SAVE_DISPATCH,
         ))
-        self.assertEqual(expected, (0, 1, 2, 3, 0, 1, 0, 2, 0, 2, 0, 4, 0, 4, 8))
+        self.assertEqual(expected, (0, 1, 2, 3, 0, 1, 0, 2, 0, 2, 0, 4, 0, 4, 8, 142))
         self.assertEqual(tuple(values), expected)
 
     def test_task_option_validation_matches_cpp(self) -> None:
@@ -293,11 +302,12 @@ class TestRuntimeCppReader(unittest.TestCase):
 
     def test_transport_and_kernel_task_types_match_cpp(self) -> None:
         """Keep transport, MHC and MegaGate tasks on distinct C++ dispatch IDs."""
-        wire_ids = (ctypes.c_uint32 * 4)()
+        wire_ids = (ctypes.c_uint32 * 5)()
         self.reader.read_transport_and_kernel_task_types(wire_ids)
         expected = (
             int(TaskType.TASK_SHMEM_GET_MEM), int(TaskType.TASK_MHC_POST),
             int(TaskType.TASK_GATE_SOFTPLUS), int(TaskType.TASK_GATE_GRAD_ZEROS),
+            int(TaskType.TASK_SAVE_DISPATCH),
         )
 
         self.assertEqual(tuple(wire_ids), expected, msg=f"Task ID mismatch: C++={tuple(wire_ids)}, Python={expected}")
@@ -469,20 +479,25 @@ class TestRuntimeCppReader(unittest.TestCase):
         cfg = allocate_runtime_config(17)
         cfg.task_num = 17
         data = bytearray(serialize_runtime_config(cfg))
-        data[40:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 40)
+        data[48:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 48)
         self.assertTrue(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
         struct.pack_into("<I", data, 36, 2)
         self.assertFalse(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
 
     def test_ready_header_and_persistent_storage_bounds(self) -> None:
         """Read ready metadata without tags and bound the persistent tail."""
-        for ep_size, experts, events, mode in ((2, 4, 1024, "push"), (2, 4, 1024, "pull"),
-                                                (64, 1024, 1104, "push"), (64, 1024, 1104, "pull")):
+        for ep_size, experts, events, mode in (
+            (2, 4, 1024, "push"),
+            (2, 4, 1024, "pull"),
+            (64, 1024, 1120, "push"),
+            (64, 1024, 1120, "pull"),
+        ):
             with self.subTest(ep_size=ep_size):
                 cfg = allocate_runtime_config(17, events)
                 cfg.task_num = 17
-                values = TaskSplitValue(tp=1, ep=ep_size, seq_size=128, all_expert_num=experts, top_k=2,
-                                       dispatch_mode=mode)
+                values = TaskSplitValue(
+                    tp=1, ep=ep_size, seq_size=128, all_expert_num=experts, top_k=2, dispatch_mode=mode
+                )
                 configure_ready_handshake(cfg, values)
                 cfg.diagnostic_mode = 1
                 cfg.aic_profile_record_capacity, cfg.aiv_profile_record_capacity = 101, 203
@@ -501,5 +516,8 @@ class TestRuntimeCppReader(unittest.TestCase):
                 for invalid_event in (events - 7, 0xFFFFFFFF):
                     invalid = bytearray(data)
                     struct.pack_into("<I", invalid, 16, invalid_event)
-                    self.assertFalse(self.reader.valid_ready_runtime(
-                        ctypes.create_string_buffer(bytes(invalid)), len(data), event_bytes, ep_size))
+                    self.assertFalse(
+                        self.reader.valid_ready_runtime(
+                            ctypes.create_string_buffer(bytes(invalid)), len(data), event_bytes, ep_size
+                        )
+                    )

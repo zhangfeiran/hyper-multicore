@@ -30,12 +30,14 @@ from .build_workspace import check_workspace, claim_workspace, safe_component
 from .build_publication import publish_payload
 from .command_runner import message
 from .soc_selection import ARCHITECTURES
+from .component_cache import provenance
 
 
 SCRIPTS = (
     "build.sh", "_build/assemble_multicore_source.py", "_build/merge_multicore_vendors.py",
     "_build/vendor_cache.py", "_build/soc_selection.py", "_build/prepare_dependencies.py",
     "_build/dependencies.lock.json",
+    "_build/component_cache.py", "_build/component_inputs.py", "_build/component_cli.py", "_build/kernel_cache.py",
     "cmake/hardening.cmake",
     "shmem/_build/shmem_sdk.sh",
 )
@@ -162,10 +164,13 @@ def prepare(root: Path, native: Path, device_arch: str, sdk: Path, request_path:
     message(f"Vendor {device_arch}: {reason}; checked in {request['lookup_seconds']:.2f}s")
 
 
-def built(request_path: Path, candidate: Path, started: float) -> None:
+def built(request_path: Path, candidate: Path, started: float, component_directory: Path | None = None) -> None:
     """Remember the fresh candidate, without publishing a reusable cache entry."""
     request = json.loads(request_path.read_text())
     request.update(reused=False, candidate=str(candidate), compile_seconds=time.time() - started)
+    if component_directory is not None:
+        request["origin"]["components"] = [provenance(json.loads(path.read_text())) for path in
+                                            sorted(component_directory.glob("component-request-*.json"))]
     atomic_json(request_path, request)
     message(f"Vendor {request['soc']}: compiled in {request['compile_seconds']:.1f}s")
 
@@ -211,11 +216,12 @@ def main() -> None:
     built_args.add_argument("--request", type=Path, required=True)
     built_args.add_argument("--candidate", type=Path, required=True)
     built_args.add_argument("--started", type=float, required=True)
+    built_args.add_argument("--component-directory", type=Path)
     args = parser.parse_args()
     if args.operation == "prepare":
         prepare(args.root, args.native, args.arch, args.sdk, args.request, args.clean)
     else:
-        built(args.request, args.candidate, args.started)
+        built(args.request, args.candidate, args.started, args.component_directory)
 
 
 if __name__ == "__main__":

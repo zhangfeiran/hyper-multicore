@@ -727,7 +727,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                                     plan=object(), workspace=object(), ensure_capacity=Mock(),
                                     plan_for_tokens=Mock())
         route = SimpleNamespace(
-            routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
+            routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128, maximum_edge_rows=None),
             unpermute_mapping=object(), maximum_received_slots=512
         )
         resources.plan_for_tokens.return_value = resources.plan
@@ -795,7 +795,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         hidden = torch.ones(2, 16, dtype=torch.bfloat16)
         ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
         weights = torch.ones(2, 2)
-        route = SimpleNamespace(metadata=SimpleNamespace(plan_tokens=128))
+        route = SimpleNamespace(metadata=SimpleNamespace(plan_tokens=128, maximum_edge_rows=None))
         workspace = Mock()
         resources = SimpleNamespace(
             spec=SimpleNamespace(auto_tokens=True, apply_probs_before_fc2=False,
@@ -838,7 +838,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         probabilities = torch.full((2, 2), 0.5)
         expert_weights = (torch.empty(4, 16, 16, dtype=torch.bfloat16),
                           torch.empty(4, 8, 16, dtype=torch.bfloat16))
-        route = SimpleNamespace(metadata=SimpleNamespace(plan_tokens=128), maximum_received_slots=4)
+        route = SimpleNamespace(metadata=SimpleNamespace(plan_tokens=128, maximum_edge_rows=None),
+                                maximum_received_slots=4)
         resources = SimpleNamespace(
             spec=SimpleNamespace(auto_tokens=False, dispatch_mode="push", apply_probs_before_fc2=True),
             workspace=object(), ensure_capacity=Mock(), plan_for_tokens=Mock(return_value=object()),

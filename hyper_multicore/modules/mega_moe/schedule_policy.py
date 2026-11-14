@@ -31,9 +31,9 @@ def compact_graph(graph: ComputeGraph, topology: TaskSplitValue, workers: int, n
     compact = 0
     for op in operators:
         if op.op_type == OpType.ALLTOALL:
-            original += topology.all_expert_num * (topology.per_expert_seq_to_other // op.split_value)
+            original += topology.all_expert_num * (topology.communication_tiles(op.split_value))
             compact += topology.all_expert_num * min(max(1, math.ceil(workers / topology.ep)),
-                                                    topology.per_expert_seq_to_other // op.split_value)
+                                                    topology.communication_tiles(op.split_value))
         elif op.op_type in (OpType.SWIGLU, OpType.SWIGLU_GRAD):
             original += topology.single_rank_expert_num * (topology.per_expert_seq // op.split_value)
             compact += topology.single_rank_expert_num * min(workers, topology.per_expert_seq // op.split_value)
@@ -42,7 +42,7 @@ def compact_graph(graph: ComputeGraph, topology: TaskSplitValue, workers: int, n
         return False
     for op in operators:
         if op.op_type == OpType.ALLTOALL:
-            lanes = min(math.ceil(workers / topology.ep), topology.per_expert_seq_to_other // op.split_value)
+            lanes = min(math.ceil(workers / topology.ep), topology.communication_tiles(op.split_value))
             groups = topology.all_expert_num
         elif op.op_type in (OpType.SWIGLU, OpType.SWIGLU_GRAD):
             lanes = min(workers, topology.per_expert_seq // op.split_value)

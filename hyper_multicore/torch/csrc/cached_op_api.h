@@ -49,6 +49,51 @@ class CachedOpApiResolver final {
 
 }  // namespace hyper_multicore
 
+#if defined(CURRENT_VERSION) && defined(V2R9) && CURRENT_VERSION == V2R9
+namespace hyper_multicore::cached_op_context {
+
+// PTA 2.9 resolves these process-lifetime symbols on every invocation. Keep
+// its callback order and execution thread while retaining only their addresses.
+inline void InitExecCommonCtx() {
+  using Callback = int (*)(void *, bool);
+  static const auto callback = reinterpret_cast<Callback>(::GetOpApiFuncAddr("InitHugeMemThreadLocal"));
+  if (callback != nullptr) {
+    callback(nullptr, false);
+  }
+}
+
+inline void ReleaseExecCommonCtx() {
+  using Callback = void (*)(void *, bool);
+  static const auto callback = reinterpret_cast<Callback>(::GetOpApiFuncAddr("ReleaseHugeMem"));
+  if (callback != nullptr) {
+    callback(nullptr, false);
+  }
+}
+
+inline void UnInitExecCommonCtx() {
+  using MemoryCallback = void (*)(void *, bool);
+  using CacheCallback = void (*)();
+  static const auto memory = reinterpret_cast<MemoryCallback>(::GetOpApiFuncAddr("UnInitHugeMemThreadLocal"));
+  if (memory != nullptr) {
+    memory(nullptr, false);
+  }
+  static const auto cache = reinterpret_cast<CacheCallback>(::GetOpApiFuncAddr("UnInitPTACacheThreadLocal"));
+  if (cache != nullptr) {
+    cache();
+  }
+}
+
+}  // namespace hyper_multicore::cached_op_context
+
+#define HYPER_CACHED_OP_CONTEXT()                                                   \
+  using ::hyper_multicore::cached_op_context::InitExecCommonCtx;                     \
+  using ::hyper_multicore::cached_op_context::ReleaseExecCommonCtx;                  \
+  using ::hyper_multicore::cached_op_context::UnInitExecCommonCtx
+#else
+// Other PTA versions retain their own context implementation until audited.
+#define HYPER_CACHED_OP_CONTEXT() static_cast<void>(0)
+#endif
+
 /**
  * Execute an ACLNN operator through the native torch_npu extension bridge.
  *
@@ -56,12 +101,15 @@ class CachedOpApiResolver final {
  * independently for the V1 and V2 task queue paths. Argument conversion,
  * workspace ownership, stream submission, cache lookup, and completion
  * semantics remain those of EXEC_NPU_CMD_V1_EXT and EXEC_NPU_CMD_V2_EXT.
+ * PTA 2.9 also reuses lifecycle callback addresses; every lifecycle call still
+ * runs at its original position and on the original thread.
  *
  * @param aclnn_api Compile-time ACLNN execution symbol token.
  * @param ... Arguments forwarded unchanged to the native extension bridge.
  */
 #define HYPER_EXEC_NPU_CMD_EXT(aclnn_api, ...)                                       \
   do {                                                                               \
+    HYPER_CACHED_OP_CONTEXT();                                                       \
     const auto hyper_task_queue_enable = OpApiGetTaskQueueEnable();                  \
     if (hyper_task_queue_enable == 2) {                                              \
       static ::hyper_multicore::CachedOpApiResolver hyper_v2_api_resolver; \

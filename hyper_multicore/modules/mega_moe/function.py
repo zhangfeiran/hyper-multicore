@@ -26,6 +26,7 @@ import torch
 from hyper_multicore._loader import load_torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
+from .normal_trace import launch_normal_forward, require_normal_trace_mode
 from .probability import PROBABILITY_PLANES, probability_stride
 from .plan import MegaMoePlan, record_plan_stream
 from .route import PreparedTopKRoute, RouteMetadata, restore_topk_output
@@ -182,6 +183,18 @@ def _allocate_forward_intermediates(
     return _ForwardIntermediates(up_proj, activation, torch.empty_like(dispatch[:capacity]))
 
 
+
+def _empty_expert_spans(experts: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
+    """Coalesce adjacent cold matrices without touching a live expert's output."""
+    spans = []
+    for expert in experts:
+        if spans and spans[-1][1] == expert:
+            spans[-1] = spans[-1][0], expert + 1
+        else:
+            spans.append((expert, expert + 1))
+    return tuple(spans)
+
+
 def _allocate_backward_intermediates(
     spec: Any,
     capacity: int,
@@ -192,9 +205,16 @@ def _allocate_backward_intermediates(
     *, weight_grad_dtype: torch.dtype | None = None,
     group_list: torch.Tensor | None = None,
     all_experts_active: bool = False,
+    empty_experts: tuple[int, ...] | None = None,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
-    if group_list is None:
+    if empty_experts is not None:
+        grad_weight1 = torch.empty_like(weight1, dtype=weight_grad_dtype)
+        grad_weight2 = torch.empty_like(weight2, dtype=weight_grad_dtype)
+        for first, last in _empty_expert_spans(empty_experts):
+            grad_weight1[first:last].zero_()
+            grad_weight2[first:last].zero_()
+    elif group_list is None:
         # Without count metadata, cold rows cannot be identified; initialize every expert.
         grad_weight1 = torch.zeros_like(weight1, dtype=weight_grad_dtype)
         grad_weight2 = torch.zeros_like(weight2, dtype=weight_grad_dtype)
@@ -263,7 +283,7 @@ def _prepare_backward_execution(
     plan: MegaMoePlan,
     saved: _SavedBackwardState,
     grad_output: Any,
-    *, all_experts_active: bool = False,
+    *, all_experts_active: bool = False, empty_experts: tuple[int, ...] | None = None,
 ) -> _BackwardExecution:
     """Resolve workspace, event counters, and intermediate tensors for backward."""
     dispatch = (torch.empty_like(saved.dispatch) if plan.spec.dispatch_mode == "pull"
@@ -288,6 +308,7 @@ def _prepare_backward_execution(
             weight_grad_dtype=plan.weight_grad_dtype,
             group_list=saved.group_list,
             all_experts_active=all_experts_active,
+            empty_experts=empty_experts,
         ),
     )
 
@@ -338,6 +359,7 @@ def _save_forward_state(
                       if ctx.source_rows else output[:0])
     ctx.plan = plan
     ctx.all_experts_active = metadata.all_experts_active
+    ctx.empty_owner_experts = getattr(metadata, "empty_owner_experts", None)
     ctx.workspace = workspace
     ctx.save_for_backward(
         saved_dispatch,
@@ -389,10 +411,11 @@ def _launch_forward_kernel(
     weight1: Any,
     weight2: Any,
     execution: _ForwardExecution,
-    *, stream: Any = None,
+    *, stream: Any = None, save_dispatch: bool = True,
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
+    require_normal_trace_mode(plan.fwd_diagnostics.is_active)
     kernel_parameters = (
         execution.dispatch,
         metadata.dispatch_target_off,
@@ -412,21 +435,24 @@ def _launch_forward_kernel(
         metadata.combine_size,
     )
     if not plan.fwd_diagnostics.is_active:
-        record_plan_stream(plan, plan.fwd_runtime_config, stream=stream)
-        multicore_ops.mega_moe(
+        runtime_config = (plan.fwd_saved_dispatch_config
+                          if save_dispatch and spec._fuse_saved_dispatch else plan.fwd_runtime_config)
+        record_plan_stream(plan, runtime_config, stream=stream)
+        launch_normal_forward((
             *kernel_parameters,
             execution.gmm_workspace,
             plan.up_proj_tiling,
             plan.swiglu_tiling,
             plan.down_proj_tiling,
-            plan.fwd_runtime_config,
+            runtime_config,
             execution.event_counters,
+        ), (
             spec.rank_id,
             spec.ep_size,
             spec.num_experts,
             spec.hidden_size,
             getattr(spec, "plan_tokens", spec.local_num_tokens),
-        )
+        ), num_workers=2 * spec.num_cube_cores)
         return
 
     with plan.fwd_diagnostics.launch(
@@ -546,6 +572,28 @@ def _native_source(tensor: torch.Tensor) -> torch.Tensor:
 
 
 # Torch declares variadic autograd hooks; concrete functions use operator-specific signatures.
+
+def _claim_forward_workspace(workspace, spec, rows, claimed):
+    """Validate ownership before any consumer can borrow directional buffers."""
+    if claimed:
+        if not workspace.in_use:
+            raise RuntimeError("MegaMoe forward requires the caller-held workspace lease.")
+        return
+    if not spec.auto_tokens:
+        workspace.ensure(spec, rows.dtype, rows.device)
+    workspace.claim()
+
+
+def _validate_integrated_output(spec: Any, permutation: Any, topk_weights: Any) -> None:
+    """Require the mapping and probabilities consumed by native integrated output."""
+    if topk_weights is not None and (
+        permutation is None or (spec.dispatch_mode != "pull" and not spec.apply_probs_before_fc2)
+    ):
+        raise ValueError("Integrated output unpermutation requires pull dispatch or pre-FC2 weighting, "
+                         "and an input permutation.")
+    if spec.apply_probs_before_fc2 and topk_weights is None:
+        raise ValueError("Pre-FC2 weighting requires the original Top-K probabilities and permutation.")
+
 class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
     """Autograd bridge for the in-place forward/backward custom ops."""
 
@@ -582,13 +630,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             Owned token-major rows with integrated unpermutation, otherwise expert-major rows.
         """
         spec = plan.spec
-        if topk_weights is not None and (
-            permutation is None or (spec.dispatch_mode != "pull" and not spec.apply_probs_before_fc2)
-        ):
-            raise ValueError("Integrated output unpermutation requires pull dispatch or pre-FC2 weighting, "
-                             "and an input permutation.")
-        if spec.apply_probs_before_fc2 and topk_weights is None:
-            raise ValueError("Pre-FC2 weighting requires the original Top-K probabilities and permutation.")
+        _validate_integrated_output(spec, permutation, topk_weights)
         metadata = route.for_kernel(spec.hidden_size)
         permutation_inputs = ()
         if permutation is not None:
@@ -599,13 +641,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         ctx.token_rows = ctx.source_rows // spec.top_k
         ctx.has_permutation = permutation is not None
         ctx.has_unpermute = topk_weights is not None
-        if workspace_claimed:
-            if not workspace.in_use:
-                raise RuntimeError("MegaMoe forward requires the caller-held workspace lease.")
-        else:
-            if not spec.auto_tokens:
-                workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
-            workspace.claim()
+        _claim_forward_workspace(workspace, spec, routed_tokens, workspace_claimed)
         execution = None
         try:
             # Dispatch and combine overwrite disjoint route ranges before consumers run.
@@ -634,7 +670,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 saved_dispatch = execution.dispatch
             else:
                 # Combine has consumed down_proj before SHMEM dispatch is reused.
-                execution.intermediates.down_proj.copy_(execution.dispatch[:capacity])
+                if not (spec._fuse_saved_dispatch and not plan.fwd_diagnostics.is_active):
+                    execution.intermediates.down_proj.copy_(execution.dispatch[:capacity])
                 saved_dispatch = execution.intermediates.down_proj
             return _save_forward_state(
                 ctx,
@@ -682,6 +719,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 saved,
                 grad_output,
                 all_experts_active=ctx.all_experts_active,
+                empty_experts=ctx.empty_owner_experts,
             )
             _launch_backward_kernel(
                 plan,
@@ -699,7 +737,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             grad_weight1 = execution.intermediates.grad_weight1
             grad_weight2 = execution.intermediates.grad_weight2
             if os.environ.get("HP_MEGA_MOE_CAPTURE_DW") == "1":
-                global _CAPTURED_WEIGHT_GRADS
+                global _CAPTURED_WEIGHT_GRADS  # pylint: disable=global-statement
                 _CAPTURED_WEIGHT_GRADS = (grad_weight1.detach().clone(),
                                           grad_weight2.detach().clone())
             grad_x = execution.grad_x
@@ -832,7 +870,7 @@ def _execute_mega_moe_without_autograd(
         _launch_forward_kernel(
             plan, route.metadata.for_kernel(plan.spec.hidden_size), execution.source,
             _native_weight_operand(weight1, plan),
-            _native_weight_operand(weight2, plan), execution, stream=workspace.lease_stream)
+            _native_weight_operand(weight2, plan), execution, stream=workspace.lease_stream, save_dispatch=False)
         rows = route.routed_tokens.shape[0]
         if not rows:
             return route.routed_tokens.new_empty((0, plan.spec.hidden_size))

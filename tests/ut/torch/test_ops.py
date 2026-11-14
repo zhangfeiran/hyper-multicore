@@ -38,7 +38,7 @@ class TestTorchOps(unittest.TestCase):
     def setUp(self) -> None:
         """Isolate backend registration from the native adapter schema checks."""
         _loader._loaded_kinds.clear()
-        _loader._native_failure = None
+        _loader._native_state.failure = None
         patcher = patch.object(ops, "load_torch_npu")
         self.backend = patcher.start()
         self.addCleanup(patcher.stop)
@@ -46,7 +46,7 @@ class TestTorchOps(unittest.TestCase):
     def tearDown(self) -> None:
         """Never retain a mocked native-registration cache between tests."""
         _loader._loaded_kinds.clear()
-        _loader._native_failure = None
+        _loader._native_state.failure = None
 
     @staticmethod
     def _backward_op(alias: str = "a") -> SimpleNamespace:
@@ -108,7 +108,7 @@ class TestTorchOps(unittest.TestCase):
             load.assert_called_once_with("good.so")
             for protocol, alias, message in ((0, "a", "transport ABI"), (1, "e", "storage reuse")):
                 _loader._loaded_kinds.clear()
-                _loader._native_failure = None
+                _loader._native_state.failure = None
                 version.return_value = protocol
                 backward.default._schema = self._backward_op(alias).default._schema
                 with self.assertRaisesRegex(NativeComponentUnavailableError, message):

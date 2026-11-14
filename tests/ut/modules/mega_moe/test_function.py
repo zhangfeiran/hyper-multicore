@@ -231,7 +231,8 @@ class TestMegaMoeFunction(unittest.TestCase):
     def _check_deferred_backward(self, *, permuted: bool, input_grad: bool = True,
                                 vary_tokens: bool = False, replay: bool = False) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
-        spec = SimpleNamespace(apply_probs_before_fc2=False, hidden_size=4, intermediate_size=2, rank_id=0,
+        spec = SimpleNamespace(apply_probs_before_fc2=False, _fuse_saved_dispatch=False, num_cube_cores=24,
+                               hidden_size=4, intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
                                dispatch_mode="push", expert_weight_layout="EIO", auto_tokens=False)
         plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False, weight_grad_dtype=None)
@@ -256,7 +257,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         down_pointers = []
         backward_capacities = []
 
-        def release_workspace(*, stream=None) -> None:
+        def release_workspace(*, stream: Any = None) -> None:
             """Make accidental reads after the lease immediately observable."""
             self.assertIs(stream, workspace.lease_stream)
             workspace.expert_buffer.fill_(float("nan"))
@@ -308,7 +309,8 @@ class TestMegaMoeFunction(unittest.TestCase):
             args[6].fill_(tag)
             args[18].fill_(tag)
 
-        def zero_cold(first, second, groups):
+        def zero_cold(first: torch.Tensor, second: torch.Tensor, groups: torch.Tensor) -> None:
+            """Initialize exactly the empty local groups in this CPU fixture."""
             previous = 0
             for expert, end in enumerate(groups.tolist()):
                 if end == previous:

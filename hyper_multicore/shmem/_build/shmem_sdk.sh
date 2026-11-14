@@ -145,6 +145,23 @@ print(hashlib.sha256(encoded).hexdigest())
     locked_commit=$("${python_bin}" -c 'import json,sys; print(json.loads(sys.argv[1])["shmem"]["commit"])' \
         "${prepared_dependency}") || return 6
 
+    export HP_SHMEM_SOC_TYPE="${soc_type}"
+    local component_request="${sdk_work_root}/component-request-sdk.json"
+    mkdir -p "${sdk_work_root}"
+    rm -rf "${install_root}"
+    "${python_bin}" "${project_root}/hyper_multicore/_build/component_cli.py" prepare \
+        --root "${project_root}" --kind sdk --output "${install_root}" --request "${component_request}"
+    if "${python_bin}" -c 'import json,sys; sys.exit(not json.load(open(sys.argv[1]))["reused"])' "${component_request}"; then
+        HP_SHMEM_SOC_TYPE="${soc_type}"
+        export HP_SHMEM_SOC_TYPE
+        HP_SHMEM_INSTALL_ROOT="${install_root}"
+        HP_SHMEM_TOOLCHAIN_KEY="${toolchain_key}"
+        export HP_SHMEM_INSTALL_ROOT HP_SHMEM_TOOLCHAIN_KEY
+        return 0
+    fi
+
+    rm -rf "${build_dir}" "${install_root}"
+    rm -rf "${source_dir}"
     mkdir -p "${source_dir}" "${build_dir}"
     if ! (set -o pipefail; git -C "${locked_source_dir}" archive --format=tar "${locked_commit}" \
         | tar -xf - -C "${source_dir}"); then
@@ -236,6 +253,7 @@ PY
         -DSOC_TYPE="${soc_type}"
     cmake --build "${build_dir}" --parallel "${native_jobs}"
     cmake --install "${build_dir}" --prefix "${install_root}/shmem"
+    "${python_bin}" "${project_root}/hyper_multicore/_build/component_cli.py" stage --request "${component_request}"
 
     HP_SHMEM_INSTALL_ROOT="${install_root}"
     HP_SHMEM_TOOLCHAIN_KEY="${toolchain_key}"

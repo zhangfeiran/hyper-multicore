@@ -79,7 +79,7 @@ bash build.sh --all --tests off
 两种模式均使用当前 CANN，不按其版本号拒绝构建；真实缺包、缺工具、头文件或符号问题由编译和加载检查报告。
 矩阵中的可选 `reference_cann` 用于提示和追溯，与实际版本不同或实际版本未知时告警并继续。
 
-每次构建准备一份公共资源。vendor 可复用，SHMEM SDK、ops 和框架适配库每次重新建立工作目录并编译。
+每次构建准备一份公共资源。vendor 按算子复用，SHMEM SDK、ops 和框架适配库按组件依赖闭包缓存。
 910B/910C 共用 `arch22`，950 使用 `arch35`；每架构只编译一次 vendor kernel，注册信息按 SoC 生成；每组框架构建一份 Torch 适配库和所需的 SHMEM binding。
 各后端在独立 Python 进程中完成加载检查，不执行 NPU 计算。
 最终清单始终按矩阵配置顺序排列。
@@ -106,7 +106,8 @@ bash build.sh --all --tests off
 只有一个架构需编译时使用完整 J，全部命中缓存时不启动 vendor 编译。
 SDK/ops 和默认单组适配库构建使用完整 J。该预算限制编译任务数，不是内存或全部系统线程的硬限制。
 
-`--clean` 清除所选架构／SoC 的 vendor 缓存并重编；不删除框架 venv、依赖源码仓库或用户 pip 缓存。
+`--clean` 清除所选架构／SoC 的本地vendor快照并跳过共享组件缓存读取；不清空其他worktree共享的组件，
+不删除框架venv、依赖源码仓库或用户pip缓存。
 `--all --clean` 强制完整重编全部配置目标。
 
 ### 输出与日志
@@ -283,8 +284,23 @@ bash build.sh --all --jobs 24
 新快照仅在制品提交成功并复核输入后原子发布。`build_info.json` 的 `vendor_sources` 区分原始 vendor 来源
 与本次组包身份；激活脚本和最终制品每次重新生成。
 
-该摘要不覆盖任意外部环境变化。同路径、同版本下修改未覆盖的 CANN 内部资源，或原地修改 Python 构建依赖的
-内部实现后，执行 `--clean`。SDK、ops 和框架适配库不复用跨构建产物或 CMake 增量结果。
+整包vendor摘要是有界的本地开发身份。原地修改未覆盖的CANN资源或Python构建依赖后，使用`--clean`。
+已核查的源码或工具链输入发生变化会使相关组件失效；组件缓存不替代完整构建资格。
+组件缓存使用实际内容、编译器、系统头文件/运行库、SDK、框架头文件/链接库及ABI。
+生产worktree路径和commit另存来源，不作为相同源码跨worktree复用的阻碍；不复用CMake工作目录。
+
+共享组件默认位于`~/.cache/hyper-multicore/native-components-v1/`，可用`HYPER_MULTICORE_NATIVE_CACHE`指定位置。
+该目录必须由当前用户持有，拒绝重定向、无归属或可被其他用户写入的目录。
+组件命中核查完整成员集合和SHA；成功组件先在本次构建私有目录暂存，整体制品提交后重新核查输入并原子发布。
+不完整或损坏组件视为miss，失败构建不发布本次暂存。
+未知自定义编译注入采用保守重建，终端明确记录；不据版本字符串单独认证任意CANN安装。
+
+GMM补丁仅使实际组装出的MoE前后向闭包失效，Gate/MHC及无关组件可复用。
+CANN动态入口按当前构建重新生成，不复制旧绝对include路径；二进制保留真实生产来源。
+vendor host注册部分仍正常编译，wheel中的host计数扩展仍由打包流程生成，不宣称整个构建零编译。
+`build_info.json`的`component_sources`、各适配器记录及vendor来源逐组件保存key、生产commit/源码摘要、命中状态与输出SHA。
+输入扫描、编译和发布计时分开记录；整包vendor命中时保留其内部组件来源。
+[实现与验证范围](design/native_component_cache.zh-CN.md)。
 
 native 源码版本和补丁由[依赖锁](../hyper_multicore/_build/dependencies.lock.json)指定。
 Git 仓库位于 `build/native/deps/`；只 fetch 缺失提交，已缓存提交不访问远端。

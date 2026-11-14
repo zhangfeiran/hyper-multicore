@@ -35,7 +35,7 @@ from hyper_multicore.shmem import _runtime as shmem_runtime
 class TestNativeLoading(unittest.TestCase):
     """Reject wrong or damaged adapters and preserve shared initialization state."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Create a minimal multi-backend payload using only the installed runtime contract."""
         self.resources = ExitStack()
         self.addCleanup(self.resources.close)
@@ -148,7 +148,7 @@ class TestNativeLoading(unittest.TestCase):
         with patch.multiple(shmem_runtime, require_multicore_environment=lambda: None,
                             load_torch_npu=lambda: None, validate_native_compatibility=lambda: selected,
                             _native=None, _native_libraries=[]), \
-                patch.object(_loader, "_loaded_kinds", set()), patch.object(_loader, "_native_failure", None), \
+                patch.object(_loader, "_loaded_kinds", set()), patch.object(_loader._native_state, "failure", None), \
                 patch.object(_loader, "query_npu_arch", return_value=3510) as query, \
                 patch.object(shmem_runtime.ctypes, "CDLL") as load, \
                 patch.object(shmem_runtime.importlib.util, "spec_from_file_location", return_value=spec), \
@@ -171,13 +171,14 @@ class TestNativeLoading(unittest.TestCase):
         barrier = Barrier(4)
         calls = []
 
-        def first_use(index):
+        def first_use(index: int) -> None:
+            """Race first callers while retaining exactly one initialization owner."""
             barrier.wait(timeout=5)
             with _loader.native_loading("torch") as needed:
                 if needed:
                     calls.append(index)
 
-        with patch.object(_loader, "_loaded_kinds", set()), patch.object(_loader, "_native_failure", None):
+        with patch.object(_loader, "_loaded_kinds", set()), patch.object(_loader._native_state, "failure", None):
             with ThreadPoolExecutor(max_workers=4) as pool:
                 list(pool.map(first_use, range(4)))
             self.assertEqual(len(calls), 1)
@@ -185,7 +186,7 @@ class TestNativeLoading(unittest.TestCase):
 
     def test_partial_failure_blocks_both_adapters(self):
         """One failed companion prevents retries and disables an already registered adapter."""
-        with patch.object(_loader, "_loaded_kinds", {"torch"}), patch.object(_loader, "_native_failure", None):
+        with patch.object(_loader, "_loaded_kinds", {"torch"}), patch.object(_loader._native_state, "failure", None):
             with self.assertRaisesRegex(OSError, "missing symbol"):
                 with _loader.native_loading("shmem"):
                     raise OSError("missing symbol")

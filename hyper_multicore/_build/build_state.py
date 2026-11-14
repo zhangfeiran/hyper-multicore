@@ -53,4 +53,5 @@ class BuildContext:
                                  scratch=native / "staging" / self.run_id / "tool-output")
         self.frameworks = {}
         self.vendor_requests = []
+        self.component_requests = []
         self.isolated = False
