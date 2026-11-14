@@ -81,6 +81,11 @@
                 "path": "hyper_multicore/ops/patches/grouped_matmul_scheduling.patch",
                 "sha256": "7b3f8b4f349985681a609ef20e97eee8f088f8041d495725b5f802d8359d37f9",
                 "purpose": "use private row descriptors and balance gradient Cube lanes"
+              },
+              {
+                "path": "hyper_multicore/ops/patches/grouped_matmul_replica.patch",
+                "sha256": "5011c2167e36194a65d6d1a6797d039f87aedc469b2e6058b72d00d48957b833",
+                "purpose": "publish FP32 guest matrix bands during grouped matmul"
               }
             ],
             "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"

@@ -25,7 +25,7 @@ from hyper_multicore import _collective
 from hyper_multicore.modules.mega_moe import function as function_module
 
 from hyper_multicore.modules.mega_moe.function import (
-    _execute_mega_moe_without_autograd, _kernel_workspace, _stage_backward_source, _stage_probabilities,
+    _kernel_workspace, _stage_backward_source, _stage_probabilities,
 )
 from hyper_multicore.modules.mega_moe.plan import _build_runtime_artifacts
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -185,8 +185,9 @@ class TestProbabilityWeighting(unittest.TestCase):
         with torch.no_grad(), patch.object(function_module, "_prepare_forward_execution", return_value=execution), \
                 patch.object(function_module, "_launch_forward_kernel"), \
                 patch.object(function_module.multicore_ops, "moe_token_permute_grad", return_value=rows[:2]) as restore:
-            output = _execute_mega_moe_without_autograd(
-                probs, rows, rows, route, SimpleNamespace(spec=spec), workspace, workspace_claimed=True)
+            output = function_module._execute_mega_moe_without_autograd(
+                probs, rows, rows, route, SimpleNamespace(spec=spec, fwd_task_prefixes=()),
+                workspace, workspace_claimed=True)
         torch.testing.assert_close(workspace.probability_workspace[0, mapping.long()], probs.flatten())
         torch.testing.assert_close(output, rows[:2])
         restore.assert_called_once()
@@ -227,7 +228,7 @@ class TestProbabilityWeighting(unittest.TestCase):
     def test_scratch_bindings_preserve_logical_plan_strides(self) -> None:
         """Retained plans expose logical scratch bounds after physical heap growth."""
         spec = SimpleNamespace(apply_probs_before_fc2=True, ep_size=4, plan_tokens=128, top_k=2)
-        plan = SimpleNamespace(spec=spec)
+        plan = SimpleNamespace(spec=spec, fwd_task_prefixes=())
         buffer = torch.arange(4 * 4096, dtype=torch.float32).view(torch.uint8)
         for size, tilings in ((16, ()), (20, (None,) * 5)):
             result = _diagnostic_parameters(plan, (None,) * size, buffer, tilings)

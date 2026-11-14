@@ -19,8 +19,8 @@
 #include "swi_glu/swi_glu.cpp"
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
-#include "runtime/worker_kernel.h"
 #include "runtime/empty_dispatch.h"
+#include "runtime/worker_kernel.h"
 #include "common/mega_moe/transport.h"
 #include "common/mega_moe/task_options.h"
 #include "common/mega_moe/routing_probabilities.h"
@@ -212,6 +212,33 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
               input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
   }
 
+  __aicore__ inline bool PrepareGroupedList(GlobalTensor<int64_t> &groups, GM_ADDR address,
+      uint32_t experts, uint32_t expert, int64_t rows, GlobalTensor<int64_t> &source, bool batched) {
+    const bool single_group = !batched && (this->home_experts_ > 0 ||
+        reinterpret_cast<__gm__ RuntimeHeader *>(this->runtimeConfigPtr)->cube_single_group == 1);
+    if (single_group) {
+      groups.SetValue(0, rows);
+      cacheWriteThrough(address, sizeof(int64_t));
+    } else {
+      for (uint32_t index = 0; index < experts; ++index) {
+        groups.SetValue(index, batched ? source.GetValue(index) : (index >= expert ? rows : 0));
+      }
+      cacheWriteThrough(address, experts * sizeof(int64_t));
+    }
+    return single_group;
+  }
+
+  __aicore__ inline int64_t ReadExpertRows(const TaskDesc &task_desc,
+      GlobalTensor<int64_t> &groups, uint32_t experts, uint32_t expert) {
+    const bool batched = GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED || GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED_READY;
+    if (batched && GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED) {
+      for (uint32_t expert = 1; expert < experts; ++expert) {
+        this->WaitForDependency(task_desc.dependent_event + expert, task_desc.extra_value_2);
+      }
+    }
+    return groups.GetValue(batched ? experts - 1 : expert);
+  }
+
   __aicore__ inline void ExecuteGroupedMatmul(TaskDesc task_desc) {
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
       DynamicData dynamic_data;
@@ -229,13 +256,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         GlobalTensor<int64_t> grouped_list_tensor_real;
         grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
         uint32_t data_index = task_desc.task_index / this->core_num;
-        const bool batched = IsBatchedGroupedMatmulTask(task_desc);
-        if (batched && GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED) {
-          for (uint32_t expert = 1; expert < expert_num_single_rank; ++expert) {
-            this->WaitForDependency(task_desc.dependent_event + expert, task_desc.extra_value_2);
-          }
-        }
-        int64_t value = grouped_list_tensor.GetValue(batched ? expert_num_single_rank - 1 : data_index);
+        int64_t value = ReadExpertRows(task_desc, grouped_list_tensor, expert_num_single_rank, data_index);
         int64_t start = 0;
         if (data_index != 0) {
           value = value - grouped_list_tensor.GetValue(data_index - 1);
@@ -244,17 +265,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         if (value == 0) {
           return;
         }
-        const bool single_group = GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::SINGLE_GROUP;
-        if (single_group) {
-          grouped_list_tensor_real.SetValue(0, value);
-          cacheWriteThrough(grouped_list_real, sizeof(int64_t));
-        } else {
-          for (uint32_t i = 0; i < expert_num_single_rank; ++i) {
-            grouped_list_tensor_real.SetValue(
-                i, batched ? grouped_list_tensor.GetValue(i) : (i >= data_index ? value : 0));
-          }
-          cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
-        }
+        const bool single_group = PrepareGroupedList(grouped_list_tensor_real, grouped_list_real,
+                                                      expert_num_single_rank, data_index, value, grouped_list_tensor,
+            GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED || GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED_READY);
 
         GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
         __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
@@ -263,18 +276,33 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         tilingdata_data->mmTilingData.singleCoreM = value;
         cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
         cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
+        if (single_group) {
+          tilingdata_data->gmmBaseParams.groupNum = 1;
+          cacheWriteThrough(tiling_data_addr, sizeof(tilingdata_data->gmmBaseParams));
+        }
         PipeBarrier<PIPE_ALL>();
 
-        int64_t input_0_offset = GmmRowOffset(task_desc.inputs[0], start);
-        int64_t output_0_offset = GmmRowOffset(task_desc.outputs[0], start);
-        const int64_t weight_offset = single_group ?
-            static_cast<int64_t>(data_index) * task_desc.inputs[1].dim[1] *
-                task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type : 0;
+        int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
+                                   ? start * task_desc.inputs[0].dim[1] * task_desc.inputs[0].data_type
+                                   : task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type;
+        int64_t output_0_offset = task_desc.outputs[0].dynamic_shape == 1
+                                    ? start * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
+                                    : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
+        const uint32_t weight_position = task_desc.inputs[1].input_position;
+        GM_ADDR weight_base = input_list[weight_position];
+        if (this->home_experts_ > 0) {
+          const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
+                                       task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+          weight_base = this->GetExpertMatrix(weight_position, data_index, matrix_bytes, weight_position == 5 ? 0 : 1);
+        } else if (single_group) {
+          weight_base += static_cast<int64_t>(data_index) * task_desc.inputs[1].dim[1] *
+                         task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+        }
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position] + weight_offset, nullptr, nullptr, nullptr,
-                       nullptr, nullptr, grouped_list_real, nullptr,
-                       input_list[task_desc.outputs[0].input_position] + output_0_offset, input_list[WORKSPACE_IDX],
-                       tiling_data_addr, task_desc.inputs[0].transpose_flag == 1,
+                       weight_base, nullptr, nullptr, nullptr, nullptr, nullptr,
+                       grouped_list_real, nullptr, input_list[task_desc.outputs[0].input_position] + output_0_offset,
+                       input_list[WORKSPACE_IDX], tiling_data_addr,
+                       task_desc.inputs[0].transpose_flag == 1,
                        task_desc.inputs[1].transpose_flag == 1);
       }
       return;
@@ -387,6 +415,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                             task_desc.inputs[1].base_ptr_offset * task_desc.inputs[1].data_type,
                           src_offset_, send_data_size_, signal, static_cast<int64_t>(task_desc.trigger_event), 1,
                           nullptr, 1, target_pe, false);
+
   }
 };
 

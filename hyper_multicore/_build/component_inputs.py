@@ -197,6 +197,7 @@ def component_inputs(root: Path, kind: str, sdk: Path | None = None,
     component = root / "hyper_multicore"
     paths = {"sdk": ("shmem/cmake/shmem_wrapper",),
              "shmem-ops": ("shmem/ccsrc/ops", "shmem/ccsrc/cann", "shmem/ccsrc/data_plane"),
+             "counts": ("replica/_device_kernel",),
              "torch": ("torch",), "shmem": ("shmem/ccsrc",)}
     if kind not in paths:
         raise ValueError(f"Unknown native component: {kind}")

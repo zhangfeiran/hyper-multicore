@@ -591,6 +591,30 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         schedule = max(128, (maximum_tokens + 127) // 128 * 128)
         return max(1, int(loads[spec.rank_id])), schedule, int(loads.max())
 
+    def test_compact_schedule_uses_the_current_group_maximum_on_both_count_paths(self) -> None:
+        """The current maximum survives a cache hit but changes with the source counts."""
+        for experts in (24, 640):
+            with self.subTest(experts=experts):
+                spec = replace(self._spec(experts), _compact_communication=True)
+                payload = self._payload(experts, torch.int32)
+                expected = int(payload[:, 3:].max())
+                workspace = SimpleNamespace(route_cache=None)
+                evidence = route_module._RouteEvidence()
+                summary, raw, _ = route_module._read_cached_route(payload, spec, workspace, "cpu", evidence)
+                self.assertEqual(evidence.maximum_edge_rows, expected)
+                if raw is not None:
+                    metadata = route_module._dynamic_route_metadata(payload[0, 3:], payload, raw, spec, summary[0])
+                    route_module._cache_host_route(
+                        workspace, spec, raw, summary, metadata, "cpu", maximum_edge_rows=expected
+                    )
+                    cached_evidence = route_module._RouteEvidence()
+                    route_module._read_cached_route(payload, spec, workspace, "cpu", cached_evidence)
+                    self.assertEqual(cached_evidence.maximum_edge_rows, expected)
+                payload[-1, 3:].zero_()
+                payload[-1, 3:5] = 257
+                route_module._read_cached_route(payload, spec, workspace, "cpu", evidence)
+                self.assertEqual(evidence.maximum_edge_rows, 257)
+
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
     )
@@ -702,6 +726,13 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                                     torch.testing.assert_close(
                                         getattr(actual.for_kernel(spec.hidden_size), field), value, rtol=0, atol=0)
 
+
+                                native = actual.for_kernel(spec.hidden_size)
+                                for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
+                                             "combine_src_off", "combine_target_off", "combine_size"):
+                                    torch.testing.assert_close(getattr(native, name),
+                                                               getattr(expected, name) * spec.hidden_size,
+                                                               rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

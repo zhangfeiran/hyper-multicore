@@ -63,6 +63,7 @@ set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities.o"
 add_library(hyper_multicore_torch SHARED
     csrc/mega_moe_utilities.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities.o"
+    csrc/replica_count_queue.cpp
     csrc/registration.cpp
     csrc/registration_mhc.cpp
     csrc/mega_mhc.cpp
@@ -93,7 +94,7 @@ target_link_directories(hyper_multicore_torch PRIVATE "${CANN_ROOT}/lib64")
 target_include_directories(hyper_multicore_torch BEFORE PRIVATE "${CANN_ROOT}/include")
 target_link_libraries(hyper_multicore_torch PRIVATE
     ${TORCH_LINK_LIBRARIES}
-    "${ASCENDC_HOST_RUNTIME}" profapi mmpa c_sec unified_dlog ascendcl runtime)
+    "${ASCENDC_HOST_RUNTIME}" profapi mmpa c_sec unified_dlog ascendcl runtime ${CMAKE_DL_LIBS})
 hp_enable_elf_hardening(hyper_multicore_torch)
 
 install(TARGETS hyper_multicore_torch DESTINATION .)

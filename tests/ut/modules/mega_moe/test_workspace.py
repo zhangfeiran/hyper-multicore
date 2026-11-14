@@ -157,20 +157,34 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                         manager = _HeapManager(None, reference)
                         manager.reserve(((spec, _workspace_layout(spec, reference.dtype)),), allow_resize=True)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
+    )
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Feature: Dynamic event allocation.
         Description: Allocate and reuse event storage through the SHMEM API.
         Expectation: Preserve dynamic counters and ready tails without reallocating.
         """
-        spec = SimpleNamespace(apply_probs_before_fc2=False, receive_capacity=128, routed_slots=256, hidden_size=16,
-                               ep_size=64, num_experts=1024, dispatch_mode="push")
+        spec = SimpleNamespace(
+            replica_slots_per_rank=0,
+            apply_probs_before_fc2=False,
+            receive_capacity=128,
+            routed_slots=256,
+            hidden_size=16,
+            ep_size=64,
+            num_experts=1024,
+            dispatch_mode="push",
+        )
         workspace = MegaMoeWorkspace(shared=True)
         with (
-            patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
-                shape, dtype=kw["dtype"],
-            )) as allocate,
+            patch.object(
+                workspace_module.shmem,
+                "empty",
+                side_effect=lambda shape, **kw: torch.empty(
+                    shape,
+                    dtype=kw["dtype"],
+                ),
+            ) as allocate,
             patch.object(workspace_module.torch, "npu", create=True),
         ):
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
@@ -206,6 +220,36 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         completion_event.record.assert_called_once_with(current_stream)
         mock_npu.synchronize.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_same_stream_reuse_uses_fifo_and_cross_stream_keeps_event_waits(self) -> None:
+        """Stream FIFO covers same-stream reuse; each new producer resets cross-stream ordering."""
+        workspace = MegaMoeWorkspace(shared=True)
+        workspace.completion_event = Mock()
+        first, second = Mock(), Mock()
+        with patch.object(workspace_module.torch, "npu", create=True) as mock_npu:
+            mock_npu.current_stream.return_value = first
+            workspace.claim()
+            workspace.release()
+            workspace.wait_for_reuse()
+            workspace.claim()
+            workspace.release()
+            first.wait_event.assert_not_called()
+            mock_npu.current_stream.return_value = second
+            workspace.wait_for_reuse()
+            workspace.claim()
+            workspace.release()
+            self.assertEqual(second.wait_event.call_count, 2)
+            workspace.wait_for_reuse()
+            workspace.claim()
+            workspace.release()
+            self.assertEqual(second.wait_event.call_count, 2)
+            mock_npu.current_stream.return_value = first
+            workspace.claim()
+            workspace.release()
+            first.wait_event.assert_called_once_with(workspace.completion_event)
+            mock_npu.synchronize.assert_not_called()
+
 
 class TestReadyEventWorkspace(unittest.TestCase):
     """Keep each direction's peer generations alive across per-call clears."""
@@ -221,11 +265,11 @@ class TestReadyEventWorkspace(unittest.TestCase):
             with self.subTest(forward=forward):
                 self.assertIs(workspace.prepare_event_counters(forward=forward), tensor)
                 self.assertEqual(torch.count_nonzero(tensor).item(), 0)
-                tensor[:workspace.event_counter_bytes].fill_(51)
-                tensor[workspace.event_counter_bytes:].fill_(7)
+                tensor[: workspace.event_counter_bytes].fill_(51)
+                tensor[workspace.event_counter_bytes :].fill_(7)
                 workspace.prepare_event_counters(forward=forward)
-                self.assertEqual(torch.count_nonzero(tensor[:workspace.event_counter_bytes]).item(), 0)
-                self.assertTrue(torch.all(tensor[workspace.event_counter_bytes:] == 7))
+                self.assertEqual(torch.count_nonzero(tensor[: workspace.event_counter_bytes]).item(), 0)
+                self.assertTrue(torch.all(tensor[workspace.event_counter_bytes :] == 7))
         self.assertEqual(mock_barrier.call_count, 2)
         workspace._free_symmetric_tensors()  # pylint: disable=protected-access
         self.assertFalse(workspace.forward_ready_initialized)

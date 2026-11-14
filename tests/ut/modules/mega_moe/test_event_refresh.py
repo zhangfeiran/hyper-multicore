@@ -29,7 +29,7 @@ class TestEventRefresh(unittest.TestCase):
     def test_runtime_changes_only_poll_intervals(self) -> None:
         """Every existing Cube and Vector task receives its requested local polling rate."""
         for mode in ("push", "pull"):
-            for slots in (0,):
+            for slots in (0, 2):
                 with self.subTest(mode=mode, slots=slots):
                     spec = MegaMoeSpec(
                         local_num_tokens=512,
@@ -43,6 +43,8 @@ class TestEventRefresh(unittest.TestCase):
                         ep_group=None,
                         rank_id=1,
                         num_cube_cores=24,
+                        replica_slots_per_rank=slots,
+                        logical_num_experts=24,
                         dispatch_mode=mode,
                     )
                     _, forward, _, backward = _build_runtime_artifacts(spec)

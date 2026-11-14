@@ -582,7 +582,20 @@ PYCONTEXT
             PER_SOC_VENDOR_INPUTS+=("--input" "${cann_soc}=${candidate}")
             PER_SOC_HOST_INPUT_IDENTITIES+=("--host-input-identity" "${cann_soc}=${HP_VENDOR_HOST_IDENTITY}")
         done <<< "${ARCH_GROUPS}"
-
+        if [[ "${ARCH_GROUPS}" == *arch22* ]]; then
+            CURRENT_REASON_CODE="REPLICA_COUNTS_BUILD_FAILED"
+            COUNTS_COMPONENT_REQUEST="${WORK_ROOT}/component-request-counts.json"
+            "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/component_cli.py" prepare \
+                --root "${PROJECT_ROOT}" --kind counts --output "${OUTPUT_ROOT}/replica" --request "${COUNTS_COMPONENT_REQUEST}"
+            if ! "${PYTHON_BIN}" -c 'import json,sys; sys.exit(not json.load(open(sys.argv[1]))["reused"])' "${COUNTS_COMPONENT_REQUEST}"; then
+            cmake -S "${PROJECT_ROOT}/hyper_multicore/replica/_device_kernel" \
+                -B "${WORK_ROOT}/replica-counts" -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX="${OUTPUT_ROOT}/replica"
+            cmake --build "${WORK_ROOT}/replica-counts" --parallel "${NATIVE_JOBS}"
+            cmake --install "${WORK_ROOT}/replica-counts" --strip
+            fi
+            "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/component_cli.py" stage --request "${COUNTS_COMPONENT_REQUEST}"
+        fi
         VENDOR_ROOT="${OUTPUT_ROOT}/vendors/hyper_multicore_nn"
         mkdir -p "$(dirname "${VENDOR_ROOT}")"
         CURRENT_REASON_CODE="CANN_VENDOR_MERGE_FAILED"

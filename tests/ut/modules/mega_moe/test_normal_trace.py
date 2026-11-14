@@ -29,11 +29,12 @@ from hyper_multicore.modules.mega_moe.plan import _build_runtime_artifacts
 from hyper_multicore.modules.mega_moe.saved_dispatch import build_saved_dispatch
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.scheduler.runtime import serialize_runtime_config, runtime_cube_worker_capacity
-from hyper_multicore.modules.recompute import create_recompute_contexts
+from hyper_multicore.replica.recompute import create_recompute_contexts
 
 
 def _spec(budget=0, compact=False):
     return MegaMoeSpec(128, 128, 128, 4 * (2 + budget), 2, 1.25, 1024, 4, None, 0, 4,
+                       replica_slots_per_rank=budget, logical_num_experts=8,
                        _compact_schedule=compact, _compact_communication=compact)
 
 

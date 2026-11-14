@@ -32,8 +32,8 @@ import torch
 from hyper_multicore import MegaMoeNumericsOptions, _automatic, _collective
 from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.modules.mega_moe import module as mega_moe_module
-from hyper_multicore.modules.mega_moe.backward.graph import build_backward_graph
 from hyper_multicore.modules.mega_moe.backward.gen_runtime_data import build_config_for_rank
+from hyper_multicore.modules.mega_moe.backward.graph import build_backward_graph
 from hyper_multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
 from hyper_multicore.modules.mega_moe.backward.tiling_tables import (
     get_act_grad_tiling_bytes, get_gate_grad_tiling_bytes, get_w1_grad_tiling_bytes, get_w2_grad_tiling_bytes,
@@ -144,7 +144,6 @@ class TestMegaMoeExperts(unittest.TestCase):
                     self.assertEqual((plan.spec.routed_slots, plan.spec.receive_capacity), (16384, 16384))
                     self.assertEqual(resources.spec, replace(plan.spec, schedule_tokens=None))
 
-
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_partial_and_small_buckets_cover_inputs_without_expanding_storage(self) -> None:
@@ -166,6 +165,25 @@ class TestMegaMoeExperts(unittest.TestCase):
                         self.assertEqual(plan.spec.plan_tokens % 128, 0)
                         self.assertEqual(plan.spec.routed_slots, reserved * 2)
                     self.assertEqual(resources.plan_for_tokens(1, "cpu").spec.plan_tokens, 128)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_communication_plan_covers_larger_edges_without_mutating_retained_plan(self) -> None:
+        """A different edge bucket cannot reuse the previous invocation's narrower graph."""
+        resources = self._cache_resources(8192, automatic=True)
+        resources.spec = replace(resources.spec, _compact_communication=True)
+        with patch.object(mega_moe_module, "build_mega_moe_plan",
+                          side_effect=lambda spec, device: SimpleNamespace(spec=spec)):
+            retained = resources.plan_for_tokens(4096, "cpu", maximum_edge_rows=257)
+            larger = resources.plan_for_tokens(4096, "cpu", maximum_edge_rows=513)
+            full = resources.plan_for_tokens(4096, "cpu", maximum_edge_rows=2586)
+            self.assertEqual((retained.spec._communication_rows, larger.spec._communication_rows), (512, 1024))
+            self.assertIsNone(full.spec._communication_rows)
+            self.assertIs(resources.plan_for_tokens(4096, "cpu", maximum_edge_rows=512), retained)
+            self.assertEqual(retained.spec.plan_tokens, 4096)
+            self.assertEqual(retained.spec.receive_capacity, resources.spec.receive_capacity)
+            with self.assertRaisesRegex(ValueError, "per-edge token capacity"):
+                resources.plan_for_tokens(4096, "cpu", maximum_edge_rows=4097)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -220,7 +238,6 @@ class TestMegaMoeExperts(unittest.TestCase):
             self.assertEqual(len(resources._plans), 1)
             self.assertEqual(resources.spec.local_num_tokens, 128)
 
-
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_unprepared_capacity_is_rejected_before_building(self) -> None:
@@ -261,40 +278,47 @@ class TestMegaMoeExperts(unittest.TestCase):
             self.assertEqual(len(resources._plans), 21)
             self.assertLessEqual(max(plan.spec.plan_tokens for plan in resources._plans.values()), capacity)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
+    )
     def test_resource_consensus_rejects_configuration_and_wire_mismatches(self) -> None:
         """Feature: Distributed resource and automatic count agreement.
         Description: Inject a different manifest, legacy wire version or incompatible expert-weight layout.
         Expectation: Every mismatch fails before symmetric allocation or count exchange.
         """
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
-        resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI")
+        resources.spec = SimpleNamespace(replica_slots_per_rank=0, ep_size=2, ep_group=object(),
+                                         expert_weight_layout="EOI")
         for mismatch in ("configuration", "wire", "layout"):
+
             def gather(output: list, value: Any, kind: str = mismatch, **kwargs: Any) -> None:
                 """Change one peer agreement field while preserving all unrelated metadata."""
                 self.assertIs(kwargs["group"], resources.spec.ep_group)
                 if kind == "layout":
                     self.assertEqual(value[2], "EOI")
-                    peer = (value[0], value[1], "EIO", value[3])
+                    peer = (value[0], value[1], "EIO", *value[3:])
                 else:
                     peer = ("dynamic_tokens_v1", *value[1:]) if kind == "wire" else ("different",)
                 output[:] = [value, peer]
 
-            with (self.subTest(mismatch=mismatch),
-                  patch.object(mega_moe_module.dist, "all_gather_object", side_effect=gather),
-                  self.assertRaisesRegex(ValueError, "configurations differ")):
+            with (
+                self.subTest(mismatch=mismatch),
+                patch.object(mega_moe_module.dist, "all_gather_object", side_effect=gather),
+                self.assertRaisesRegex(ValueError, "configurations differ"),
+            ):
                 resources._validate_distributed_configuration(
-                    ({"local_num_tokens": 128, "auto_tokens": True, "expert_weight_layout": "EOI"},))
+                    ({"local_num_tokens": 128, "auto_tokens": True, "expert_weight_layout": "EOI"},)
+                )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_precision_options_participate_in_rank_consensus(self) -> None:
-        """Reject a rank using a different clamp or routing-probability definition."""
+        """Reject differing numerical options and saved-dispatch buffer or copy policies."""
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
         resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI")
         specification = {"local_num_tokens": 128, "auto_tokens": True, "expert_weight_layout": "EOI",
-                         "swiglu_limit": 0.5, "clamp_after_activation": False, "apply_probs_before_fc2": False}
+                         "swiglu_limit": 0.5, "clamp_after_activation": False, "apply_probs_before_fc2": False,
+                         "_fuse_saved_dispatch": False, "_saved_dispatch_lanes": 0}
 
         def capture(output: list, manifest: Any, *, peer_manifest: list, **_kwargs: Any) -> None:
             """Record the independently normalized peer manifest."""
@@ -306,7 +330,8 @@ class TestMegaMoeExperts(unittest.TestCase):
             output[:] = [manifest, peer_manifest[0]]
 
         for field, value in (("swiglu_limit", 7.0), ("clamp_after_activation", True),
-                             ("apply_probs_before_fc2", True)):
+                             ("apply_probs_before_fc2", True), ("_fuse_saved_dispatch", True),
+                             ("_saved_dispatch_lanes", 8)):
             peer_manifest = []
             with patch.object(mega_moe_module.dist, "all_gather_object",
                               side_effect=partial(capture, peer_manifest=peer_manifest)):
@@ -703,8 +728,9 @@ class TestMegaMoeExperts(unittest.TestCase):
                     numerics_options=MegaMoeNumericsOptions(swiglu_limit=invalid_limit),
                 )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
+    )
     def test_forward_passes_router_inputs_and_restores_shape(self) -> None:
         """Feature: forward passes router inputs and restores shape.
         Description: Execute forward with router metadata and caller-shaped inputs.
@@ -727,27 +753,25 @@ class TestMegaMoeExperts(unittest.TestCase):
                                     plan=object(), workspace=object(), ensure_capacity=Mock(),
                                     plan_for_tokens=Mock())
         route = SimpleNamespace(
-            routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128, maximum_edge_rows=None),
-            unpermute_mapping=object(), maximum_received_slots=512
+            routed_tokens=object(),
+            metadata=SimpleNamespace(
+                empty_owner_experts=None, replica_route=None, plan_tokens=128, maximum_edge_rows=None
+            ),
+            unpermute_mapping=object(),
+            maximum_received_slots=512,
         )
         resources.plan_for_tokens.return_value = resources.plan
         expert_output = object()
 
         with (
-            patch.object(
-                torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True, create=True
-            ),
+            patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True, create=True),
             patch.object(torch, "npu", Mock(is_current_stream_capturing=Mock(return_value=False)), create=True),
             patch.object(experts, "_get_execution_resources", return_value=resources),
-            patch.object(
-                mega_moe_module, "prepare_topk_route", return_value=route
-            ) as mock_prepare,
+            patch.object(mega_moe_module, "prepare_topk_route", return_value=route) as mock_prepare,
             patch.object(
                 mega_moe_module, "execute_mega_moe_with_permutation", return_value=expert_output
             ) as mock_execute,
-            patch.object(
-                mega_moe_module, "restore_topk_output", return_value=expected
-            ) as mock_restore,
+            patch.object(mega_moe_module, "restore_topk_output", return_value=expected) as mock_restore,
         ):
             actual = experts(
                 hidden_states,
@@ -761,8 +785,14 @@ class TestMegaMoeExperts(unittest.TestCase):
         hidden_flat = mock_prepare.call_args.args[0]
         torch.testing.assert_close(hidden_flat, hidden_states.reshape(128, 16))
         mock_prepare.assert_called_once_with(
-            hidden_flat, topk_ids, topk_weights, resources.spec, tokens_per_expert,
-            workspace=resources.workspace, autograd_mask=13,
+            hidden_flat,
+            topk_ids,
+            topk_weights,
+            resources.spec,
+            tokens_per_expert,
+            workspace=resources.workspace,
+            replica_route=None,
+            autograd_mask=13,
         )
         resources.ensure_capacity.assert_called_once_with(512)
         mock_execute.assert_called_once_with(
@@ -776,9 +806,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             topk_weights=None,
             workspace_claimed=False,
         )
-        mock_restore.assert_called_once_with(
-            expert_output, route.unpermute_mapping, topk_weights
-        )
+        mock_restore.assert_called_once_with(expert_output, route.unpermute_mapping, topk_weights)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -795,7 +823,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         hidden = torch.ones(2, 16, dtype=torch.bfloat16)
         ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
         weights = torch.ones(2, 2)
-        route = SimpleNamespace(metadata=SimpleNamespace(plan_tokens=128, maximum_edge_rows=None))
+        route = SimpleNamespace(metadata=SimpleNamespace(
+            plan_tokens=128, empty_owner_experts=None, maximum_edge_rows=None))
         workspace = Mock()
         resources = SimpleNamespace(
             spec=SimpleNamespace(auto_tokens=True, apply_probs_before_fc2=False,
@@ -838,8 +867,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         probabilities = torch.full((2, 2), 0.5)
         expert_weights = (torch.empty(4, 16, 16, dtype=torch.bfloat16),
                           torch.empty(4, 8, 16, dtype=torch.bfloat16))
-        route = SimpleNamespace(metadata=SimpleNamespace(plan_tokens=128, maximum_edge_rows=None),
-                                maximum_received_slots=4)
+        route = SimpleNamespace(metadata=SimpleNamespace(
+            plan_tokens=128, empty_owner_experts=None, maximum_edge_rows=None), maximum_received_slots=4)
         resources = SimpleNamespace(
             spec=SimpleNamespace(auto_tokens=False, dispatch_mode="push", apply_probs_before_fc2=True),
             workspace=object(), ensure_capacity=Mock(), plan_for_tokens=Mock(return_value=object()),
@@ -961,17 +990,25 @@ class TestMegaMoeExperts(unittest.TestCase):
         layers[-1].close()
         resources.close.assert_called_once_with()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
+    )
     def test_execution_resource_uses_manager_owned_runtime(self) -> None:
         """Feature: execution resource uses manager-owned Runtime.
         Description: Construct and close one execution resource twice.
         Expectation: Reserve and attach through the manager while close only removes the workspace.
         """
         root_group = object()
-        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
-                                     dispatch_mode="push", max_local_num_tokens=None,
-                                     dynamic_tokens=False, auto_tokens=False)
+        bound_spec = SimpleNamespace(
+            replica_slots_per_rank=0,
+            ep_group=root_group,
+            ep_size=1,
+            local_num_tokens=128,
+            dispatch_mode="push",
+            max_local_num_tokens=None,
+            dynamic_tokens=False,
+            auto_tokens=False,
+        )
         workspace = Mock()
         manager = Mock(root_group=root_group, heap_bytes=1024, epoch=0, workspaces=[], growth_records=[])
         manager.reserve.return_value = ({},)
@@ -987,9 +1024,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                 return_value=bound_spec,
             ),
             patch.object(mega_moe_module, "_get_heap_manager", return_value=manager),
-            patch.object(
-                mega_moe_module, "build_mega_moe_plan", return_value=object()
-            ) as mock_build_plan,
+            patch.object(mega_moe_module, "build_mega_moe_plan", return_value=object()) as mock_build_plan,
             patch.object(mega_moe_module, "MegaMoeWorkspace", return_value=workspace),
             patch.object(_automatic._CLEANUP, "root_group", object()),
             patch.object(_collective, "exchange", wraps=_collective.exchange) as exchange,
@@ -1013,17 +1048,25 @@ class TestMegaMoeExperts(unittest.TestCase):
         manager.detach_runtime.assert_not_called()
         self.assertEqual(close_order, ["workspace"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
+    )
     def test_execution_resource_construction_failure_rolls_back_manager_state(self) -> None:
         """Feature: construction failure rolls back manager state.
         Description: Fail plan creation after attaching the sole Runtime reference.
         Expectation: Remove new reservations and detach a newly acquired unused Runtime.
         """
         root_group = object()
-        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
-                                     dispatch_mode="push", max_local_num_tokens=None,
-                                     dynamic_tokens=False, auto_tokens=False)
+        bound_spec = SimpleNamespace(
+            replica_slots_per_rank=0,
+            ep_group=root_group,
+            ep_size=1,
+            local_num_tokens=128,
+            dispatch_mode="push",
+            max_local_num_tokens=None,
+            dynamic_tokens=False,
+            auto_tokens=False,
+        )
 
         manager = Mock(heap_bytes=1024, epoch=0, workspaces=[])
         manager.reserve.return_value = ({},)
@@ -1053,8 +1096,9 @@ class TestMegaMoeExperts(unittest.TestCase):
         manager.rollback_reservations.assert_called_once()
         manager.detach_runtime.assert_called_once_with()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
+    )
     def test_construction_failure_after_restart_preserves_committed_heap(self) -> None:
         """Feature: MegaMoe public API and resource lifecycle.
 
@@ -1063,9 +1107,16 @@ class TestMegaMoeExperts(unittest.TestCase):
         """
         root_group = object()
         specification = {"name": "new resource"}
-        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
-                                     dispatch_mode="push", max_local_num_tokens=None,
-                                     dynamic_tokens=False, auto_tokens=False)
+        bound_spec = SimpleNamespace(
+            replica_slots_per_rank=0,
+            ep_group=root_group,
+            ep_size=1,
+            local_num_tokens=128,
+            dispatch_mode="push",
+            max_local_num_tokens=None,
+            dynamic_tokens=False,
+            auto_tokens=False,
+        )
         growth_record = {"epoch": 1, "heap_bytes": 4096}
         manager = Mock(heap_bytes=2048, epoch=0, workspaces=[object()], growth_records=[])
         manager.attach_runtime.return_value = False

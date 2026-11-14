@@ -38,6 +38,9 @@ class MegaMoeTuningOptions:
         dispatch_split: Dispatch tile rows in forward and backward; a positive
             integer multiple of 128, excluding bool.
         combine_split: Combine tile rows, with the same constraints as dispatch.
+        replica_slots_per_rank: Maximum temporary guest slots per EP rank. Zero
+            keeps owner routing. Positive budgets use exact counts and topology
+            heuristics; the model still owns only its original local parameters.
     """
 
     dispatch_mode: Literal["push", "pull"] = "push"
@@ -45,3 +48,4 @@ class MegaMoeTuningOptions:
     capacity_growth_factor: float | None = None
     dispatch_split: int = 128
     combine_split: int = 128
+    replica_slots_per_rank: int = 0

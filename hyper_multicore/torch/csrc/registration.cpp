@@ -12,18 +12,21 @@
 #include <torch/library.h>
 
 TORCH_LIBRARY(hyper_multicore, m) {
-  m.def("mega_moe_saved_dispatch_version() -> int", []() -> int64_t { return 3; });
-  m.def("mega_moe_normal_trace_version() -> int", []() -> int64_t { return 1; });
-  m.def("mega_moe_compact_version() -> int", []() -> int64_t { return 1; });
-  m.def("mega_moe_adaptive_gradient_version() -> int", []() -> int64_t { return 3; });
-  m.def("mega_moe_empty_dispatch_version() -> int", []() -> int64_t { return 1; });
   m.def("moe_token_permute_out(Tensor tokens, Tensor indices, Tensor(a!) output, Tensor(b!) mapping) "
         "-> (Tensor(a!), Tensor(b!))");
   m.def(
     "mega_moe_unpermute_grad_out(Tensor permuted_tokens, Tensor grad_output, "
     "Tensor sorted_indices, Tensor probs, Tensor(a!) grad_permuted, Tensor(b!) grad_probs) "
     "-> (Tensor(a!), Tensor(b!))");
+  m.def("mega_moe_compact_version() -> int", []() -> int64_t { return 1; });
   m.def("mega_moe_transport_version() -> int", []() -> int64_t { return 1; });
+  m.def("mega_moe_schedule_version() -> int", []() -> int64_t { return 3; });
+  m.def("mega_moe_adaptive_gradient_version() -> int", []() -> int64_t { return 4; });
+  m.def("mega_moe_local_gradient_version() -> int", []() -> int64_t { return 1; });
+  m.def("mega_moe_final_gradient_version() -> int", []() -> int64_t { return 1; });
+  m.def("mega_moe_empty_dispatch_version() -> int", []() -> int64_t { return 1; });
+  m.def("mega_moe_saved_dispatch_version() -> int", []() -> int64_t { return 3; });
+  m.def("mega_moe_normal_trace_version() -> int", []() -> int64_t { return 1; });
   // -------------------------------------------------------------------------
   // mega_moe: MoE-FFN forward operator (wraps aclnnHyperMegaMoe)
   //
