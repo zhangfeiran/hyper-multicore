@@ -22,8 +22,11 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
+import torch
+
 from hyper_multicore.diagnostics.api import prepare_mega_kernel_diagnostics
 from hyper_multicore.diagnostics.common.session import _get_active_session
+from .mxfp8_profile_graph import bind_mx_profile_graph
 
 _SCOPE = ContextVar("mx_profile_scope", default=None)
 
@@ -59,6 +62,7 @@ def resolve_mx_profile_owner(operator: Any, task: Any, context: MxProfileOwnerCo
         task: Current native task descriptor.
         context: Bound expert topology used to resolve the owner.
     """
+    operator = getattr(operator, "_mx_profile_source_operator", operator)
     spec = context.spec
     base = spec.rank_id * spec.local_experts
     if operator.name in ("dispatch", "combine"):
@@ -102,6 +106,22 @@ def mx_profile_capture_enabled() -> bool:
     return True
 
 
+def _bind_mx_profile_runtime(runtime: Any, profile: Any) -> Any:
+    """Preserve the current invocation's FP32 gradient-return runtime envelope.
+
+    The cached diagnostic configuration describes the immutable task graph. MX
+    backward appends an 80-byte invocation-owned envelope with guest destinations
+    and the gradient protocol pointer. Profiling must retain that exact envelope.
+    """
+    suffix_bytes = runtime.runtime.numel() - profile.numel()
+    expected = 80 if runtime.host.kernel_gradients else 0
+    if suffix_bytes != expected:
+        raise ValueError("MX profile runtime does not match the invocation's gradient envelope")
+    if not suffix_bytes:
+        return profile
+    return torch.cat((profile, runtime.runtime[-suffix_bytes:]))
+
+
 def prepare_mx_diagnostics(host: Any, spec: Any, device: Any) -> Any:
     """Prepare lazy task diagnostics for the selected MX worker schedule.
 
@@ -121,6 +141,11 @@ def prepare_mx_diagnostics(host: Any, spec: Any, device: Any) -> Any:
         owner_resolver=resolve_mx_profile_owner,
         owner_context=MxProfileOwnerContext(spec),
         execution_mode="event_driven",
+        graph_adapter=bind_mx_profile_graph,
+        extra_aic_records=2 * spec.replica_slots_per_rank if host.weight_prefetch else 0,
+        extra_aiv_records=(
+            2 * (spec.ep_size + 1) * spec.replica_slots_per_rank + 2 if host.kernel_gradients else 0
+        ),
         vector_worker_stride=(
             1
             if spec.mx_vector_policy
@@ -156,6 +181,7 @@ def profile_mx_launch(
     with runtime.diagnostics.launch(
         parameters, direction=direction, fallback_event_counters=events, tags=scope
     ) as call:
-        # Capture deliberately uses blocking metadata. The normal/async path is untouched.
+        # The pending call owns this complete image through profiling drain.
+        call.arguments.runtime_config = _bind_mx_profile_runtime(runtime, call.runtime_config)
         descriptor = prepare(buffers, call.runtime_config, call.event_counters, spec)
         launch(buffers, call.runtime_config, call.event_counters, call.diagnostic_buffer, descriptor)
