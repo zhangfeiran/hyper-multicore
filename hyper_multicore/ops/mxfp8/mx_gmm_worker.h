@@ -7,6 +7,7 @@
 #include "mx_launch_descriptor.h"
 #include "mx_task_flags.h"
 #include "mx_a5_policy.h"
+#include "runtime/cycle_trace_recorder.h"
 #include "mx_blaze/gemm/block/block_mmad_qgmm_mx.h"
 #include "mx_blaze/gemm/kernel/kernel_qgmm_mx.h"
 
@@ -153,7 +154,8 @@ __aicore__ inline MxWeightReady ResolveMxWeightReady(const Task &task, const MxG
 
 template <class Task>
 __aicore__ inline void WaitMxWeightProjection(const Task &task, const MxGmmDescriptor &r, GM_ADDR *inputs,
-                                              const __gm__ MxLaunchDescriptor *launch) {
+                                              const __gm__ MxLaunchDescriptor *launch,
+                                              MulticoreRuntime::CycleTraceRecorder *trace, uint32_t task_id) {
   const uint32_t position_code = task.extra_value_1 & MX_PROJECTION_READY_MASK;
   if (position_code == 0) return;
   const bool forward = launch->version == 12 && launch->reserved == 11;
@@ -163,6 +165,7 @@ __aicore__ inline void WaitMxWeightProjection(const Task &task, const MxGmmDescr
   if (position >= launch->buffer_count || launch->buffer_bytes[position] != 5 * sizeof(uint64_t)) AscendC::Trap();
   if (r.m == 0 || r.k == 0) return;
   const auto ready = ResolveMxWeightReady(task, r, reinterpret_cast<__gm__ uint64_t *>(inputs[position]), forward);
+  const uint64_t start = trace == nullptr ? 0 : trace->Now();
   AscendC::GlobalTensor<int32_t> flag;
   flag.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(ready.address), 1);
   auto value = reinterpret_cast<__gm__ volatile int32_t *>(ready.address);
@@ -170,6 +173,12 @@ __aicore__ inline void WaitMxWeightProjection(const Task &task, const MxGmmDescr
     AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                       AscendC::DcciDst::CACHELINE_OUT>(flag);
   } while (*value < ready.epoch);
+  if (trace != nullptr) {
+    const auto info = reinterpret_cast<__gm__ uint64_t *>(inputs[position]);
+    const uint32_t projection = (task.inputs[1].input_position - (forward ? 27 : 33)) / 2;
+    const uint32_t slot = r.group_list_offset / sizeof(int64_t) - info[3];
+    trace->Record(0x1000A + projection, task_id, ready.epoch, slot, start, trace->Now());
+  }
 }
 
 template <class Task>
@@ -187,7 +196,8 @@ __aicore__ inline MxOutputRange ResolveMxOutput(const Task &task, const MxGmmDes
 
 template <class Task>
 __aicore__ inline void ExecuteMxGmmTask(const Task &task, GM_ADDR *inputs, const __gm__ MxLaunchDescriptor *launch,
-                                      GM_ADDR guest_output = nullptr, uint64_t home_experts = 0) {
+                                      GM_ADDR guest_output = nullptr, uint64_t home_experts = 0,
+                                      MulticoreRuntime::CycleTraceRecorder *trace = nullptr, uint32_t task_id = 0) {
   CheckMxRange(static_cast<uint64_t>(task.extra_value_0) * sizeof(MxGmmDescriptor), sizeof(MxGmmDescriptor),
                launch->buffer_bytes[task.inputs[3].input_position]);
   auto table = reinterpret_cast<__gm__ MxGmmDescriptor *>(inputs[task.inputs[3].input_position]);
@@ -211,7 +221,7 @@ __aicore__ inline void ExecuteMxGmmTask(const Task &task, GM_ADDR *inputs, const
     ResolveMxGmmGroup(r, start, end);
   }
   const uint64_t m = r.m, n = r.n, k = r.k;
-  WaitMxWeightProjection(task, r, inputs, launch);
+  WaitMxWeightProjection(task, r, inputs, launch, trace, task_id);
   const uint64_t output_bytes = r.output_dtype == static_cast<uint32_t>(MxOutput::BF16) ? 2 : 4;
   const auto output = ResolveMxOutput(task, r, inputs, launch, guest_output, home_experts);
   CheckMxRange(r.x_offset, m * k, launch->buffer_bytes[task.inputs[0].input_position]);

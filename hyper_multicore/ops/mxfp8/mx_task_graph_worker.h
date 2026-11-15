@@ -40,7 +40,7 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
       case 160:
         MulticoreMx::ExecuteMxGmmTask(task, this->input_list, launch,
                                      this->replica_matrix_bases_[task.outputs[0].input_position == 6 ? 3 : 2],
-                                     this->home_experts_);
+                                     this->home_experts_, this->replica_trace_, this->replica_trace_task_);
         break;
       default:
         Trap();

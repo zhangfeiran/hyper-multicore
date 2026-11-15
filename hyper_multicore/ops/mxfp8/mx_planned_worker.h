@@ -48,7 +48,10 @@ class MxPlannedWorker : public MxTaskWorker<VectorWorkerPolicy::ALL> {
       recorder.Init(this->worker_id_, this->input_list[this->DIAGNOSTIC_IDX],
                     getAicProfileRecordCapacity(this->runtimeConfigPtr),
                     getAivProfileRecordCapacity(this->runtimeConfigPtr), getCubeWorkerCapacity(this->runtimeConfigPtr));
-    if (begin == end) return;
+    if (begin == end) {
+      if constexpr (Profiled) RecordComplete(recorder);
+      return;
+    }
     const uint32_t depth = ReadyDepth(PlannedTask(begin));
     const uint32_t total = (end - begin + stride - 1) / stride;
     if (depth && total > 64) AscendC::Trap();
@@ -69,6 +72,15 @@ class MxPlannedWorker : public MxTaskWorker<VectorWorkerPolicy::ALL> {
         ++head;
       }
     }
+    if constexpr (Profiled) RecordComplete(recorder);
+  }
+
+  __aicore__ inline void RecordComplete(CycleTraceRecorder &recorder) {
+    // Planned mode requires completion_event == 0; both endpoints follow all task triggers.
+    const uint64_t done = recorder.Now();
+    recorder.Record(0x1001E, 0, 0, 0xFFFFFFFF, done, done);
+    const uint64_t complete = recorder.Now();
+    recorder.Record(0x1001F, 0, 0, 0xFFFFFFFF, complete, complete);
   }
 
   __aicore__ inline uint32_t ReadyDepth(TaskId id) {
