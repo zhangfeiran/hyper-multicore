@@ -298,7 +298,8 @@ def _allocate_backward_intermediates(
         grad_weight1 = torch.empty_like(weight1, dtype=weight_grad_dtype, memory_format=torch.contiguous_format)
         grad_weight2 = torch.empty_like(weight2, dtype=weight_grad_dtype, memory_format=torch.contiguous_format)
         if not all_experts_active:
-            multicore_ops.zero_empty_expert_gradients(grad_weight1, grad_weight2, group_list)
+            multicore_ops.zero_empty_expert_gradients(
+                grad_weight1[:weight2.shape[0]], grad_weight2, group_list)
     if weight1.shape[0] > weight2.shape[0]:
         grad_weight1[weight2.shape[0]:].zero_()
     act_grad = torch.empty(

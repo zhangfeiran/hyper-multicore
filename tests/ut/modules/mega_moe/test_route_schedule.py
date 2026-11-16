@@ -235,6 +235,26 @@ class TestRouteSchedule(unittest.TestCase):
                 experts._validate_tensors(hidden, (gate, torch.empty(3, 4, 3, dtype=torch.bfloat16)))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_padded_gradient_group_list_uses_real_experts_only(self) -> None:
+        """Cold-expert initialization sees real matrices and clears padded rows separately."""
+        spec = SimpleNamespace(replica_slots_per_rank=0, intermediate_size=3, hidden_size=4)
+        gate, down = torch.ones(3, 6, 4), torch.ones(2, 4, 3)
+        groups = torch.tensor([1, 1], dtype=torch.int64)
+
+        def clear_cold(first, second, cumulative):
+            self.assertEqual(first.shape[0], cumulative.numel())
+            self.assertEqual(second.shape[0], cumulative.numel())
+            first[1].zero_()
+            second[1].zero_()
+
+        with patch.object(function_impl.multicore_ops, "zero_empty_expert_gradients", side_effect=clear_cold):
+            result = function_impl._allocate_backward_intermediates(
+                spec, 4, torch.ones(4, 4), gate, down, group_list=groups)
+        torch.testing.assert_close(result.grad_weight1[1], torch.zeros_like(gate[1]))
+        torch.testing.assert_close(result.grad_weight1[2], torch.zeros_like(gate[2]))
+        torch.testing.assert_close(result.grad_weight2[1], torch.zeros_like(down[1]))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_padded_gradient_initialization_clears_empty_and_unused_rows(self) -> None:
         """Feature: Direct full-shape expert gradients.
 
