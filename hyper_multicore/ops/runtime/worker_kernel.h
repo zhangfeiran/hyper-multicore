@@ -1104,9 +1104,6 @@ class KernelWorkerBase {
   int64_t core_num = 0;
   int64_t vector_num = 0;
   uint32_t active_vector_num = 0;
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
-  bool ready_queue_ = false;
-#endif
   static constexpr uint32_t INVALID_VECTOR_SCHEDULE_INDEX = 0xFFFFFFFF;
 };
 

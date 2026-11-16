@@ -229,7 +229,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     if (task_desc.inputs[0].tensor_type == 2) {
       swi_glu(SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.outputs[0]), nullptr,
               input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
-              GetSwiGluClampLimit(task_desc));
+              GetSwiGluClampLimit(task_desc),
+              GetSwiGluClampPosition(task_desc) == SwiGluClampPosition::AFTER_SILU);
       return;
     }
 

@@ -61,10 +61,7 @@ class MxPlannedWorker : public MxTaskWorker<VectorWorkerPolicy::ALL> {
       const uint32_t selected = depth ? SelectReady(begin, total, stride, depth, finished, head) : head;
       if (selected == total) continue;
       const TaskId id = PlannedTask(begin + selected * stride);
-      if constexpr (Profiled)
-        this->ExecuteTaskProfiled(id, recorder);
-      else
-        this->ExecuteTaskFast(id);
+      this->ExecuteTask(id, Profiled ? DiagnosticMode::PROFILE : DiagnosticMode::NORMAL, recorder);
       if (depth) {
         finished |= uint64_t(1) << selected;
         while (head < total && (finished & (uint64_t(1) << head))) ++head;

@@ -302,7 +302,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       swi_glu_grad(SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.inputs[1]),
                    SharedTensorAddress(task_desc.outputs[0]), input_list[SWIGLU_GRAD_WORKSPACE_IDX],
                    input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
-                  GetSwiGluClampLimit(task_desc));
+                   GetSwiGluClampLimit(task_desc),
+                   GetSwiGluClampPosition(task_desc) == SwiGluClampPosition::AFTER_SILU);
       return;
     }
 

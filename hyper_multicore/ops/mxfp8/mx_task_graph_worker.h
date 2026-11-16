@@ -75,11 +75,34 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
         ExecuteShmemPutMem(task);
         break;
       case 141:
-        this->template ExecuteShmemGetMem<bfloat16_t>(task);
+        ExecuteShmemGetMem<bfloat16_t>(task);
         break;
       default:
         Trap();
     }
+  }
+
+  template <typename T>
+  __aicore__ inline void ExecuteShmemGetMem(const TaskDesc &task) {
+    GM_ADDR tiling = this->input_list[TILING_IDX];
+    const int64_t ep = getExtraValueFromTiling(tiling, 1);
+    const int64_t experts = getExtraValueFromTiling(tiling, 2);
+    const int64_t hidden = getExtraValueFromTiling(tiling, 3);
+    const int64_t tiles = task.task_split_num / experts;
+    const int64_t source_pe = task.task_index / ((experts / ep) * tiles);
+    const int64_t size = reinterpret_cast<__gm__ int32_t *>(
+        this->input_list[task.inputs[3].input_position])[task.inputs[3].base_ptr_offset];
+    const int64_t start = (task.task_index % tiles) * static_cast<int64_t>(task.task_split_value) * hidden;
+    if (start >= size) return;
+    const int64_t tile_elements = static_cast<int64_t>(task.task_split_value) * hidden;
+    const int64_t elements = size - start < tile_elements ? size - start : tile_elements;
+    const int64_t destination = reinterpret_cast<__gm__ int64_t *>(
+        this->input_list[task.inputs[0].input_position])[task.inputs[0].base_ptr_offset];
+    const int64_t source = reinterpret_cast<__gm__ int64_t *>(
+        this->input_list[task.inputs[2].input_position])[task.inputs[2].base_ptr_offset];
+    PullToLocal<T>(this->input_list[task.outputs[0].input_position] + (destination + start) * sizeof(T),
+                   this->input_list[task.inputs[1].input_position] + (source + start) * sizeof(T),
+                   elements, source_pe);
   }
 
   __aicore__ inline void ExecuteShmemPutMem(TaskDesc task_desc) {
