@@ -1,0 +1,34 @@
+name: PR12 pinned workspace
+on:
+  push:
+    branches: [work/pr12-rebase-reuse-20261116]
+    paths: [.github/workflows/pr12-workspace.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Prepare public pinned Git bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir source
+          cd source
+          git init
+          git remote add origin https://github.com/mindspore-ai/hyper-multicore.git
+          git fetch --no-tags origin \
+            797e8bdbb9fb19ba6e1753236bfe47a1178b1b58:refs/heads/master-snapshot \
+            45599d6be3aaf9b6d73178b14bf24dac028e6bfd:refs/heads/pr12-original
+          test "$(git rev-parse master-snapshot)" = 797e8bdbb9fb19ba6e1753236bfe47a1178b1b58
+          test "$(git rev-parse pr12-original)" = 45599d6be3aaf9b6d73178b14bf24dac028e6bfd
+          git bundle create ../pr12-source.bundle master-snapshot pr12-original
+          git bundle verify ../pr12-source.bundle
+      - name: Publish pinned public source
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr12-pinned-source
+          path: pr12-source.bundle
+          retention-days: 1
+          if-no-files-found: error
