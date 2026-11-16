@@ -132,7 +132,11 @@ class TestNativeLoading(unittest.TestCase):
             return 0
 
         function = Mock(side_effect=query)
-        with patch.object(_loader.ctypes, "CDLL", return_value=SimpleNamespace(aclrtGetDeviceInfo=function)):
+        version_file = self.root / "opp" / "version.info"
+        version_file.parent.mkdir()
+        version_file.write_text("Version=9.1.0\n", encoding="utf-8")
+        with patch.dict("os.environ", {"ASCEND_HOME_PATH": str(self.root)}), \
+                patch.object(_loader.ctypes, "CDLL", return_value=SimpleNamespace(aclrtGetDeviceInfo=function)):
             self.assertEqual(_loader.query_npu_arch(), 3510)
             function.side_effect = None
             function.return_value = 507899
@@ -140,7 +144,7 @@ class TestNativeLoading(unittest.TestCase):
                 _loader.query_npu_arch()
 
     def test_cann_85_arch_query_accepts_only_known_910_soc_names(self):
-        """Fallback is limited to old CANN's unsupported attribute and known SoCs."""
+        """Old CANN uses only known SoCs and never probes the unsupported attribute."""
         version_file = self.root / "opp" / "version.info"
         version_file.parent.mkdir()
         version_file.write_text("Version=8.5.2\n", encoding="utf-8")
@@ -154,13 +158,9 @@ class TestNativeLoading(unittest.TestCase):
                 self.assertEqual(_loader.query_npu_arch(), 2201)
             for name in (b"Ascend910A", b"Ascend950PR_9599", None):
                 soc.return_value = name
-                with self.assertRaisesRegex(_loader.NativeComponentUnavailableError, "107000"):
+                with self.assertRaisesRegex(_loader.NativeComponentUnavailableError, "Unsupported CANN 8.5"):
                     _loader.query_npu_arch()
-            soc.return_value = b"Ascend910B2C"
-            query.return_value = 507899
-            with self.assertRaisesRegex(_loader.NativeComponentUnavailableError, "507899"):
-                _loader.query_npu_arch()
-            query.return_value = 107000
+            query.assert_not_called()
             version_file.write_text("Version=9.1.0\n", encoding="utf-8")
             with self.assertRaisesRegex(_loader.NativeComponentUnavailableError, "107000"):
                 _loader.query_npu_arch()

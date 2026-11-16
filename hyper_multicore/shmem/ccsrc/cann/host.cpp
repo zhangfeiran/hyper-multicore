@@ -425,30 +425,28 @@ runtime::Result<DeviceIdentity> query_device_identity() {
     return runtime::Result<DeviceIdentity>::Failure(current_device.error());
   }
 
-  int64_t npu_arch = 0;
-  // The enum value is absent from older headers, including CANN 8.5.
-  constexpr auto kNpuArchAttribute = static_cast<aclrtDevAttr>(601);
-  const aclError arch_status = aclrtGetDeviceInfo(current_device.value(), kNpuArchAttribute, &npu_arch);
   const char *device_soc_name = aclrtGetSocName();
-  if (arch_status != ACL_SUCCESS) {
-#ifdef HP_SHMEM_LEGACY_NPU_ARCH
-    // ACL 8.5 reports RT_PARAM_INVALID for the newer attribute. Accept only
-    // known 910B/910_93 names; all other failures and devices remain errors.
-    constexpr aclError kRtParamInvalid = 107000;
-    if (arch_status == kRtParamInvalid && device_soc_name != nullptr &&
-        (std::string_view(device_soc_name).find("Ascend910B") == 0 ||
-         std::string_view(device_soc_name).find("Ascend910_93") == 0)) {
-      npu_arch = kAscend910NpuArch;
-    } else
-#endif
-    {
-      return runtime::Result<DeviceIdentity>::Failure(AclFailure("aclrtGetDeviceInfo(NPU_ARCH)", arch_status));
-    }
-  }
   if (device_soc_name == nullptr || device_soc_name[0] == '\0') {
     return runtime::Result<DeviceIdentity>::Failure(runtime::Status{
       runtime::ErrorCode::UnsupportedCapability, std::nullopt, "aclrtGetSocName returned an empty SoC name"});
   }
+  int64_t npu_arch = 0;
+#ifdef HP_SHMEM_LEGACY_NPU_ARCH
+  // Do not probe the unsupported attribute: it leaves a stale ACL thread error.
+  if (std::string_view(device_soc_name).find("Ascend910B") != 0 &&
+      std::string_view(device_soc_name).find("Ascend910_93") != 0) {
+    return runtime::Result<DeviceIdentity>::Failure(runtime::Status{
+      runtime::ErrorCode::UnsupportedCapability, std::nullopt,
+      std::string("Unsupported legacy CANN SHMEM SoC: ") + device_soc_name});
+  }
+  npu_arch = kAscend910NpuArch;
+#else
+  constexpr auto kNpuArchAttribute = static_cast<aclrtDevAttr>(601);
+  const aclError arch_status = aclrtGetDeviceInfo(current_device.value(), kNpuArchAttribute, &npu_arch);
+  if (arch_status != ACL_SUCCESS) {
+    return runtime::Result<DeviceIdentity>::Failure(AclFailure("aclrtGetDeviceInfo(NPU_ARCH)", arch_status));
+  }
+#endif
   return runtime::Result<DeviceIdentity>::Success(DeviceIdentity{current_device.value(), npu_arch, device_soc_name});
 }
 

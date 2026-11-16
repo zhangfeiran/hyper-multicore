@@ -201,27 +201,27 @@ def validate_native_compatibility() -> dict:
 def query_npu_arch() -> int:
     """Read visible logical device 0's architecture without creating a device context."""
     acl = ctypes.CDLL("libascendcl.so", mode=ctypes.RTLD_LOCAL)
+    # CANN 8.5 lacks the attribute and probing it leaves a stale ACL error in
+    # the calling thread. Select only explicitly supported SoCs without probing.
+    try:
+        version_file = Path(os.environ["ASCEND_HOME_PATH"]) / "opp/version.info"
+        legacy = any(line.strip().startswith("Version=8.5.") for line in version_file.read_text().splitlines())
+    except (OSError, KeyError):
+        legacy = False
+    if legacy:
+        soc_name = acl.aclrtGetSocName
+        soc_name.argtypes = []
+        soc_name.restype = ctypes.c_char_p
+        name = soc_name()
+        if name and name.startswith((b"Ascend910B", b"Ascend910_93")):
+            return 2201
+        raise NativeComponentUnavailableError(f"Unsupported CANN 8.5 SoC for SHMEM: {name!r}")
     query = acl.aclrtGetDeviceInfo
     query.argtypes = [ctypes.c_uint32, ctypes.c_int32, ctypes.POINTER(ctypes.c_int64)]
     query.restype = ctypes.c_int32
     arch = ctypes.c_int64()
     status = query(0, _ACL_DEV_ATTR_NPU_ARCH, ctypes.byref(arch))
     if status != 0:
-        # CANN 8.5 lacks this attribute and returns ACL_ERROR_RT_PARAM_INVALID.
-        # Its SoC name is usable without creating a device context, but only
-        # known 910B/910_93 names are sufficient to select a backend safely.
-        try:
-            version_file = Path(os.environ["ASCEND_HOME_PATH"]) / "opp/version.info"
-            legacy = any(line.strip().startswith("Version=8.5.") for line in version_file.read_text().splitlines())
-        except (OSError, KeyError):
-            legacy = False
-        if legacy and status == 107000:
-            soc_name = acl.aclrtGetSocName
-            soc_name.argtypes = []
-            soc_name.restype = ctypes.c_char_p
-            name = soc_name()
-            if name and name.startswith((b"Ascend910B", b"Ascend910_93")):
-                return 2201
         raise NativeComponentUnavailableError(f"aclrtGetDeviceInfo(NPU_ARCH) failed for visible device 0: {status}")
     return arch.value
 

@@ -37,6 +37,7 @@ constexpr int32_t kDeviceIndex = 3;
 aclError g_device_status = ACL_SUCCESS;
 aclError g_arch_status = ACL_SUCCESS;
 int64_t g_npu_arch = 3510;
+int g_arch_calls = 0;
 char g_device_soc_name[64] = {};
 bool g_null_soc = false;
 
@@ -48,8 +49,11 @@ void test_identity_values() {
   const struct {
     int64_t arch;
     const char *soc;
-  } devices[] = {{2201, "Ascend910B4"}, {2201, "Ascend910_9391"}, {3510, "Ascend950PR_9599"},
-                 {3510, "Ascend950DT_9591"}, {3510, "FutureDeviceName"}};
+  } devices[] = {{2201, "Ascend910B4"}, {2201, "Ascend910_9391"},
+#ifndef HP_SHMEM_LEGACY_NPU_ARCH
+                 {3510, "Ascend950PR_9599"}, {3510, "Ascend950DT_9591"}, {3510, "FutureDeviceName"},
+#endif
+                };
   for (const auto &device : devices) {
     g_npu_arch = device.arch;
     std::copy_n(device.soc, std::strlen(device.soc) + 1, g_device_soc_name);
@@ -70,6 +74,7 @@ void test_query_failures() {
   check(device_failure.error().cann_error_code == g_device_status, "device error code was lost");
   g_device_status = ACL_SUCCESS;
 
+#ifndef HP_SHMEM_LEGACY_NPU_ARCH
   g_arch_status = ACL_ERROR_INVALID_PARAM;
   const auto arch_failure = query_device_identity();
   check(!arch_failure.ok(), "architecture query failure was ignored");
@@ -78,6 +83,7 @@ void test_query_failures() {
   check(arch_failure.error().message.find("aclrtGetDeviceInfo(NPU_ARCH)") != std::string::npos,
         "failed architecture query was not identified");
   g_arch_status = ACL_SUCCESS;
+#endif
 
 #ifdef HP_SHMEM_LEGACY_NPU_ARCH
   g_arch_status = 107000;
@@ -89,6 +95,7 @@ void test_query_failures() {
   const char *unknown = "Ascend910A";
   std::copy_n(unknown, std::strlen(unknown) + 1, g_device_soc_name);
   check(!query_device_identity().ok(), "unknown legacy SoC was accepted");
+  check(g_arch_calls == 0, "legacy CANN unexpectedly queried the unsupported attribute");
   g_arch_status = ACL_SUCCESS;
 #endif
 
@@ -109,6 +116,7 @@ extern "C" aclError aclrtGetDevice(int32_t *device_id) {
 }
 
 extern "C" aclError aclrtGetDeviceInfo(uint32_t device_id, aclrtDevAttr attr, int64_t *value) {
+  ++g_arch_calls;
   if (device_id != kDeviceIndex || attr != static_cast<aclrtDevAttr>(601)) return ACL_ERROR_INVALID_PARAM;
   *value = g_npu_arch;
   return g_arch_status;
