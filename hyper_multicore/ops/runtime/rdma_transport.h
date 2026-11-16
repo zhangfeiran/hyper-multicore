@@ -120,7 +120,7 @@ class RdmaTransport {
   uint64_t source_rows = 1;
 
  private:
-  __aicore__ inline GM_ADDR RegisteredRemoteAddress(GM_ADDR symmetric, uint32_t bytes, uint32_t peer) const {
+  __aicore__ inline GM_ADDR CheckedSymmetricAddress(GM_ADDR symmetric, uint32_t bytes, uint32_t peer) const {
     auto state = aclshmemi_get_state();
     const uint64_t base = reinterpret_cast<uint64_t>(state->heap_base);
     const uint64_t address = reinterpret_cast<uint64_t>(symmetric);
@@ -130,9 +130,10 @@ class RdmaTransport {
     auto info = aclshmemi_qp_info_fetch();
     auto region = reinterpret_cast<__gm__ aclshmemi_rdma_mem_info *>(info->mem_ptr) + peer;
     if (bytes > region->size || offset > region->size - bytes) AscendC::Trap();
-    // P2P mappings belong to this process and can differ from the peer's RNIC-registered VA.
-    // The SDK's generic RoCE NBI wrappers translate through aclshmem_ptr(), which assumes equal VAs.
-    return reinterpret_cast<GM_ADDR>(region->addr + offset);
+    // The locked SHMEM SDK translates the local symmetric address to the
+    // peer's RNIC-registered VA when posting the WQE. Translating here as well
+    // applies the heap-base offset twice when registered VAs differ by rank.
+    return symmetric;
   }
 
   template <bool Read>
@@ -148,10 +149,10 @@ class RdmaTransport {
     double_words.address_.bufferAddr = reinterpret_cast<uint64_t>(scratch) + UB_ALIGN_SIZE;
     double_words.address_.dataLen = UB_ALIGN_SIZE;
     if constexpr (Read) {
-      aclshmemi_roce_read(destination, RegisteredRemoteAddress(source, bytes, peer), peer, 0,
+      aclshmemi_roce_read(destination, CheckedSymmetricAddress(source, bytes, peer), peer, 0,
                           bytes, double_words, words, 0);
     } else {
-      aclshmemi_roce_write(RegisteredRemoteAddress(destination, bytes, peer), source, peer, 0,
+      aclshmemi_roce_write(CheckedSymmetricAddress(destination, bytes, peer), source, peer, 0,
                            bytes, double_words, words, 0);
     }
 #endif

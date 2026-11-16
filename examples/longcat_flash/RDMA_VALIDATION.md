@@ -88,7 +88,8 @@ python -m torch.distributed.run --standalone --nproc-per-node=16 \
 ## 设备协议与存储
 
 - 每个 peer/QP 固定一个 AIV 提交普通 NBI 与 quiet，不使用不受该后端支持的多 AIV 同 QP 并发提交。
-- RoCE 以对端 RNIC 注册区域的基址加对称 heap 内偏移形成远端地址，并检查区域边界。
+- RoCE 检查对称 heap 和对端 RNIC 注册区域的边界，将本地对称地址交给锁定的 SHMEM SDK；
+  该 SDK 提交 WQE 时以对端注册基址加 heap 内偏移形成远端地址，调用方不再重复换算。
   P2P 映射属于当前进程，可能与对端注册的虚拟地址不同；不能直接用 MTE 的映射地址提交 RDMA。
   MTE 仍使用 SDK 的 P2P 映射，不改写全局映射表。
 - 本地协调 AIV 仅更新本次 generation 和本地启动事件。每个 peer 的 ready、数据、credit、quiet
