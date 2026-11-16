@@ -860,7 +860,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
         weights = torch.ones(2, 2)
         route = SimpleNamespace(metadata=SimpleNamespace(
-            plan_tokens=128, empty_owner_experts=None, maximum_edge_rows=None))
+            plan_tokens=128, empty_owner_experts=None, maximum_edge_rows=None), maximum_received_slots=4)
         workspace = Mock()
         resources = SimpleNamespace(
             spec=SimpleNamespace(auto_tokens=True, apply_probs_before_fc2=False,
