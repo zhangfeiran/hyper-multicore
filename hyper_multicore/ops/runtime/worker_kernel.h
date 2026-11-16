@@ -659,30 +659,57 @@ class KernelWorkerBase {
     }
   }
 
-  // Share the compute call site across diagnostics. Replicating the entire
-  // inlined task dispatcher for each mode exceeds the AIV scalar stack limit.
+  struct RdmaQueueCursor {
+    uint32_t owner;
+    uint32_t owners;
+    uint32_t phase;
+    uint32_t slot;
+  };
+
+  // Keep one task-dispatch call site for normal, profiled, and RDMA work.
   __aicore__ inline void ProcessTasks(DiagnosticMode mode, CycleTraceRecorder &recorder) {
 #ifdef HMC_RUNTIME_CUBE
     uint32_t block_idx = this->worker_id_;
     const uint32_t count = this->cube_task_num;
     const uint32_t stride = this->core_num;
 #else
-    if (rdma_.enabled && this->worker_id_ % 2 == 0) {
-      ProcessRdmaCommunicationQueue(mode, recorder);
-      return;
-    }
-    if (ready_queue_) {
+    const bool rdma_owner = rdma_.enabled && this->worker_id_ % 2 == 0;
+    RdmaQueueCursor cursor{0, 0, 0, 0};
+    if (rdma_owner) {
+      cursor.owner = this->worker_id_ / 2;
+      cursor.owners = RdmaOwnerCount();
+      if (cursor.owner >= cursor.owners) return;
+      ExchangeRdmaEpoch(false);
+      executing_communication_ = true;
+    } else if (ready_queue_) {
       ProcessVectorReady(mode, recorder);
       return;
     }
-    uint32_t block_idx = GetVectorScheduleIndex();
+    uint32_t block_idx = rdma_owner ? 0 : GetVectorScheduleIndex();
     if (block_idx == INVALID_VECTOR_SCHEDULE_INDEX) return;
     const uint32_t count = this->vector_task_num;
     const uint32_t stride = this->active_vector_num;
 #endif
-    for (; block_idx < count; block_idx += stride) {
-      ExecuteTask(GetTaskIndex(block_idx), mode, recorder);
+    for (;;) {
+      TaskId task_id;
+#ifndef HMC_RUNTIME_CUBE
+      if (rdma_owner) {
+        if (!NextRdmaCommunicationTask(cursor, task_id)) break;
+      } else
+#endif
+      {
+        if (block_idx >= count) break;
+        task_id = GetTaskIndex(block_idx);
+        block_idx += stride;
+      }
+      ExecuteTask(task_id, mode, recorder);
     }
+#ifndef HMC_RUNTIME_CUBE
+    if (rdma_owner) {
+      ExchangeRdmaEpoch(true);
+      executing_communication_ = false;
+    }
+#endif
   }
 
   __aicore__ inline bool IsQueuedTaskReady(TaskId task_id) {
@@ -1136,31 +1163,30 @@ class KernelWorkerBase {
 #endif
   }
 
-  __aicore__ inline void ProcessRdmaCommunicationQueue(DiagnosticMode mode, CycleTraceRecorder &recorder) {
+  __aicore__ inline bool NextRdmaCommunicationTask(RdmaQueueCursor &cursor, TaskId &selected) {
 #ifndef HMC_RUNTIME_CUBE
-    const uint32_t owner = worker_id_ / 2;
-    const uint32_t owners = RdmaOwnerCount();
-    if (owner >= owners) return;
-    ExchangeRdmaEpoch(false);
-    executing_communication_ = true;
-    // All dispatches precede return waits: a blocked Combine must never prevent a later peer's dispatch.
-    for (uint32_t phase = 0; phase < 2; ++phase) {
-      for (uint32_t slot = 0; slot < vector_task_num; ++slot) {
-        TaskId id = GetTaskIndex(slot);
-        TaskDesc task;
-        getTaskDesc(runtimeConfigPtr, &task, id);
-        if (!IsCommunication(task) || CommunicationPeer(task) % owners != owner) continue;
-        if ((task.inputs[1].input_position == 2) != (phase == 0)) continue;
-        ExecuteTask(id, mode, recorder);
+    const uint32_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+    while (cursor.phase < 2) {
+      while (cursor.slot < vector_task_num) {
+        const TaskId id = GetTaskIndex(cursor.slot++);
+        auto task = reinterpret_cast<__gm__ const TaskDesc *>(
+            runtimeConfigPtr + getAllTasksOffset(runtimeConfigPtr) + id * sizeof(TaskDesc));
+        const auto kind = task->task_type;
+        if (kind != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL && kind != TaskType::TASK_SHMEM_GET_MEM) continue;
+        const uint32_t peer = task->task_index / (task->task_split_num / ep);
+        if (peer % cursor.owners != cursor.owner) continue;
+        if ((task->inputs[1].input_position == 2) != (cursor.phase == 0)) continue;
+        selected = id;
+        return true;
       }
-      const uint32_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
-      for (uint32_t peer = owner; peer < ep; peer += owners) {
+      for (uint32_t peer = cursor.owner; peer < ep; peer += cursor.owners) {
         if (rdma_.UsesRdma(peer)) rdma_.Quiet(peer);
       }
+      ++cursor.phase;
+      cursor.slot = 0;
     }
-    ExchangeRdmaEpoch(true);
-    executing_communication_ = false;
 #endif
+    return false;
   }
 
   __aicore__ inline bool UsesRdmaTransfer(const TaskDesc &task) const {

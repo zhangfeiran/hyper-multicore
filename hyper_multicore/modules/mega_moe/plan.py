@@ -278,6 +278,10 @@ def _build_backward_runtime_graph(spec, task_values, weight_grad_dtype, compact)
 
 def _compact_schedule_requested(spec: MegaMoeSpec) -> bool:
     """Retain current owner compaction and explicitly qualified physical schedules."""
+    # RDMA dedicates half of the vector workers to peer-owned communication;
+    # the compact ready queue instead assumes that all vector workers consume it.
+    if rdma.enabled(spec):
+        return False
     return spec._compact_schedule or (
         not spec.replica_slots_per_rank and not spec._fuse_saved_dispatch
         and spec.dispatch_mode == "push" and spec.intermediate_size < 2048
@@ -345,7 +349,8 @@ def _build_runtime_artifacts(
 
 def _resolve_compact_schedule(spec, device, automatic):
     """Retain explicit research schedules and older adapters on their existing path."""
-    compatible = (automatic and spec.dispatch_mode == "push" and spec.expert_weight_layout == "EIO"
+    compatible = (automatic and not rdma.enabled(spec) and spec.dispatch_mode == "push"
+                  and spec.expert_weight_layout == "EIO"
                   and spec._gradient_queue_order in ("original", "device_active_w1_lanes")
                   and spec.intermediate_size < 2048
                   and not (spec._batch_empty_dispatch or spec._batch_empty_combine))

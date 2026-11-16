@@ -16,6 +16,7 @@
 
 import os
 import struct
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 import unittest
@@ -201,3 +202,16 @@ class TestRdmaTransport(unittest.TestCase):
                     self.assertEqual(runtime.all_event_num_triggers[runtime.completion_event], 64)
                     self.assertLess(runtime.completion_event + 8, mega_moe_event_capacity(128, 16))
                     self.assertEqual(runtime.protocol_version, 1)
+
+    def test_rdma_reserves_vector_workers_even_with_compact_requested(self) -> None:
+        """Dedicated RDMA owners cannot also consume the all-vector ready queue."""
+        base = MegaMoeSpec(local_num_tokens=4096, hidden_size=5120, intermediate_size=1792,
+                           num_experts=24, top_k=8, initial_capacity_factor=1.25,
+                           receive_capacity=40960, ep_size=4, ep_group=None, rank_id=0,
+                           num_cube_cores=4, dispatch_mode="push", _compact_schedule=True)
+        for engine in ("mte_roce", "roce"):
+            with self.subTest(engine=engine):
+                _, forward, _, backward = _build_runtime_artifacts(replace(base, shmem_data_engine=engine))
+                self.assertEqual((forward.vector_ready_queue, backward.vector_ready_queue), (0, 0))
+        _, forward, _, backward = _build_runtime_artifacts(base)
+        self.assertEqual((forward.vector_ready_queue, backward.vector_ready_queue), (1, 1))
