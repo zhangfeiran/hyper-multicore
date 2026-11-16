@@ -631,7 +631,10 @@ time.sleep(30)
                 second_key = next(line for line in second.stdout.splitlines() if line.startswith("KEY="))
                 self.assertEqual(first_key != second_key, soc == "ascend950")
                 self.assertIn(f"BACKEND={backend}", second.stdout)
-                self.assertIn(f"-DSOC_TYPE={backend}", Path(fixture.env["TOOL_CALLS"]).read_text(encoding="utf-8"))
+                calls = Path(fixture.env["TOOL_CALLS"]).read_text(encoding="utf-8")
+                self.assertIn(f"-DSOC_TYPE={backend}", calls)
+                self.assertIn(f"-DACLSHMEM_RDMA_SUPPORT={'OFF' if soc == 'ascend950' else 'ON'}", calls)
+                self.assertNotIn(f"-DACLSHMEM_RDMA_SUPPORT={'ON' if soc == 'ascend950' else 'OFF'}", calls)
 
     def vendor_fixture(self, compile_soc: str, series: list[str]) -> Path:
         """Build the smallest complete six-operator vendor with shared host fixtures."""

@@ -240,17 +240,22 @@ PY
     echo "  soc family: ${soc_type}"
     echo "  install root: ${install_root}"
 
+    local rdma_support=ON
+    if [[ "${soc_type}" == Ascend950 ]]; then
+        # The Ascend950 backend remains opt-in until its NIC backend is selected.
+        rdma_support=OFF
+    fi
+
     cmake -S "${wrapper}" \
         -B "${build_dir}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DHP_SHMEM_SOURCE_DIR="${source_dir}" \
         -DUSE_CXX11_ABI=ON \
-        -DACLSHMEM_RDMA_SUPPORT=ON \
         -DUSE_UNIT_TEST=OFF \
         -DUSE_EXAMPLES=OFF \
         -DBUILD_PYTHON=OFF \
         -DCMAKE_DISABLE_FIND_PACKAGE_MPI=TRUE \
-        -DACLSHMEM_RDMA_SUPPORT=OFF \
+        -DACLSHMEM_RDMA_SUPPORT="${rdma_support}" \
         -DSOC_TYPE="${soc_type}"
     cmake --build "${build_dir}" --parallel "${native_jobs}"
     cmake --install "${build_dir}" --prefix "${install_root}/shmem"
