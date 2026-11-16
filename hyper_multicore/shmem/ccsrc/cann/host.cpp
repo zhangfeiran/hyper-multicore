@@ -426,11 +426,25 @@ runtime::Result<DeviceIdentity> query_device_identity() {
   }
 
   int64_t npu_arch = 0;
-  const aclError arch_status = aclrtGetDeviceInfo(current_device.value(), ACL_DEV_ATTR_NPU_ARCH, &npu_arch);
-  if (arch_status != ACL_SUCCESS) {
-    return runtime::Result<DeviceIdentity>::Failure(AclFailure("aclrtGetDeviceInfo(NPU_ARCH)", arch_status));
-  }
+  // The enum value is absent from older headers, including CANN 8.5.
+  constexpr auto kNpuArchAttribute = static_cast<aclrtDevAttr>(601);
+  const aclError arch_status = aclrtGetDeviceInfo(current_device.value(), kNpuArchAttribute, &npu_arch);
   const char *device_soc_name = aclrtGetSocName();
+  if (arch_status != ACL_SUCCESS) {
+#ifdef HP_SHMEM_LEGACY_NPU_ARCH
+    // ACL 8.5 reports RT_PARAM_INVALID for the newer attribute. Accept only
+    // known 910B/910_93 names; all other failures and devices remain errors.
+    constexpr aclError kRtParamInvalid = 107000;
+    if (arch_status == kRtParamInvalid && device_soc_name != nullptr &&
+        (std::string_view(device_soc_name).find("Ascend910B") == 0 ||
+         std::string_view(device_soc_name).find("Ascend910_93") == 0)) {
+      npu_arch = kAscend910NpuArch;
+    } else
+#endif
+    {
+      return runtime::Result<DeviceIdentity>::Failure(AclFailure("aclrtGetDeviceInfo(NPU_ARCH)", arch_status));
+    }
+  }
   if (device_soc_name == nullptr || device_soc_name[0] == '\0') {
     return runtime::Result<DeviceIdentity>::Failure(runtime::Status{
       runtime::ErrorCode::UnsupportedCapability, std::nullopt, "aclrtGetSocName returned an empty SoC name"});

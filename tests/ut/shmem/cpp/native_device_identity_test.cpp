@@ -79,6 +79,19 @@ void test_query_failures() {
         "failed architecture query was not identified");
   g_arch_status = ACL_SUCCESS;
 
+#ifdef HP_SHMEM_LEGACY_NPU_ARCH
+  g_arch_status = 107000;
+  for (const char *soc : {"Ascend910B2C", "Ascend910_9382"}) {
+    std::copy_n(soc, std::strlen(soc) + 1, g_device_soc_name);
+    const auto legacy = query_device_identity();
+    check(legacy.ok() && legacy.value().npu_arch == 2201, "legacy 910 architecture was not recognized");
+  }
+  const char *unknown = "Ascend910A";
+  std::copy_n(unknown, std::strlen(unknown) + 1, g_device_soc_name);
+  check(!query_device_identity().ok(), "unknown legacy SoC was accepted");
+  g_arch_status = ACL_SUCCESS;
+#endif
+
   g_device_soc_name[0] = '\0';
   for (bool null_soc : {false, true}) {
     g_null_soc = null_soc;
@@ -96,7 +109,7 @@ extern "C" aclError aclrtGetDevice(int32_t *device_id) {
 }
 
 extern "C" aclError aclrtGetDeviceInfo(uint32_t device_id, aclrtDevAttr attr, int64_t *value) {
-  if (device_id != kDeviceIndex || attr != ACL_DEV_ATTR_NPU_ARCH) return ACL_ERROR_INVALID_PARAM;
+  if (device_id != kDeviceIndex || attr != static_cast<aclrtDevAttr>(601)) return ACL_ERROR_INVALID_PARAM;
   *value = g_npu_arch;
   return g_arch_status;
 }

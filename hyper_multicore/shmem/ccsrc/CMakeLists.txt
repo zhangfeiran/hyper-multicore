@@ -39,6 +39,12 @@ else()
     set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 endif()
 
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES "${ASCEND_HOME_PATH}/include")
+check_cxx_source_compiles("#include <acl/acl.h>\nint main() { return static_cast<int>(ACL_DEV_ATTR_NPU_ARCH); }"
+    HP_SHMEM_HAS_NPU_ARCH_ATTR)
+unset(CMAKE_REQUIRED_INCLUDES)
+
 # Read the aclshmem environment.
 if(NOT DEFINED ENV{SHMEM_HOME_PATH})
     message(FATAL_ERROR
@@ -99,6 +105,9 @@ add_library(hyper_multicore_shmem_runtime STATIC
     cann/host.cpp
     cann/log.cpp
 )
+if(NOT HP_SHMEM_HAS_NPU_ARCH_ATTR)
+    target_compile_definitions(hyper_multicore_shmem_runtime PUBLIC HP_SHMEM_LEGACY_NPU_ARCH)
+endif()
 if(HP_SHMEM_SOC_TYPE STREQUAL "Ascend950")
     target_compile_definitions(hyper_multicore_shmem_runtime PUBLIC HP_SHMEM_ASCEND950)
 endif()
