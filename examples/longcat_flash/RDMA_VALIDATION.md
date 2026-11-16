@@ -119,6 +119,9 @@ python -m torch.distributed.run --standalone --nproc-per-node=16 \
 
 ## 本地验收记录
 
+以下记录来自 rebase 前的提交 `d2ec04c6e0512c75b224a59936b4a66610f26300`，
+用于保留实验出处，不能作为当前提交的验收结果。当前版本需要重新构建并逐 rank 验证。
+
 2026-11-12 使用独立 HPM、16 个 Ascend910_9382 逻辑 NPU、aarch64、Python 3.11、
 PyTorch/torch-npu 2.9.1、CANN 9.1.0 完成以下检查。模型维度保持为上方配置。
 原生库编译目标包含 `ascend910_93` 和 `ascend910b`；910B2C/x86_64 尚无实机验收。
