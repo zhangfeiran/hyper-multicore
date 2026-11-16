@@ -638,7 +638,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                                            start, size_, send_data_size_);
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
       if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
-        if (task_desc.extra_value_1 == 1) {
+        if ((task_desc.extra_value_1 & 1U) != 0) {
           credit = EmptyTailCompletionCredit(value, single_expert_task_num, size_, send_data_size_);
         }
       }

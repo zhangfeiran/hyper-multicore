@@ -23,7 +23,7 @@ from unittest.mock import patch
 
 import torch
 
-from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
+from hyper_multicore.modules.mega_moe.module import A5MegaMoeExperts as MegaMoeExperts
 from hyper_multicore.modules.mega_moe.plan import _build_runtime_artifacts, _resolve_a5_execution_spec
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec, bind_mega_moe_spec
 from hyper_multicore.scheduler.config import TaskType

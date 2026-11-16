@@ -27,7 +27,7 @@ import torch
 
 from tests.common.mark_utils import arg_mark
 
-from hyper_multicore.replica import _metadata, routing
+from hyper_multicore.replica import _metadata, routing, _a5_routing
 from hyper_multicore.replica.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.mega_moe.module import _MegaMoeExecutionResources
 from hyper_multicore.modules.mega_moe.mxfp8_module import _MXFP8Resources
@@ -127,7 +127,9 @@ class TestReplicaCountHeaders(unittest.TestCase):
         """
         cache = _metadata._ReplicaCountHeaderCache()
         config = ExpertReplicaConfig(2, 1, 1)
-        with patch.object(routing, '_gather_replica_counts', wraps=routing._gather_replica_counts) as gather:
+        with (patch.object(routing, '_gather_replica_counts', wraps=routing._gather_replica_counts) as gather,
+              patch.object(_a5_routing, '_gather_replica_counts',
+                           wraps=_a5_routing._gather_replica_counts) as a5_gather):
             for values in ([0, 1], [0, 0], [0, 1]):
                 ids = torch.tensor(values, dtype=torch.int64).reshape(2, 1)
                 counts = torch.bincount(ids.flatten(), minlength=2).int()
@@ -137,12 +139,12 @@ class TestReplicaCountHeaders(unittest.TestCase):
                 self.assertEqual(actual.plan.logical_counts, reference.plan.logical_counts)
                 self.assertTrue(torch.equal(actual.physical_ids, reference.physical_ids))
             ids = torch.tensor([[0], [1]])
-            gather.return_value = torch.tensor([[1, 1, 1, 0, 2, 31]], dtype=torch.int64)
+            a5_gather.return_value = torch.tensor([[1, 1, 1, 0, 2, 31]], dtype=torch.int64)
             with self.assertRaisesRegex(ValueError, 'in-range'):
                 routing.prepare_replica_route(ids, config, compact_home=True, dynamic_header=(0, 2, 31),
                                               _trusted_counts=torch.tensor([1, 1], dtype=torch.int32),
                                               _count_header_cache=cache)
-        self.assertEqual(gather.call_count, 7)
+        self.assertEqual(gather.call_count + a5_gather.call_count, 7)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

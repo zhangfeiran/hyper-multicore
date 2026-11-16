@@ -22,7 +22,7 @@ from unittest.mock import patch
 import torch
 
 from hyper_multicore.modules.mega_moe import function as moe_function
-from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
+from hyper_multicore.modules.mega_moe.module import A5MegaMoeExperts as MegaMoeExperts
 from hyper_multicore.modules.mega_moe.plan import _build_runtime_artifacts
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_moe.workspace import _workspace_allocation_specs

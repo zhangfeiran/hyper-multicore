@@ -19,7 +19,7 @@ import unittest
 from unittest.mock import patch
 
 from hyper_multicore.replica.capacity import ExpertReplicaConfig
-from hyper_multicore.replica import planner
+from hyper_multicore.replica import _calibrated_planner as planner
 
 
 def traffic(plan: object, nodes: tuple[int, ...]) -> tuple[int, int]:

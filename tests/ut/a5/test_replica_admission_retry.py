@@ -20,6 +20,7 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from hyper_multicore.replica import planner
+from hyper_multicore.replica import _calibrated_planner
 from hyper_multicore.replica.cost import ExpertReplicaCostModel
 
 
@@ -43,7 +44,7 @@ class TestReplicaAdmissionRetry(unittest.TestCase):
                 options = dict(adaptive=True, minimum_replica_rows=1024, minimum_load_reduction=.4,
                                capacity_limit=196608, receive_capacity=196608)
                 expected = planner._build_expert_replica_plan(counts, budget, target_load=24576, **options)
-                with patch.object(planner, '_uncalibrated_copies', wraps=planner._uncalibrated_copies) as select:
+                with patch.object(_calibrated_planner, '_uncalibrated_copies', wraps=_calibrated_planner._uncalibrated_copies) as select:
                     actual = planner._build_expert_replica_plan(counts, budget, target_load=30720, **options)
                 actual.validate()
                 self.assertTrue(expected.transfers)
@@ -79,7 +80,7 @@ class TestReplicaAdmissionRetry(unittest.TestCase):
         counts = [[4096] * 6 + [0] * 42 for _ in range(8)]
         for budget in (2, 6):
             with self.subTest(budget=budget):
-                with patch.object(planner, '_uncalibrated_copies', wraps=planner._uncalibrated_copies) as select:
+                with patch.object(_calibrated_planner, '_uncalibrated_copies', wraps=_calibrated_planner._uncalibrated_copies) as select:
                     actual = planner._build_expert_replica_plan(
                         counts, budget, adaptive=True, target_load=30720, minimum_replica_rows=1024,
                         minimum_load_reduction=.4, capacity_limit=196608, receive_capacity=196608)
@@ -89,7 +90,7 @@ class TestReplicaAdmissionRetry(unittest.TestCase):
 
     def test_impossible_fraction_keeps_owner_without_retry(self) -> None:
         """An impossible admission bound must remain a cheap owner-only decision."""
-        with patch.object(planner, '_uncalibrated_copies', wraps=planner._uncalibrated_copies) as select:
+        with patch.object(_calibrated_planner, '_uncalibrated_copies', wraps=_calibrated_planner._uncalibrated_copies) as select:
             actual = planner._build_expert_replica_plan(
                 self.diffuse_counts(), 6, adaptive=True, target_load=30720,
                 minimum_replica_rows=1024, minimum_load_reduction=.8,
@@ -100,7 +101,7 @@ class TestReplicaAdmissionRetry(unittest.TestCase):
     def test_required_capacity_does_not_use_optional_retry(self) -> None:
         """Mandatory replicas remain valid even if optional gain is impossible."""
         counts = [[4096] * 6 + [0] * 42 for _ in range(8)]
-        with patch.object(planner, '_uncalibrated_copies', wraps=planner._uncalibrated_copies) as select:
+        with patch.object(_calibrated_planner, '_uncalibrated_copies', wraps=_calibrated_planner._uncalibrated_copies) as select:
             actual = planner._build_expert_replica_plan(
                 counts, 2, adaptive=True, target_load=30720, minimum_replica_rows=1000000,
                 minimum_load_reduction=.99, capacity_limit=49152, receive_capacity=49152)

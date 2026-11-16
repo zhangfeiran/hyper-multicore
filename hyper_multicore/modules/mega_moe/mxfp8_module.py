@@ -35,7 +35,7 @@ from hyper_multicore.scheduler.runtime import serialize_runtime_config
 from hyper_multicore.scheduler.config import mega_moe_event_capacity
 
 from .heap_manager import _get_heap_manager, _workspace_layout
-from .module import MegaMoeExperts, _MegaMoeExecutionResources, _checkpoint_contract
+from .module import A5MegaMoeExperts, _MegaMoeExecutionResources, _checkpoint_contract
 from .mxfp8_execution import MXFP8Execution
 from .mxfp8_diagnostics import prepare_mx_diagnostics
 from .mxfp8_function import execute_mxfp8_experts
@@ -291,7 +291,7 @@ def _mx_b0_options(replica_slots: int) -> tuple[str, bool]:
     return poll, skip_zero == "1"
 
 
-class MXFP8MegaMoeExperts(MegaMoeExperts):
+class MXFP8MegaMoeExperts(A5MegaMoeExperts):
     """Execute MXFP8 experts while keeping FSDP root Parameters phase-current.
 
     Args:

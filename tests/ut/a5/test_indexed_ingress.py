@@ -22,7 +22,7 @@ from unittest.mock import patch
 import torch
 
 from hyper_multicore.modules.mega_moe import route as route_module
-from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
+from hyper_multicore.modules.mega_moe.module import A5MegaMoeExperts as MegaMoeExperts
 from hyper_multicore.modules.mega_moe.plan import (
     _build_ingress_config, _build_runtime_artifacts, _ingress_graph, _row_credit_element_offset,
 )

@@ -446,7 +446,7 @@ class TestMegaMoeRoute(unittest.TestCase):
                             tokens = torch.ones((2, 4), dtype=torch.bfloat16)
                             permuted = tokens.repeat_interleave(2, dim=0)
                             mapping = torch.arange(4, dtype=torch.int32)
-                            workspace = Mock(in_use=True, source_buffer=permuted)
+                            workspace = Mock(in_use=True, source_buffer=permuted, replica_route_cache=None)
                             with (patch.object(route_module, "_start_count_gather") as gather,
                                   patch.object(route_module, "_permute_topk_input",
                                                return_value=(permuted, mapping)),
@@ -490,7 +490,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                             replica = ReplicaRoute(plan, ids, counts, rank, None, home_only=compact,
                                                    dynamic_summary=summary, _host_counts=host)
                             permuted = hidden.repeat_interleave(2, dim=0)
-                            workspace = Mock(in_use=True, source_buffer=permuted)
+                            workspace = Mock(in_use=True, source_buffer=permuted, replica_route_cache=None)
                             start = rank * spec.local_experts
                             reference = route_module._compute_route_metadata(
                                 counts[rank], counts, counts[:, start:start + spec.local_experts], spec,
@@ -518,7 +518,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         home = replace(self._spec(4), ep_size=2)
         config = ExpertReplicaConfig(4, 2, 1)
         physical = replace(home, num_experts=6, logical_num_experts=4, replica_slots_per_rank=1)
-        workspace = Mock(in_use=True, source_buffer=torch.empty(4, 16))
+        workspace = Mock(in_use=True, source_buffer=torch.empty(4, 16), replica_route_cache=None)
         decisions = []
 
         def gather(output: torch.Tensor, payload: torch.Tensor, **_options: Any) -> Mock:
@@ -622,7 +622,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
             count = sum(logical[rank]) // 2
             ids = torch.tensor([[0, 1]] * count, dtype=torch.int32).reshape(count, 2)
             hidden, probs = torch.ones(count, 16), torch.ones(count, 2)
-            workspace = Mock(in_use=False, source_buffer=None)
+            workspace = Mock(in_use=False, source_buffer=None, replica_route_cache=None)
             staged, mapping = torch.empty(count * 2, 16), torch.arange(count * 2, dtype=torch.int32)
             selected = []
             grown = []
@@ -634,7 +634,8 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
             def choose(counts: torch.Tensor, summary: list[list[int]], host: list[list[int]] | None) -> Any:
                 self.assertFalse(grown)
                 self.assertIsNone(workspace.source_buffer)
-                self.assertEqual(host is None, experts == 520)
+                if host is not None:
+                    self.assertEqual(host, logical)
                 loads = [row[6] for row in summary]
                 if min(loads) == max(loads):
                     return None
@@ -812,7 +813,12 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                                                   "Device-only descriptors must not read counts back")
                                 empty = tuple((received.sum(0) == 0).nonzero().flatten().tolist())
                                 expected = replace(expected, empty_experts=empty)
-                                for field, value in vars(expected).items():
+                                fields = ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
+                                          "combine_src_off", "combine_target_off", "combine_size", "group_list",
+                                          "expert_capacity", "empty_experts")
+                                self.assertEqual(actual.all_experts_active, not empty)
+                                for field in fields:
+                                    value = getattr(expected, field)
                                     observed = getattr(actual, field)
                                     if isinstance(value, torch.Tensor):
                                         self.assertEqual(value.dtype, torch.int32 if field.endswith("size") else torch.int64)
@@ -822,6 +828,10 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                                         self.assertEqual(offset % 512, 0)
                                     else:
                                         self.assertEqual(observed, value)
+                                for field in fields[:6]:
+                                    torch.testing.assert_close(
+                                        getattr(actual.for_kernel(spec.hidden_size), field),
+                                        getattr(expected.for_kernel(spec.hidden_size), field), rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

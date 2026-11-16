@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from hyper_multicore.replica import routing
+from hyper_multicore.replica import _a5_routing
 from hyper_multicore.replica.capacity import ExpertReplicaConfig
 from hyper_multicore.replica.recompute import create_recompute_contexts
 from hyper_multicore.replica.whole import build_whole_expert_plan
@@ -124,7 +125,7 @@ def test_complete_expert_credit_rejects_invalid_values(credit: int) -> None:
 
 
 def test_complete_route_uses_the_existing_gradient_transfer_credit() -> None:
-    plan = routing._build_route_plan(
+    plan = _a5_routing._build_route_plan(
         marginal_hot_counts(), ExpertReplicaConfig(96, 16, 2), True,
         {"capacity_limit": 393216, "minimum_load_reduction": 0.4, "minimum_replica_rows": 1024,
          "_replica_transfer_row_credit": 896, "_rank_nodes": (0,) * 8 + (1,) * 8})

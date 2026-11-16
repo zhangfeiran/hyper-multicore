@@ -16,7 +16,7 @@
 
 import unittest
 
-from hyper_multicore.replica import routing
+from hyper_multicore.replica import _a5_routing as routing
 from hyper_multicore.replica.cost import ExpertReplicaCostModel
 
 

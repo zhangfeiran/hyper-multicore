@@ -19,7 +19,7 @@ import random
 import unittest
 from unittest.mock import patch
 
-from hyper_multicore.replica import planner, plan as plan_module
+from hyper_multicore.replica import _calibrated_planner as planner, plan as plan_module
 from hyper_multicore.replica.capacity import ExpertReplicaConfig
 from hyper_multicore.replica.cost import ExpertReplicaCostModel
 from tests.common.mark_utils import arg_mark

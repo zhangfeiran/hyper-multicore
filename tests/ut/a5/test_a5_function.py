@@ -55,16 +55,15 @@ class TestMegaMoeFunction(unittest.TestCase):
                                intermediate_size=2, top_k=2, forward_shared_expert=True,
                                backward_shared_expert=False, expert_weight_layout="EIO",
                                replica_slots_per_rank=0, auto_tokens=False)
-        plan = SimpleNamespace(spec=spec, ingress_diagnostics=None)
+        plan = SimpleNamespace(spec=spec, ingress_diagnostics=None, fwd_task_prefixes=())
         workspace = Mock(source_buffer=torch.zeros(4, 4), routed_buffer=torch.zeros(4, 4),
                          gmm_workspace=torch.zeros(1))
-        workspace.release.side_effect = lambda: workspace.routed_buffer.fill_(float("nan"))
+        workspace.release.side_effect = lambda **kwargs: workspace.routed_buffer.fill_(float("nan"))
         hidden = torch.ones(2, 4)
         first, second = torch.ones(2, 4, 4, requires_grad=True), torch.ones(2, 2, 4, requires_grad=True)
-        metadata = SimpleNamespace(expert_capacity=4, group_list=torch.tensor([2, 4]), replica_route=None)
-        for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
-                     "combine_src_off", "combine_target_off", "combine_size"):
-            setattr(metadata, name, torch.zeros(2, dtype=torch.int64))
+        metadata = function_module.RouteMetadata(
+            *(torch.zeros(2, dtype=torch.int64) for _ in range(6)),
+            group_list=torch.tensor([2, 4]), expert_capacity=4)
         route = SimpleNamespace(metadata=metadata, routed_tokens=hidden.repeat_interleave(2, dim=0),
                                 unpermute_mapping=torch.arange(4, dtype=torch.int32))
         probabilities = torch.tensor([[0.25, 0.75], [0.25, 0.75]])
@@ -73,7 +72,7 @@ class TestMegaMoeFunction(unittest.TestCase):
 
         def launch(
             _plan: Any, _route: Any, _source: Any, _first: Any, _second: Any,
-            execution: Any, _pool: Any = None,
+            execution: Any, _pool: Any = None, **_kwargs: Any,
         ) -> None:
             """Write distinct complete receive buffers on each invocation.
 
@@ -290,7 +289,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             self.assertFalse(workspace.in_use)
             workspace.in_use = True
 
-        def release() -> None:
+        def release(*, stream=None) -> None:
             """End the current workspace lease."""
             self.assertTrue(workspace.in_use)
             workspace.in_use = False
@@ -302,14 +301,14 @@ class TestMegaMoeFunction(unittest.TestCase):
         runtime = SimpleNamespace(normal_tensor=None)
         plan = SimpleNamespace(spec=spec, fwd_task_prefixes=(), bwd_task_prefixes=(),
                                fwd_diagnostics=MegaKernelDiagnostics(runtime),
-                               bwd_diagnostics=MegaKernelDiagnostics(runtime), reuse_backward_dispatch=False)
-        route = SimpleNamespace(replica_route=replica, expert_capacity=2, group_list=torch.tensor([2]))
-        for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
-                     "combine_src_off", "combine_target_off", "combine_size"):
-            setattr(route, name, torch.zeros(2, dtype=torch.int64))
+                               bwd_diagnostics=MegaKernelDiagnostics(runtime), reuse_backward_dispatch=False,
+                               weight_grad_dtype=None)
+        route = function_module.RouteMetadata(
+            *(torch.zeros(2, dtype=torch.int64) for _ in range(6)),
+            group_list=torch.tensor([2]), expert_capacity=2, replica_route=replica)
 
         def forward_kernel(_plan: Any, _route: Any, source: Any, weight1: Any, weight2: Any,
-                           execution: Any, _pool: Any) -> None:
+                           execution: Any, _pool: Any, **_kwargs: Any) -> None:
             """Emulate a differentiable scalar projection into the real saved buffers."""
             execution.dispatch.copy_(source)
             execution.combine.copy_(source * (weight1.sum() + weight2.sum()))
@@ -317,7 +316,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             execution.intermediates.activation.zero_()
 
         def backward_kernel(_plan: Any, saved: Any, gradient: Any, execution: Any,
-                            _pool: Any, _gradient_return: Any = None) -> None:
+                            _pool: Any, _gradient_return: Any = None, **_kwargs: Any) -> None:
             """Differentiate the CPU projection using the checkpoint-restored inputs."""
             execution.grad_x.copy_(gradient * (saved.weight1.sum() + saved.weight2.sum()))
             value = (gradient * saved.dispatch).sum()
@@ -370,6 +369,10 @@ class TestMegaMoeFunction(unittest.TestCase):
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
         context.plan.spec.replica_slots_per_rank = 0
+        context.plan.spec.apply_probs_before_fc2 = False
+        context.plan.bwd_task_prefixes = ()
+        context.plan.bwd_no_replica_task_prefixes = ()
+        context.all_experts_active = False
         context.replica_route = None
         context.workspace.replica_provider = None
         execution = function_module._BackwardExecution(
@@ -391,7 +394,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertIs(result[0], gradient)
         self.assertIs(result[1], execution.intermediates.grad_weight1)
         self.assertIs(result[2], execution.intermediates.grad_weight2)
-        context.workspace.release.assert_called_once_with()
+        context.workspace.release.assert_called_once_with(stream=context.workspace.lease_stream)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
@@ -530,8 +533,8 @@ class TestMegaMoeFunction(unittest.TestCase):
         regular, overlap = object(), object()
         plan = SimpleNamespace(spec=SimpleNamespace(dispatch_mode="push"), bwd_diagnostics=overlap,
                                bwd_diagnostics_no_replica=regular, reuse_backward_dispatch=False,
-                               bwd_runtime_no_replica_reuse_dispatch=True)
-        saved = SimpleNamespace(dispatch=torch.empty(3, 4), weight1=None, weight2=None)
+                               bwd_runtime_no_replica_reuse_dispatch=True, weight_grad_dtype=None)
+        saved = SimpleNamespace(dispatch=torch.empty(3, 4), weight1=None, weight2=None, group_list=None)
         workspace = Mock(expert_buffer=torch.empty(3, 4), routed_buffer=torch.empty(3, 4),
                          gmm_workspace=torch.empty(1), swiglu_grad_workspace=torch.empty(1))
         with patch.object(function_module, "_allocate_backward_intermediates") as allocate:
@@ -640,8 +643,10 @@ class TestMegaMoeFunction(unittest.TestCase):
         spec = SimpleNamespace(replica_slots_per_rank=int(empty_replica_route), hidden_size=4,
                                intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
-                               dispatch_mode="pull" if pull else "push", expert_weight_layout="EIO", auto_tokens=False)
-        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=reuse, fwd_task_prefixes=(), bwd_task_prefixes=())
+                               dispatch_mode="pull" if pull else "push", expert_weight_layout="EIO", auto_tokens=False,
+                               num_cube_cores=24)
+        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=reuse, fwd_task_prefixes=(), bwd_task_prefixes=(),
+                               weight_grad_dtype=None)
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
@@ -677,7 +682,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             self.assertTrue(all(reference() is None for reference in scratch_references))
             return restore_gradient(*args)
 
-        def release_workspace() -> None:
+        def release_workspace(*, stream=None) -> None:
             """Make accidental reads after the lease immediately observable."""
             self.assertTrue(workspace.in_use)
             workspace.in_use = False
@@ -735,8 +740,8 @@ class TestMegaMoeFunction(unittest.TestCase):
             self.assertEqual(args[12].data_ptr() == args[0].data_ptr(), reuse)
             self.assertNotEqual(saved_dispatch.data_ptr(), args[0].data_ptr())
             scratch_references[:] = [weakref.ref(args[index]) for index in (8, 10, 12)]
-            self.assertEqual(torch.count_nonzero(args[6]).item(), 0)
-            self.assertEqual(torch.count_nonzero(args[18]).item(), 0)
+            self.assertEqual(torch.count_nonzero(args[6][0]).item(), 0)
+            self.assertEqual(torch.count_nonzero(args[18][0]).item(), 0)
             args[13].fill_(tag)
             args[6].fill_(tag)
             args[18].fill_(tag)
@@ -767,7 +772,16 @@ class TestMegaMoeFunction(unittest.TestCase):
         capacities = (7, 2, 1, 5)
         outputs = []
         sources = []
+        def zero_cold(first, second, groups):
+            previous = 0
+            for expert, end in enumerate(groups.tolist()):
+                if end == previous:
+                    first[expert].zero_()
+                    second[expert].zero_()
+                previous = end
+
         with (
+            patch.object(function_module.multicore_ops, "zero_empty_expert_gradients", side_effect=zero_cold),
             patch.object(MegaKernelDiagnostics, "launch",
                          side_effect=AssertionError("ordinary path must bypass launch")),
             patch.object(
@@ -792,10 +806,9 @@ class TestMegaMoeFunction(unittest.TestCase):
                 tokens = (1, 3, 2, 4)[tag - 1] if vary_tokens else 2
                 source = torch.full((tokens if permuted else 4, 4), float(tag), requires_grad=input_grad)
                 replica = SimpleNamespace(plan=SimpleNamespace(transfers=())) if empty_replica_route else None
-                route = SimpleNamespace(replica_route=replica, expert_capacity=capacity, group_list=torch.tensor([0, capacity]))
-                for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
-                             "combine_src_off", "combine_target_off", "combine_size"):
-                    setattr(route, name, torch.zeros(4, dtype=torch.int64))
+                route = function_module.RouteMetadata(
+                    *(torch.zeros(4, dtype=torch.int64) for _ in range(6)),
+                    group_list=torch.tensor([0, capacity]), expert_capacity=capacity, replica_route=replica)
                 output = self._check_deferred_forward(
                     source, weight1, weight2, route, plan, workspace, dispatch_pointers if pull else down_pointers,
                     permuted=permuted, vary_tokens=vary_tokens, replay=replay,

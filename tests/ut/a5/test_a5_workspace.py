@@ -52,7 +52,8 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         """A committed Heap restart must replace every replica address and cached runtime image."""
         spec = SimpleNamespace(receive_capacity=128, routed_slots=256, top_k=2, hidden_size=8, intermediate_size=4,
                                ep_size=2, num_experts=6, dispatch_mode="push", replica_slots_per_rank=1,
-                               replica_transport="shmem_signal_kernel_gradient_bands")
+                               replica_transport="shmem_signal_kernel_gradient_bands", expert_weight_layout="EIO",
+                               apply_probs_before_fc2=False)
         workspace = MegaMoeWorkspace(shared=True)
         with (patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
                 shape, dtype=kw["dtype"])), patch.object(workspace_module.torch.npu, "Event")):
@@ -237,7 +238,8 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         after = workspace_module._spec_workspace_bytes(specification, torch.bfloat16)
         self.assertEqual(after - before, 5120 * 1792 * 3 * 6 + 5 * 4 * 64 + 2 * 64 + 511)
         spec = SimpleNamespace(hidden_size=8, intermediate_size=4, ep_size=4,
-                               replica_slots_per_rank=1, replica_transport="shmem_signal_kernel_gradient")
+                               replica_slots_per_rank=1, replica_transport="shmem_signal_kernel_gradient",
+                               expert_weight_layout="EIO")
         workspace = MegaMoeWorkspace(shared=True)
         with patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
                 shape, dtype=kw["dtype"])), patch.object(workspace_module.shmem, "free"):
@@ -265,7 +267,8 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         after = workspace_module._spec_workspace_bytes(specification, torch.bfloat16)
         self.assertEqual(after - before, 2 * (18 + 9) * 32 * 64)
         spec = SimpleNamespace(hidden_size=8, intermediate_size=4, ep_size=4,
-                               replica_slots_per_rank=2, replica_transport=specification["replica_transport"])
+                               replica_slots_per_rank=2, replica_transport=specification["replica_transport"],
+                               expert_weight_layout="EIO")
         workspace = MegaMoeWorkspace(shared=True)
         with patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
                 shape, dtype=kw["dtype"])) as allocate, patch.object(workspace_module.shmem, "free") as free:
@@ -281,7 +284,8 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Retain expanded event storage when allocating through the SHMEM API."""
         spec = SimpleNamespace(receive_capacity=128, routed_slots=256, top_k=2, hidden_size=16,
-                               ep_size=64, num_experts=1024, dispatch_mode="push", replica_slots_per_rank=0)
+                               ep_size=64, num_experts=1024, dispatch_mode="push", replica_slots_per_rank=0,
+                               apply_probs_before_fc2=False)
         workspace = MegaMoeWorkspace(shared=True)
         with (
             patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(

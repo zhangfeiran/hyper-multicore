@@ -1530,7 +1530,10 @@ def _replica_metadata(agreed: _ReplicaAgreement, capacity: int, device: Any) -> 
     """Pack exact physical counts once, preserving owned metadata and native strides."""
     route, spec = agreed.route, agreed.spec
     if spec._host_replica_metadata and route is not None and route._host_counts is not None:
-        table = np.frombuffer(route.plan._dispatch_counts_bytes, dtype="<i4")
+        if route.home_only:
+            table = np.asarray(route._host_counts, dtype=np.int32)
+        else:
+            table = np.frombuffer(route.plan._dispatch_counts_bytes, dtype="<i4")
         return _numpy_route_metadata(table.reshape(spec.ep_size, spec.num_experts), spec, capacity, device)
     if agreed.raw is not None and spec.ep_size * spec.num_experts <= _HOST_DESCRIPTOR_MAX_COUNTS:
         return _host_route_metadata(agreed.raw, spec, capacity, device)

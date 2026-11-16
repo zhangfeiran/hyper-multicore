@@ -127,7 +127,7 @@ class TestReplicaTopology(unittest.TestCase):
     def test_startup_manifest_collects_node_identity_without_new_hot_collective(self) -> None:
         """Append identity to the existing resource consensus and preserve its configuration check."""
         resource = module_api._MegaMoeExecutionResources.__new__(module_api._MegaMoeExecutionResources)
-        resource.spec = SimpleNamespace(ep_size=4, ep_group=object())
+        resource.spec = SimpleNamespace(ep_size=4, ep_group=object(), expert_weight_layout="EIO")
 
         def gather(output: list, value: tuple, **_kwargs: object) -> None:
             """Supply interleaved machine identities in EP rank order."""

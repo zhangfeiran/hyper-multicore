@@ -24,11 +24,11 @@ from hyper_multicore.diagnostics import (
 if TYPE_CHECKING:
     from hyper_multicore.modules.mega_gate.module import MegaGate
     from hyper_multicore.modules.mega_mhc.module import MegaMhc
-    from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
+    from hyper_multicore.modules.mega_moe.module import A5MegaMoeExperts, MegaMoeExperts
     from hyper_multicore.modules.mega_moe.mxfp8_module import MXFP8MegaMoeExperts
 
 __all__ = [
-    "MegaGate", "MegaMhc", "MegaMoeExperts", "MegaMoeNumericsOptions", "MXFP8MegaMoeExperts", "MegaKernelDiagnostics",
+    "MegaGate", "MegaMhc", "MegaMoeExperts", "A5MegaMoeExperts", "MegaMoeNumericsOptions", "MXFP8MegaMoeExperts", "MegaKernelDiagnostics",
     "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
 ]
 
@@ -43,6 +43,8 @@ def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
         from hyper_multicore.modules.mega_gate.module import (  # pylint: disable=import-outside-toplevel
             MegaGate as value,
         )
+    elif name == "A5MegaMoeExperts":
+        from hyper_multicore.modules.mega_moe.module import A5MegaMoeExperts as value  # pylint: disable=import-outside-toplevel
     elif name == "MegaMoeExperts":
         from hyper_multicore.modules.mega_moe.module import (  # pylint: disable=import-outside-toplevel
             MegaMoeExperts as value,

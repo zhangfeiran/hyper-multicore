@@ -293,7 +293,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
+            apply_probs_before_fc2=getattr(spec, "apply_probs_before_fc2", False),
 
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
             shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
@@ -337,7 +337,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
+            apply_probs_before_fc2=getattr(spec, "apply_probs_before_fc2", False),
 
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
             shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
@@ -381,7 +381,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
+            apply_probs_before_fc2=getattr(spec, "apply_probs_before_fc2", False),
 
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
             shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
@@ -440,7 +440,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
+            apply_probs_before_fc2=getattr(spec, "apply_probs_before_fc2", False),
 
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
             shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
@@ -515,7 +515,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
+            apply_probs_before_fc2=getattr(spec, "apply_probs_before_fc2", False),
 
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
             shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),

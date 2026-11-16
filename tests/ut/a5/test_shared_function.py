@@ -127,11 +127,12 @@ class TestSharedFunction(unittest.TestCase):
                                forward_shared_expert=forward_shared, backward_shared_expert=backward_shared,
                                num_cube_cores=cube_cores, expert_weight_layout="EIO", replica_slots_per_rank=0, auto_tokens=False)
         plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False, ingress_diagnostics=None,
-                               bwd_diagnostics=None)
+                               bwd_diagnostics=None, fwd_task_prefixes=(), bwd_task_prefixes=(),
+                               bwd_no_replica_task_prefixes=(), weight_grad_dtype=torch.float32)
         workspace = Mock(expert_buffer=torch.zeros(8, 4), routed_buffer=torch.zeros(4, 4),
                          gmm_workspace=torch.zeros(512, dtype=torch.uint8), swiglu_grad_workspace=torch.zeros(1),
                          replica_provider=None, replica_runtime_images={}, replica_task_prefixes={})
-        workspace.release.side_effect = lambda: (workspace.expert_buffer.fill_(float("nan")),
+        workspace.release.side_effect = lambda **_kwargs: (workspace.expert_buffer.fill_(float("nan")),
                                                  workspace.routed_buffer.fill_(float("nan")))
         w1 = torch.randn(4, 4, requires_grad=True)
         w2 = torch.randn(4, 2, requires_grad=True)
@@ -146,6 +147,7 @@ class TestSharedFunction(unittest.TestCase):
 
         def forward_kernel(
             _plan: Any, _route: Any, _source: Any, _first: Any, _second: Any, execution: Any, _pool: Any = None,
+            **_kwargs: Any,
         ) -> None:
             """Fill independent outputs through the actual indirect tensor table."""
             self.assertEqual(execution.shared_ptrs is not None, forward_shared)
@@ -163,7 +165,7 @@ class TestSharedFunction(unittest.TestCase):
             execution.combine.zero_()
 
         def backward_kernel(_plan: Any, _saved: Any, _gradient: Any, execution: Any,
-                            _pool: Any = None, _return: Any = None) -> None:
+                            _pool: Any = None, _return: Any = None, **_kwargs: Any) -> None:
             """Emulate device math while retaining the real saved-context and launch plumbing."""
             self.assertEqual(execution.shared_ptrs is not None, backward_shared)
             if execution.shared_ptrs is not None:
@@ -214,6 +216,8 @@ class TestSharedFunction(unittest.TestCase):
             patch.object(moe_function, "load_torch_npu", return_value=SimpleNamespace(npu_swiglu=native_forward)),
             patch.object(moe_function, "_launch_forward_kernel", side_effect=forward_kernel),
             patch.object(moe_function, "_launch_backward_kernel", side_effect=backward_kernel),
+            patch.object(moe_function.multicore_ops, "zero_empty_expert_gradients",
+                         side_effect=lambda first, second, _groups: (first.zero_(), second.zero_())),
             patch.object(moe_function.multicore_ops, "moe_token_permute_grad",
                          side_effect=lambda grad, _mapping, rows, top_k: grad.reshape(rows, top_k, 4).sum(1)),
         ):
@@ -224,10 +228,9 @@ class TestSharedFunction(unittest.TestCase):
                     source = storage[::2]
                     source.retain_grad()
                 reference = source.detach().clone().requires_grad_(input_grad)
-                route = SimpleNamespace(replica_route=None, expert_capacity=3, group_list=torch.tensor([0, 3]))
-                for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
-                             "combine_src_off", "combine_target_off", "combine_size"):
-                    setattr(route, name, torch.zeros(4, dtype=torch.int64))
+                route = moe_function.RouteMetadata(
+                    *(torch.zeros(4, dtype=torch.int64) for _ in range(6)),
+                    group_list=torch.tensor([0, 3]), expert_capacity=3)
                 prepared = SimpleNamespace(metadata=route, routed_tokens=source.detach().repeat_interleave(2, dim=0),
                                            unpermute_mapping=torch.arange(4, dtype=torch.int32))
                 def execute(tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

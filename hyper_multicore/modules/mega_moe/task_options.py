@@ -61,8 +61,15 @@ def _activation_options(task: Any) -> bool:
 
 
 def _transport_options(task: Any) -> bool:
+    # Indexed A5 GETs use this field as an operation selector, not as a
+    # probability payload. The port and top-k dimension identify the ABI.
+    if (task.task_type == TaskType.TASK_SHMEM_GET_MEM and task.inputs[1].dim[3] > 0
+            and ((task.extra_value_0 == 16 and task.extra_value_1 in (1, 3))
+                 or (task.extra_value_0 == 25 and task.extra_value_1 == 8))):
+        return False
     allowed = int(ShmemTaskPartition.RUNTIME_ROWS | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITIES
-                  | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS)
+                  | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS
+                  | (1 if task.task_type == TaskType.TASK_SHMEM_PUT_MEM_SIGNAL else 0))
     if task.extra_value_1 & ~allowed:
         raise ValueError(f"invalid transport flags {task.extra_value_1:#x}")
     payload = transport_payload(task)

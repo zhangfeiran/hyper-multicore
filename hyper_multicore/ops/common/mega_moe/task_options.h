@@ -67,9 +67,17 @@ __aicore__ inline bool IsActivationTaskOptionsValid(const TaskDesc &task, uint32
 }
 
 __aicore__ inline bool IsTransportTaskOptionsValid(const TaskDesc &task, uint32_t probability_position) {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+  if (task.task_type == TaskType::TASK_SHMEM_GET_MEM && task.inputs[1].dim[3] > 0 &&
+      ((task.extra_value_0 == 16 && (task.extra_value_1 == 1 || task.extra_value_1 == 3)) ||
+       (task.extra_value_0 == 25 && task.extra_value_1 == 8))) {
+    return IsProbabilityOperandValid(task, false, 4, probability_position);
+  }
+#endif
   constexpr uint32_t scalar_bits = static_cast<uint32_t>(MegaMoeTransportPayload::TOKENS_WITH_PROBABILITIES) |
       static_cast<uint32_t>(MegaMoeTransportPayload::TOKENS_WITH_PROBABILITY_GRADIENTS);
-  constexpr uint32_t allowed = static_cast<uint32_t>(ShmemTaskPartition::RUNTIME_ROWS) | scalar_bits;
+  const uint32_t allowed = static_cast<uint32_t>(ShmemTaskPartition::RUNTIME_ROWS) | scalar_bits |
+      (task.task_type == TaskType::TASK_SHMEM_PUT_MEM_SIGNAL ? 1U : 0U);
   if ((task.extra_value_1 & ~allowed) != 0) return false;
   const auto payload = GetMegaMoeTransportPayload(task);
   if (static_cast<uint32_t>(payload) == scalar_bits) return false;

@@ -30,7 +30,7 @@ from hyper_multicore import _automatic, _collective
 from hyper_multicore.modules.mega_moe import module as mega_moe_module
 from hyper_multicore.modules.mega_moe.backward.graph import build_backward_graph
 from hyper_multicore.modules.mega_moe.forward.graph import build_forward_graph
-from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
+from hyper_multicore.modules.mega_moe.module import A5MegaMoeExperts as MegaMoeExperts
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.scheduler.config import TaskSplitValue
 from tests.common.mark_utils import arg_mark
@@ -72,7 +72,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                                              replica_slots_per_rank=budget)
                     self.addCleanup(experts.close)
                     resources = SimpleNamespace(
-                        spec=SimpleNamespace(auto_tokens=True, rank_id=0), home_spec=object(),
+                        spec=SimpleNamespace(auto_tokens=True, rank_id=0, dispatch_mode=mode,
+                                             apply_probs_before_fc2=False, _replica_inbox_slots=None), home_spec=object(),
                         home_plan=None, plan=None,
                         workspace=SimpleNamespace(release=lambda: None),
                         prepare_auto_workspace=lambda *_args: None,
@@ -88,8 +89,9 @@ class TestMegaMoeExperts(unittest.TestCase):
                         callback = options.get("_select_replica_route")
                         replica = None
                         if callback is not None:
-                            _, replica = callback(torch.zeros(2, 4), [[0] * 6 + [1], [0] * 6 + [2]], None)
-                        return SimpleNamespace(metadata=SimpleNamespace(replica_route=replica, plan_tokens=128),
+                            _, replica = callback(torch.zeros(2, 4), [[0] * 6 + [1], [0] * 6 + [9]], None)
+                        return SimpleNamespace(metadata=SimpleNamespace(replica_route=replica, plan_tokens=128,
+                                                                       empty_owner_experts=None, maximum_edge_rows=None),
                                                unpermute_mapping=None, maximum_received_slots=128)
 
                     # Recording mocks would retain input tensors and hide the actual lifetime contract.
@@ -157,7 +159,7 @@ class TestMegaMoeExperts(unittest.TestCase):
     def test_resource_manifest_rejects_rank_configuration_mismatch(self) -> None:
         """Static and dynamic ranks enter the same check before symmetric allocation."""
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
-        resources.spec = SimpleNamespace(ep_size=2, ep_group=object())
+        resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI")
 
         def gather(output: list, value: Any, **kwargs: Any) -> None:
             """Simulate a peer using another resource mode or capacity."""
@@ -224,7 +226,8 @@ class TestMegaMoeExperts(unittest.TestCase):
             experts = MegaMoeExperts(hidden_size=16, intermediate_size=8,
                                      num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
                                      replica_slots_per_rank=1).bfloat16()
-            physical = SimpleNamespace(rank_id=0, replica_slots_per_rank=1, auto_tokens=False)
+            physical = SimpleNamespace(rank_id=0, replica_slots_per_rank=1, auto_tokens=False,
+                                       dispatch_mode=mode, apply_probs_before_fc2=False, _replica_inbox_slots=None)
             home = SimpleNamespace(rank_id=0, replica_slots_per_rank=0)
             plans = {False: SimpleNamespace(spec=physical), True: SimpleNamespace(spec=home)}
             resources = SimpleNamespace(spec=physical, home_spec=home, plan=None, home_plan=None,
@@ -233,7 +236,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                                         plan_for_tokens=Mock(side_effect=lambda _tokens, _device, **kw:
                                                              plans[kw.get('home_only', False)]))
             route = SimpleNamespace(unpermute_mapping=object(), maximum_received_slots=256,
-                                    metadata=SimpleNamespace(plan_tokens=128))
+                                    metadata=SimpleNamespace(plan_tokens=128, empty_owner_experts=None,
+                                                             maximum_edge_rows=None))
             try:
                 with (self.subTest(mode=mode),
                       patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True, create=True),
@@ -456,17 +460,15 @@ class TestMegaMoeExperts(unittest.TestCase):
         Expectation: Every mismatch fails before symmetric allocation or count exchange.
         """
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
-        resources.spec = SimpleNamespace(ep_size=2, ep_group=object())
+        resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI")
         for mismatch in ("configuration", "wire", "layout"):
             def gather(output: list, value: Any, kind: str = mismatch, **kwargs: Any) -> None:
                 """Change one peer agreement field while preserving all unrelated metadata."""
                 self.assertIs(kwargs["group"], resources.spec.ep_group)
                 self.assertEqual(value[0], "dynamic_tokens_v4")
                 if kind == "layout":
-                    peer_specification = list(value[2][0])
-                    layout_index = peer_specification.index("EOI")
-                    peer_specification[layout_index] = "EIO"
-                    peer = (value[0], value[1], (tuple(peer_specification),), *value[3:])
+                    self.assertEqual(value[2], "EOI")
+                    peer = (value[0], value[1], "EIO", *value[3:])
                 else:
                     peer = ("dynamic_tokens_v3", *value[1:]) if kind == "wire" else ("different",)
                 output[:] = [value, peer]
@@ -836,7 +838,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                                             workspace=Mock(capacity_floor=384, in_use=True), ensure_capacity=Mock())
                 resources.home_spec = resources.home_plan.spec
                 resources.plan_for_tokens = Mock(side_effect=lambda _tokens, _device, *, home_only=False,
-                                                   owner=resources: owner.home_plan if home_only else owner.plan)
+                                                   owner=resources, **_kwargs: owner.home_plan if home_only else owner.plan)
                 route = SimpleNamespace(unpermute_mapping=object(), maximum_received_slots=256,
                                         metadata=SimpleNamespace(plan_tokens=128))
                 try:

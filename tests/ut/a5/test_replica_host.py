@@ -305,8 +305,9 @@ print("shape rejected before allocation")
         Expectation: The planner consumes the native dispatch result and validates its complete plan.
         """
         counts = ((600, 300, 50, 50, 20, 10, 0, 0),) * 4
+        from hyper_multicore.replica import _calibrated_planner
         with patch.object(host, "_native_backend", return_value=self.native), patch.object(
-                planner, "_materialize_dispatch", wraps=host._materialize_dispatch) as called:
+                _calibrated_planner, "_materialize_dispatch", wraps=host._materialize_dispatch) as called:
             plan = planner._build_expert_replica_plan(counts, 2, adaptive=True, _rank_nodes=(0, 0, 1, 1))
         plan.validate()
         self.assertTrue(plan.transfers)

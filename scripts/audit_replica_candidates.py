@@ -26,7 +26,7 @@ from pathlib import Path
 from unittest.mock import patch
 from typing import Any
 
-from hyper_multicore.replica import cost, planner
+from hyper_multicore.replica import cost, _calibrated_planner as planner
 from hyper_multicore.replica.capacity import ExpertReplicaConfig
 from hyper_multicore.replica.cost import ExpertReplicaCostModel
 from hyper_multicore.replica.plan import ExpertExecutionPlan

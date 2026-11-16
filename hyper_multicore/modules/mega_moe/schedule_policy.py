@@ -193,7 +193,10 @@ class MegaMoeSchedulePolicy:
         queue = list(config.cube_task_indices[:config.task_index_num[0]])
         queue += list(config.vector_task_indices[:config.task_index_num[1]])
         for task_id in queue:
-            config.all_tasks[task_id].extra_value_2 = self.dependency_poll_interval
+            task = config.all_tasks[task_id]
+            # Peer-tile GMMs use this word as a native kernel selector.
+            if task.extra_value_2 != 0x4D54494C:
+                task.extra_value_2 = self.dependency_poll_interval
         config.vector_ready_queue = int(self.vector_ready_queue)
         if self.batch_experts:
             collapse_batched_tasks(config, workers)

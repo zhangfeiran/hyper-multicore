@@ -417,7 +417,7 @@ def _build_runtime_artifacts(
                         and task.extra_value_2 != 0x4D54494C):
                     task.extra_value_2 = A5_GMM_KERNEL_TAG | (2 if direction == 0 else 3)
                 elif direction == 1 and task.task_type == TaskType.TASK_SHMEM_PUT_MEM_SIGNAL:
-                    task.extra_value_1 = 1
+                    task.extra_value_1 |= 1
     if spec.num_cube_cores == 32:
         qp_count = configured_udma_qp_count()
         if qp_count not in (16, 32):
