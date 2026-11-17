@@ -60,11 +60,12 @@ class TestMXFP8Graph(unittest.TestCase):
         self.addCleanup(mxfp8_ops.require_mxfp8_window_feature.cache_clear)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
-    def test_disabled_switches_preserve_frozen_runtime_bytes(self) -> None:
-        """Feature: Disabled MX readiness switches.
-        Description: Compare twelve runtime images against the independent C+D baseline.
+    def test_default_tile_preserves_frozen_t6_runtime_bytes(self) -> None:
+        """Feature: Qualified MX default tiling with disabled readiness switches.
+        Description: Compare twelve default runtime images against the independent T6 baseline.
         Expectation: Every configuration, GMM and quantization byte has the same hash.
         """
+        os.environ.pop("PANGU_MX_GMM_TILE", None)
         baseline = json.loads((Path(__file__).parent / "fixtures/mxfp8_window_baseline.json").read_text())
         self.assertEqual(baseline["source_commit"], "24fb62785cd2833a707c6ec82aac75cc53099a9e")
         for ep in (4, 8, 64):

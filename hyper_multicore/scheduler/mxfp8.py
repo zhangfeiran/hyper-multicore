@@ -106,7 +106,9 @@ def make_mx_gmm_descriptor(
     """
     if layout not in MX_GMM_LAYOUTS:
         raise ValueError(f"Unsupported MX GMM layout: {layout}")
-    tile = os.environ.get("PANGU_MX_GMM_TILE", "baseline") if tile is None else tile
+    # Match the qualified arch35 two-expert pipeline and PR23 default. Keep the
+    # original small tile available through an explicit "baseline" override.
+    tile = os.environ.get("PANGU_MX_GMM_TILE", "t6") if tile is None else tile
     if tile not in MX_GMM_TILES:
         raise ValueError(f"Unsupported MX GMM tile: {tile}; expected one of {tuple(MX_GMM_TILES)}")
     if cube_count <= 0 or not 0 <= cube_index < cube_count:
