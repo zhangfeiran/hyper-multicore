@@ -161,6 +161,8 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
                 require_mxfp8_window_feature("replica_udma_gradient_peer_qp")
             if self.spec.mx_peer_qp0:
                 require_mxfp8_window_feature("mx_peer_qp0")
+                if self.spec.replica_slots_per_rank and self.spec.replica_transport != "p2p":
+                    require_mxfp8_window_feature("mx_active_peer_qp0")
             if self.source_row_fp8:
                 require_mxfp8_window_feature("mx_source_row_fp8")
                 require_mxfp8_window_feature("mx_source_row_ready_event")
@@ -306,7 +308,7 @@ def _mx_peer_qp0_option(replica_slots: int, vector_policy: str, source_row: bool
     if active not in ("0", "1"):
         raise ValueError("PANGU_MX_ACTIVE_PEER_QP0 must be 0 or 1")
     if value == "1" and (
-            (replica_slots and (active != "1" or transport != "p2p"))
+            (replica_slots and (active != "1" or transport not in ("p2p", "shmem_signal_kernel_gradient")))
             or vector_policy != "window2" or source_row or configured_data_engine() != "mte_udma"):
         raise ValueError("MX peer QP0 requires B0 window2, mte_udma and ordinary BF16 token ingress")
     return value == "1"

@@ -151,7 +151,9 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
 
     constexpr uint32_t kPeerQp0Marker = 0x4D585130U;
     if (task_desc.extra_value_0 == kPeerQp0Marker) {
-      if (launch->version != 15 || launch->reserved != 14 || this->replica_udma_legacy_qp_bank_) Trap();
+      const bool peer_protocol = launch->version >= 15 && launch->version <= 18 &&
+                                 launch->reserved + 1 == launch->version;
+      if (!peer_protocol || this->replica_udma_legacy_qp_bank_) Trap();
       if (TryPeerQp0Put(task_desc, target_pe, target_offset_, src_offset_, send_data_size_, transport_probe)) return;
     }
 
@@ -299,12 +301,16 @@ __aicore__ inline void ValidateMxWindowRuntime(GM_ADDR runtime, const __gm__ Mul
 
 __aicore__ inline bool HasMxPrefetch(const __gm__ MulticoreMx::MxLaunchDescriptor *launch) {
   return (launch->version == 12 && launch->reserved == 11) ||
-         (launch->version == 13 && launch->reserved == 12);
+         (launch->version == 13 && launch->reserved == 12) ||
+         (launch->version == 17 && launch->reserved == 16) ||
+         (launch->version == 18 && launch->reserved == 17);
 }
 
 __aicore__ inline bool HasMxGradientReturn(const __gm__ MulticoreMx::MxLaunchDescriptor *launch) {
   return (launch->version == 11 && launch->reserved == 10) ||
-         (launch->version == 13 && launch->reserved == 12);
+         (launch->version == 13 && launch->reserved == 12) ||
+         (launch->version == 16 && launch->reserved == 15) ||
+         (launch->version == 18 && launch->reserved == 17);
 }
 
 template <MulticoreRuntime::VectorWorkerPolicy Policy>
@@ -316,7 +322,8 @@ __aicore__ inline void RunMxTaskGraph(GM_ADDR buffers, GM_ADDR runtime, GM_ADDR 
   const bool prefetch = HasMxPrefetch(launch);
   const bool gradients = HasMxGradientReturn(launch);
   const bool source_row = launch->version == 14 && launch->reserved == 13;
-  const bool peer_qp0 = launch->version == 15 && launch->reserved == 14;
+  const bool peer_qp0 = launch->version >= 15 && launch->version <= 18 &&
+                        launch->reserved + 1 == launch->version;
   const bool window = (launch->version == 6 && launch->reserved == 5) || gradients || prefetch || source_row || peer_qp0;
   const bool legacy = launch->version == 1 && launch->reserved == 0;
   if (launch->magic != MulticoreMx::MX_LAUNCH_MAGIC || (!window && !legacy) || launch->buffer_count == 0 ||

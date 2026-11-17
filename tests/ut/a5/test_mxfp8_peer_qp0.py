@@ -141,7 +141,41 @@ def test_active_peer_requires_explicit_p2p_opt_in():
     with patch.dict(os.environ, {'PANGU_MX_PEER_QP0': '1', 'PANGU_MX_ACTIVE_PEER_QP0': '1',
                                  'HYPER_MULTICORE_SHMEM_DATA_ENGINE': 'mte_udma'}):
         assert _mx_peer_qp0_option(2, 'window2', False, 'p2p')
-        with pytest.raises(ValueError):
-            _mx_peer_qp0_option(2, 'window2', False, 'shmem_signal_kernel_gradient')
+        assert _mx_peer_qp0_option(2, 'window2', False, 'shmem_signal_kernel_gradient')
         with pytest.raises(ValueError):
             _mx_peer_qp0_option(2, 'window2', True, 'p2p')
+
+
+@pytest.mark.parametrize('gradients,prefetch,version', ((False,False,15),(True,False,16),(False,True,17),(True,True,18)))
+def test_active_peer_launch_composes_only_with_qualified_payload(gradients,prefetch,version):
+    import torch
+    from hyper_multicore.modules.mega_moe import mxfp8_ops
+    from hyper_multicore.scheduler.mxfp8 import MxLaunchDescriptor
+    spec = MegaMoeSpec(4096,5120,1792,64,8,1.25,40960,8,None,0,32,
+        replica_slots_per_rank=2,logical_num_experts=48,replica_transport='shmem_signal_kernel_gradient',
+        mx_peer_qp0=True,mx_vector_policy='window2',compute_stages=6)
+    buffers = [torch.zeros(64,dtype=torch.uint8) for _ in range(38)]
+    with patch.object(mxfp8_ops,'require_mxfp8_window_feature') as require:
+        data = mxfp8_ops.serialize_mxfp8_launch(buffers,torch.zeros(1024,dtype=torch.uint8),
+            torch.zeros(65536,dtype=torch.uint8),spec,kernel_gradients=gradients,weight_prefetch=prefetch)
+    record = MxLaunchDescriptor.from_buffer_copy(data)
+    assert (record.version,record.reserved)==(version,version-1)
+    if gradients or prefetch:
+        require.assert_called_once_with('mx_active_peer_qp0')
+    else:
+        require.assert_not_called()
+
+
+def test_active_helpers_reserve_nonzero_qps_after_peer_token_ownership():
+    from hyper_multicore.modules.mega_moe.mxfp8_gradient_udma import mx_gradient_peer_qps
+    for qps in (8,16,32):
+        spec = MegaMoeSpec(4096,5120,1792,64,8,1.25,40960,8,None,0,32,
+            replica_slots_per_rank=2,logical_num_experts=48,replica_transport='shmem_signal_kernel_gradient',
+            mx_peer_qp0=True,mx_gradient_udma=True,mx_vector_policy='window2',compute_stages=6,
+            dispatch_split=512,combine_split=512)
+        with patch.dict(os.environ,{'HYPER_MULTICORE_SHMEM_DATA_ENGINE':'mte_udma',
+                                    'HYPER_MULTICORE_SHMEM_UDMA_QP_NUM':str(qps)}):
+            graph=build_mxfp8_runtime(spec,forward=False)
+            owners=mx_gradient_peer_qps(graph.config,spec)
+        assert len(owners)==8
+        assert all(len(set(row))==4 and min(row)>0 and max(row)<qps for row in owners)

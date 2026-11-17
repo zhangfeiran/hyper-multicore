@@ -60,11 +60,13 @@ def mxfp8_window_feature_available(feature: str) -> bool:
     binary = vendor / "op_impl/ai_core/tbe/kernel/arch35/pangu_mxfp8_task_graph" / expected
     if hashlib.sha256(binary.read_bytes()).hexdigest() != receipt.get("sha256"):
         raise RuntimeError("MX window capability receipt does not match the loaded vendor payload.")
-    if feature == "mx_peer_qp0":
+    if feature in ("mx_peer_qp0", "mx_active_peer_qp0"):
         # This optional native ABI also requires launch version15, which older
         # device payloads reject instead of silently treating QP0 tasks as MTE.
         try:
-            return torch.ops.hyper_multicore.mxfp8_peer_qp0_version() == 1
+            version = torch.ops.hyper_multicore.mxfp8_peer_qp0_version()
+            return version >= 1 if feature == "mx_peer_qp0" else (
+                version >= 2 and feature in receipt.get("features", ()))
         except AttributeError:
             return False
     return feature in receipt.get("features", ())
@@ -117,8 +119,16 @@ def serialize_mxfp8_launch(
         vector_policy=spec.mx_vector_policy,
     )
     if getattr(spec, "mx_peer_qp0", False):
-        if source_row_fp8 or kernel_gradients or weight_prefetch:
-            raise ValueError("MX peer QP0 cannot share guest or source-row launch protocols")
+        if source_row_fp8:
+            raise ValueError("MX peer QP0 cannot share source-row launch protocols")
+        if kernel_gradients or weight_prefetch:
+            if not spec.replica_slots_per_rank or spec.replica_transport != "shmem_signal_kernel_gradient":
+                raise ValueError("MX peer QP0 cannot share unqualified guest launch protocols")
+            require_mxfp8_window_feature("mx_active_peer_qp0")
+            record = MxLaunchDescriptor.from_buffer_copy(content)
+            version = 18 if kernel_gradients and weight_prefetch else (16 if kernel_gradients else 17)
+            record.version, record.reserved = version, version - 1
+            return bytes(record)
         record = MxLaunchDescriptor.from_buffer_copy(content)
         record.version, record.reserved = 15, 14
         return bytes(record)

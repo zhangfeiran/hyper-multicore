@@ -158,8 +158,10 @@ __aicore__ inline void WaitMxWeightProjection(const Task &task, const MxGmmDescr
                                               MulticoreRuntime::CycleTraceRecorder *trace, uint32_t task_id) {
   const uint32_t position_code = task.extra_value_1 & MX_PROJECTION_READY_MASK;
   if (position_code == 0) return;
-  const bool forward = launch->version == 12 && launch->reserved == 11;
-  const bool backward = launch->version == 13 && launch->reserved == 12;
+  const bool forward = (launch->version == 12 && launch->reserved == 11) ||
+                       (launch->version == 17 && launch->reserved == 16);
+  const bool backward = (launch->version == 13 && launch->reserved == 12) ||
+                        (launch->version == 18 && launch->reserved == 17);
   if ((!forward && !backward) || r.layout == static_cast<uint32_t>(MxLayout::TN)) AscendC::Trap();
   const uint32_t position = position_code - 1;
   if (position >= launch->buffer_count || launch->buffer_bytes[position] != 5 * sizeof(uint64_t)) AscendC::Trap();

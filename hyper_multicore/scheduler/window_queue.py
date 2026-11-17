@@ -28,7 +28,7 @@ MX_PEER_QP0_TAG = 0x4D585130
 
 def _peer_transport_queues(cfg: Any, spec: Any, tasks: list[int]) -> list[list[int]]:
     """Assign every remote peer one QP0 owner, preserving dispatch/combine FIFO."""
-    if ((spec.replica_slots_per_rank and spec.replica_transport != "p2p")
+    if ((spec.replica_slots_per_rank and spec.replica_transport not in ("p2p", "shmem_signal_kernel_gradient"))
             or spec.mx_vector_policy != "window2" or spec.dispatch_mode != "push"
             or spec.num_cube_cores != 32):
         raise ValueError("MX peer QP0 queues require B0 window2 on 32 Cubes")
@@ -96,7 +96,9 @@ def _validate_qp_owners(cfg: Any, spec: Any, vectors: list[list[int]], qps: int)
             peer = task.task_index // (task.task_split_num // spec.ep_size)
             if peer == spec.rank_id:
                 continue
-            key = peer, qp
+            # Peer-owned token puts use QP0 independently of their physical lane.
+            task_qp = 0 if getattr(task, "extra_value_0", 0) == MX_PEER_QP0_TAG else qp
+            key = peer, task_qp
             owner = owners.setdefault(key, worker)
             if owner != worker:
                 raise ValueError(f"QP owner collision: peer={peer}, qp={qp}, workers={owner}/{worker}")
