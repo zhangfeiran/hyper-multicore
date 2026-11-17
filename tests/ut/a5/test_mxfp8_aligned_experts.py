@@ -125,3 +125,29 @@ def test_required_capacity_moves_override_optional_guest_threshold():
         capacity_limit=6,minimum_replica_rows=10000,minimum_load_reduction=.9)
     assert max(plan.destination_loads)==6 and len(plan.transfers)==1
     assert_actual_permutation(plan)
+
+
+def test_aligned_admission_does_not_require_the_guest_to_fit_the_average():
+    from hyper_multicore.replica import _a5_routing as routing
+    from hyper_multicore.replica.routing import _GatheredReplicaCounts
+    config=ExpertReplicaConfig(48,8,2)
+    counts=[]
+    for rank in range(8):
+        other=(torch.arange(4096*7).reshape(4096,7)+rank*4096*7)%47+1
+        ids=torch.cat((torch.zeros(4096,1,dtype=torch.int64),other),dim=1)
+        counts.append(torch.bincount(ids.flatten(),minlength=48).tolist())
+    totals=[sum(row[e] for row in counts) for e in range(48)]
+    loads=tuple(sum(totals[i:i+6]) for i in range(0,48,6))
+    summary=[[0,4096,31,sum(row),min(row),max(row),load] for row,load in zip(counts,loads)]
+    gathered=_GatheredReplicaCounts(torch.tensor(counts,dtype=torch.int32),summary,counts)
+    options=dict(target_load=None,receive_capacity=None,factor=None,minimum_load_reduction=.2,
+        minimum_saved_rows=0,cost_model=None,rank_nodes=(0,)*4+(1,)*4,
+        minimum_replica_rows=8192,gathered_counts=gathered)
+    # The legacy split preview rejects because each cold rank has <8192 slack to the mean.
+    legacy=routing._try_compact_home_route(None,ids,config,None,0,**options)
+    assert legacy.home_only
+    assert routing._try_compact_home_route(None,ids,config,None,0,aligned_experts=True,**options) is None
+    plan=build_aligned_expert_plan(counts,config,capacity_limit=196608,
+        minimum_replica_rows=8192,minimum_load_reduction=.2,rank_nodes=options['rank_nodes'])
+    assert len(plan.transfers)==1
+    assert max(plan.destination_loads)<.8*max(loads)

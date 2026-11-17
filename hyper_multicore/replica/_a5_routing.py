@@ -102,6 +102,24 @@ def _complete_admission_copies(signature: tuple[Any, ...]) -> list[dict[int, int
     return None if copies is None else [dict(row) for row in copies]
 
 
+@lru_cache(maxsize=64, typed=True)
+def _cached_aligned_admission(signature: tuple[Any, ...]) -> bool:
+    """Preview the same minimax fragments, without requiring guests to hit the mean.
+
+    Placement depends on expert totals, not per-source intersections. A synthetic
+    source table is safe only for this CPU decision; execution always uses fresh
+    exact source counts to materialize the real interval quotas.
+    """
+    from .aligned import build_aligned_expert_plan
+    decision, limit, _, _, nodes, _, _ = signature
+    zeros = (0,) * decision.config.num_experts
+    counts = (decision.totals,) + (zeros,) * (decision.config.ep_size - 1)
+    plan = build_aligned_expert_plan(counts, decision.config, capacity_limit=limit,
+        minimum_replica_rows=decision.minimum_rows, minimum_load_reduction=decision.admission / 10000,
+        minimum_saved_rows=decision.saved_rows, rank_nodes=nodes)
+    return bool(plan.transfers)
+
+
 class _RecomputedReplicaPlans:
     """Retain immutable CPU plans and home-decision evidence for one invocation."""
 
@@ -384,6 +402,7 @@ def _try_compact_home_route(
     gathered_counts: _GatheredReplicaCounts | None = None,
     rejected_quota_memo: _RejectedQuotaMemo | None = None,
     complete_experts: bool = False,
+    aligned_experts: bool = False,
 ) -> ReplicaRoute | _UncalibratedCandidate | None:
     """Read bounded statistics before deciding whether a full CPU table is needed."""
     # A larger allowance must not replace the original checkpoint graph with
@@ -472,6 +491,8 @@ def _try_compact_home_route(
                 complete_search = _complete_guest_search_enabled()
                 projected_nodes = _projected_rank_nodes(nodes)
                 signature = (rejection, upper, resident, complete_search, nodes, projected_nodes)
+                if aligned_experts:
+                    signature += ("aligned64",)
                 previous = None
                 if cache is not None and cache.cursor < len(cache.entries):
                     previous = cache.entries[cache.cursor][0]
@@ -481,8 +502,15 @@ def _try_compact_home_route(
                     config, totals, destination_loads, target, admission, minimum_saved_rows, minimum_replica_rows)
                 memo_rejected = rejected_quota_memo is not None and rejected_quota_memo.contains(signature)
                 if not (replay_rejected or memo_rejected):
-                    candidate = (_complete_admission_copies(signature) if complete_experts else
-                                 _admitted_uncalibrated_copies(
+                    if aligned_experts:
+                        if _cached_aligned_admission(signature):
+                            if rejected_quota_memo is not None:
+                                rejected_quota_memo.signature = None
+                            return None
+                        candidate = None
+                    else:
+                        candidate = (_complete_admission_copies(signature) if complete_experts else
+                                     _admitted_uncalibrated_copies(
                                      totals, list(destination_loads), config, upper, resident, target,
                                      minimum_replica_rows, admission, minimum_saved_rows,
                                      allow_complete_search=complete_search, projected_rank_nodes=projected_nodes))
@@ -645,7 +673,7 @@ def prepare_replica_route(
             minimum_replica_rows=minimum_replica_rows,
             cost_model=_cost_model, rank_nodes=_rank_nodes, capacity_budget=_capacity_budget,
             gathered_counts=_gathered_counts, rejected_quota_memo=_rejected_quota_memo,
-            complete_experts=_complete_experts and not _aligned_experts)
+            complete_experts=_complete_experts and not _aligned_experts, aligned_experts=_aligned_experts)
         if isinstance(ordinary, ReplicaRoute):
             return ordinary
         prepared_candidate = ordinary

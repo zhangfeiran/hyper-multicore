@@ -73,3 +73,16 @@ SET在MTE拓扑走mapped store；不与token UDMA队列混用。旧固定QP bank
 agreement的CPU counts和source summary；home-only把已拥有的小表交给offset打包，避免再次用
 设备算子重建相同metadata。F和R每次仍读取当前counts，不缓存未经本次校验的路由；新开关加入
 EP构造清单和资源生命周期。该候选尚须匹配设备screen，默认关闭。
+
+
+## 准入与粗切分必须使用相同目标
+
+旧 compact 准入按平均负载目标寻找可填充 guest。当冷 rank 到平均值只剩少于最小片段的
+空间时，它会拒绝一个实际能显著降低双边峰值的大块切分。aligned64 因此单独用相同
+minimax/64行规则预览；只使用 global totals 的合成source表用于CPU决策，绝不上传执行。
+真正派发仍依据本次完整source counts重新生成区间交集。拒绝memo包含partition标记。
+
+节点身份作为计划与预览的输入；峰值及平方和相同时优先同节点。与whole候选比较时
+继续传递同一rank_nodes。必须满足的容量迁移优先于可选的最小guest行数/收益阈值，
+但内部切点仍须64对齐。新增回归用例检查“平均目标拒绝、实际单guest方案可行”的边界，
+以及小矩阵的必要整专家迁移。
