@@ -151,7 +151,7 @@ def test_secondary_balance_is_preserved_before_owner_locality():
     assert len(plan.transfers)==1
     assert plan.transfers[0].owner_rank==0
     assert plan.transfers[0].target_rank==15
-    guest_slot=15*config.slots_per_rank+6 if (config:=plan.config) else 0
+    guest_slot=15*plan.config.slots_per_rank+6
     assert sum(plan.dispatch_counts[source][guest_slot] for source in range(8))==0
     assert max(plan.destination_loads)==59345
     assert sum(plan.destination_loads)==16*4096*8
