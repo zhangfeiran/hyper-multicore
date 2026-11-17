@@ -160,6 +160,25 @@ def _place_aligned(matrix, config, limit, minimum_rows, threshold, minimum_saved
                 break
             (_, _, expert), loads = min(deletions)
             del selected[expert]
+    # Whole-expert placement is a cheap competitor, not a split-K seed. Avoid
+    # paying several full weight/dW transfers for less than the existing global
+    # row allowance. This also preserves complete reductions when equally good.
+    if selected and original_peak <= limit:
+        # Optional whole-expert competition must not veto mandatory fragments:
+        # the latter can satisfy a bound that no complete expert can fit.
+        from .whole import build_whole_expert_plan
+        whole = build_whole_expert_plan(matrix, config, capacity_limit=limit,
+            minimum_load_reduction=threshold / 10000, minimum_saved_rows=minimum_saved,
+            minimum_replica_rows=minimum_rows, transfer_row_credit=credit, rank_nodes=nodes)
+        if (max(whole.destination_loads) <= max(loads) + credit
+                and len(whole.transfers) <= len(selected)):
+            ends = tuple(sum(source[slot] for source in whole.dispatch_counts)
+                         for slot in range(config.physical_experts))
+            complete = AlignedExpertExecutionPlan(config, matrix, whole.slot_to_logical, whole.dispatch_counts,
+                                                  tuple((0, end) for end in ends))
+            complete.validate()
+            return complete
+
     slots, spans = [], []
     for rank in range(config.ep_size):
         logical = list(range(rank * home, (rank + 1) * home))
@@ -183,22 +202,4 @@ def _place_aligned(matrix, config, limit, minimum_rows, threshold, minimum_saved
             prefix += count
     plan = AlignedExpertExecutionPlan(config, matrix, tuple(slots), tuple(map(tuple, dispatch)), tuple(spans))
     plan.validate()
-    # Whole-expert placement is a cheap competitor, not a split-K seed. Avoid
-    # paying several full weight/dW transfers for less than the existing global
-    # row allowance. This also preserves complete reductions when equally good.
-    if selected and original_peak <= limit:
-        # Optional whole-expert competition must not veto mandatory fragments:
-        # the latter can satisfy a bound that no complete expert can fit.
-        from .whole import build_whole_expert_plan
-        whole = build_whole_expert_plan(matrix, config, capacity_limit=limit,
-            minimum_load_reduction=threshold / 10000, minimum_saved_rows=minimum_saved,
-            minimum_replica_rows=minimum_rows, transfer_row_credit=credit, rank_nodes=nodes)
-        if (max(whole.destination_loads) <= max(plan.destination_loads) + credit
-                and len(whole.transfers) <= len(plan.transfers)):
-            ends = tuple(sum(source[slot] for source in whole.dispatch_counts)
-                         for slot in range(config.physical_experts))
-            complete = AlignedExpertExecutionPlan(config, matrix, whole.slot_to_logical, whole.dispatch_counts,
-                                                  tuple((0, end) for end in ends))
-            complete.validate()
-            return complete
     return plan
