@@ -70,9 +70,10 @@ SET在MTE拓扑走mapped store；不与token UDMA队列混用。旧固定QP bank
 `PANGU_MX_SHARED_COUNTS=1` 只选择现有逻辑路由 agreement 作为 MX 的 count 控制通道。
 控制spec使用逻辑专家数和已有INT32 wire，执行spec仍固定token数；不切换实际执行图为动态token。
 复用已有ID/容量/grad mask校验及小表阈值，保留原有大表readback策略。planner收到同一次新鲜
-agreement的CPU counts和source summary；home-only把已拥有的小表交给offset打包，避免再次用
-设备算子重建相同metadata。F和R每次仍读取当前counts，不缓存未经本次校验的路由；新开关加入
-EP构造清单和资源生命周期。该候选尚须匹配设备screen，默认关闭。
+agreement的CPU counts和source summary；home-only可携带已拥有的小表，但当前固定 MX
+`prepare_topk_route` 仍使用设备 metadata 路径，不能把携带小表写成已消除 metadata 计算。
+F和R每次仍读取当前counts，不缓存未经本次校验的路由；新开关加入EP构造清单和资源生命周期。
+EP8筛选未得到稳定收益，后续EP16冻结配置关闭此开关。
 
 
 ## 准入与粗切分必须使用相同目标
@@ -82,7 +83,42 @@ EP构造清单和资源生命周期。该候选尚须匹配设备screen，默认
 minimax/64行规则预览；只使用 global totals 的合成source表用于CPU决策，绝不上传执行。
 真正派发仍依据本次完整source counts重新生成区间交集。拒绝memo包含partition标记。
 
-节点身份作为计划与预览的输入；峰值及平方和相同时优先同节点。与whole候选比较时
+节点身份作为计划与预览的输入；接收峰值相同时先选同节点，再比较负载平方和，避免为了
+几行次级负载差异跨机复制完整权重及返回完整形状dW。每步仍严格改善原来的
+`(峰值, 平方和)`，每专家至多一个guest，搜索仍有界。与whole候选比较时
 继续传递同一rank_nodes。必须满足的容量迁移优先于可选的最小guest行数/收益阈值，
 但内部切点仍须64对齐。新增回归用例检查“平均目标拒绝、实际单guest方案可行”的边界，
 以及小矩阵的必要整专家迁移。
+
+## 复用已有元素单位路由描述符
+
+原 metadata 同时提供行单位和元素单位 offset/size。固定 MX F/R 曾在绑定时逐字段乘 H，
+反向又乘一次。执行入口现在调用一次 `for_kernel(H)`，直接绑定已有元素视图并保存给B；
+GMM `group_list` 继续保持行单位。该公共优化也适用于B0，性能比较必须同时使用它，不能
+把公共改进全部归给副本。单测直接检查绑定张量身份和行单位前缀，避免仅检查数值巧合。
+
+## 验收边界与重现
+
+2026-11-18设备验收参数：双机950DT、EP16/E96、每rank4096 token、H5120/I1792/TopK8，
+BF16激活、物理MXFP8、T6/window2、FP32 roots/partial/public dW、QP32、8GiB SHMEM heap。
+冻结源 `e198c862` 对照原分支；新原生 `add1c5e` 来自完整构建wheel，Python策略覆盖单独保存哈希。
+不得手工替换native再伪造完整包的payload校验；早期组件混装被加载器拒绝的记录予以保留。
+
+完整字段对照、实际图X/dY/A/dU量化块、32×32 CPU FP64 dW参考和初末结果稳定性分别记录。
+曲线使用独立进程和抽样校验回执，不能替代完整精度验收。配置筛选、ABBA和32-alpha曲线
+分别报告；连续F/R/B使用每轮所有rank最大值的中位数，不相加各phase中位数。
+Torch allocator峰值、SHMEM配置量与物理HBM峰值是不同口径。所有结果均为专家组件，
+未接入Trainer或训练收敛验收。
+
+## 冷缓存规划与重复物化
+
+固定路由warm曲线会命中CPU计划LRU，不能代表每步变化的路由成本。原先先构造并校验aligned
+计划，再比较whole方案；whole胜出时前一份source配额与校验全部丢弃。现在先根据已知负载和
+边数比较whole候选，只物化最终选择的区间；保留最终完整守恒及全局行序校验。500组
+EP1/2/4/8/16差分覆盖367份有效计划和133份对应异常，slot/interval/dispatch/load完全一致。
+950DT的CPU-only交错对照中hot75冷规划9.616→7.177ms，singlehot4.152→4.116ms。
+这不是NPU端到端降时，尚需真实动态路由/Trainer单独度量。
+
+差量算分原型的收益小于重复物化消除，未采用；原型和CPU样本保留。另试过在不增加边的
+前提下收回guest前缀，在当前min_rows8192的热点锚点没有实际计划变化，只有额外搜索；降低
+门槛又增加到8/23条完整矩阵传输边，因此本轮停止此实现，不占用NPU重跑相同计划。
