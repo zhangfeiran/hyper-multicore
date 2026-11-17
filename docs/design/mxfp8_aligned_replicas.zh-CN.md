@@ -125,3 +125,12 @@ EP1/2/4/8/16差分覆盖367份有效计划和133份对应异常，slot/interval/
 门槛又增加到8/23条完整矩阵传输边，因此本轮停止此实现，不占用NPU重跑相同计划。
 
 最终32-alpha改为同配置持久进程的ABBA扫描，避免每组约4分钟初始化；alpha值、种子和每轮全rank最大值统计不变。allocator曲线保留跨点容量/缓存高水位，不能解释为逐点独立冷峰值。测量代码用devices=[]及CPU default_generator，仅改变CPU RNG，避免PTA fork_rng初始化其他NPU。
+
+## 冷容量增长的诊断边界
+
+持续扫描中一次只读调用栈停在 `ensure_capacity → HeapManager._restart → SHMEM native initialize`。
+当时配置8GiB heap、首个balanced点实际arena约0.755GB，仍有约7.835GB未分配；容量增长实现会
+整体重建运行时。该证据证明冷路径存在，不证明具体耗时全部属于QP创建，也没有实现原地扩容。
+后续可审视剩余heap内对称追加新buffer、保留旧lease和旧地址直到最后消费者结束、更新workspace
+映射及容量不足时回退整重启的合同。必须保持Root一致调用、SDK注册、指针/epoch及FP32 dW边界。
+暖态F/R/B曲线排除此初始化/扩容段，不能替代动态Trainer单步。
