@@ -186,7 +186,9 @@ def _place_aligned(matrix, config, limit, minimum_rows, threshold, minimum_saved
     # Whole-expert placement is a cheap competitor, not a split-K seed. Avoid
     # paying several full weight/dW transfers for less than the existing global
     # row allowance. This also preserves complete reductions when equally good.
-    if selected:
+    if selected and original_peak <= limit:
+        # Optional whole-expert competition must not veto mandatory fragments:
+        # the latter can satisfy a bound that no complete expert can fit.
         from .whole import build_whole_expert_plan
         whole = build_whole_expert_plan(matrix, config, capacity_limit=limit,
             minimum_load_reduction=threshold / 10000, minimum_saved_rows=minimum_saved,

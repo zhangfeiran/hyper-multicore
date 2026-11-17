@@ -127,6 +127,15 @@ def test_required_capacity_moves_override_optional_guest_threshold():
     assert_actual_permutation(plan)
 
 
+def test_feasible_mandatory_fragment_is_not_vetoed_by_infeasible_whole_expert():
+    plan=build_aligned_expert_plan(((256,0,0,0),)*4,ExpertReplicaConfig(4,4,1),
+        capacity_limit=512,minimum_replica_rows=10000,minimum_load_reduction=.9)
+    assert max(plan.destination_loads)==512
+    assert len(plan.transfers)==1
+    assert sorted(span for span in plan.intervals if span[1]>span[0])==[(0,512),(512,1024)]
+    assert_actual_permutation(plan)
+
+
 def test_equal_peak_prefers_local_guest_over_three_rows_of_secondary_balance():
     # EP16 single-hot routing: the last rank owns three fewer cold rows. Both
     # placements have the same 59345-row peak, so keep the guest on owner0's node.
