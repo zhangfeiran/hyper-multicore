@@ -136,8 +136,9 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         self.token_mte_scratch_bytes = 16384
         self._replica_partition = specification.get("mx_replica_partition", "whole")
         self._shared_counts = specification.get("mx_shared_counts", False)
-        self.replica_control_spec = replace(self.spec, num_experts=self.spec.logical_num_experts or self.spec.num_experts,
-                                           replica_slots_per_rank=0, auto_tokens=True)
+        self.replica_control_spec = replace(
+            self.spec, num_experts=self.spec.logical_num_experts or self.spec.num_experts,
+            replica_slots_per_rank=0, auto_tokens=True)
         self.weight_prefetch = MXProjectionPrefetch() if specification.get("mx_weight_prefetch", False) else None
         self.replica_headers = _ReplicaCountHeaderCache() if self.spec.replica_slots_per_rank else None
         if self.spec.num_cube_cores != 32:

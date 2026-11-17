@@ -1,8 +1,17 @@
 # Copyright 2026 Huawei Technologies Co., Ltd
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
+#
 # http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Bounded whole/64-row expert fragments preserving global MX quantization groups."""
 from __future__ import annotations
 
@@ -14,6 +23,7 @@ from .admission import reduction_basis_points
 from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
 from .planner import _counts_matrix
+from .topology import _validate_rank_nodes
 
 
 @dataclass(frozen=True)
@@ -23,6 +33,7 @@ class AlignedExpertExecutionPlan(ExpertExecutionPlan):
     intervals: tuple[tuple[int, int], ...]
 
     def __post_init__(self) -> None:
+        """Own fragment boundaries alongside the immutable source quota table."""
         super().__post_init__()
         object.__setattr__(self, "intervals", tuple(tuple(span) for span in self.intervals))
 
@@ -63,7 +74,8 @@ class AlignedExpertExecutionPlan(ExpertExecutionPlan):
 def build_aligned_expert_plan(counts: Sequence[Sequence[int]], config: ExpertReplicaConfig, *,
                               capacity_limit: int, minimum_replica_rows: int = 0,
                               minimum_load_reduction: float = 0.0,
-                              minimum_saved_rows: int = 0, transfer_row_credit: int = 0) -> AlignedExpertExecutionPlan:
+                              minimum_saved_rows: int = 0, transfer_row_credit: int = 0,
+                              rank_nodes: Sequence[int] | None = None) -> AlignedExpertExecutionPlan:
     """Freeze exact count agreement before the pure deterministic placement cache."""
     matrix = _counts_matrix(counts)
     if len(matrix) != config.ep_size or len(matrix[0]) != config.num_experts:
@@ -72,20 +84,22 @@ def build_aligned_expert_plan(counts: Sequence[Sequence[int]], config: ExpertRep
     _integer(minimum_replica_rows, "Aligned minimum guest rows", 0)
     _integer(minimum_saved_rows, "Aligned minimum saved rows", 0)
     _integer(transfer_row_credit, "Aligned transfer row credit", 0)
+    nodes = _validate_rank_nodes(() if rank_nodes is None else rank_nodes, config.ep_size) or (0,) * config.ep_size
     threshold = reduction_basis_points(minimum_load_reduction)
     return _place_aligned(matrix, config, capacity_limit, minimum_replica_rows, threshold, minimum_saved_rows,
-                          transfer_row_credit)
+                          transfer_row_credit, nodes)
 
 
 @lru_cache(maxsize=64)
-def _place_aligned(matrix, config, limit, minimum_rows, threshold, minimum_saved, credit):
+def _place_aligned(matrix, config, limit, minimum_rows, threshold, minimum_saved, credit, nodes):
+    """Minimize the receive peak, then discard avoidable full-matrix transfers."""
     home, width = config.home_experts, config.slots_per_rank
     totals = tuple(map(sum, zip(*matrix)))
     loads = [sum(totals[r * home:(r + 1) * home]) for r in range(config.ep_size)]
     original_peak = max(loads)
     guests = [0] * config.ep_size
     selected = {}
-    minimum_rows = max(64, minimum_rows)
+    minimum_rows = 1 if original_peak > limit else max(64, minimum_rows)
     # A logical expert gets at most one guest. Each accepted move strictly improves
     # the (global peak, squared rank loads) objective, so search is bounded by E.
     while config.replica_slots_per_rank:
@@ -111,12 +125,12 @@ def _place_aligned(matrix, config, limit, minimum_rows, threshold, minimum_saved
                     after[owner] -= moved
                     after[target] += moved
                     candidate = (max(after), sum(n * n for n in after))
-                    key = (candidate, expert, target, cut)
+                    key = (candidate, int(nodes[owner] != nodes[target]), expert, target, cut)
                     if candidate < score and (best is None or key < best[0]):
                         best = (key, after)
         if best is None:
             break
-        (_, expert, target, cut), loads = best
+        (_, _, expert, target, cut), loads = best
         selected[expert] = (target, cut)
         guests[target] += 1
     peak = max(loads)
@@ -174,7 +188,7 @@ def _place_aligned(matrix, config, limit, minimum_rows, threshold, minimum_saved
         from .whole import build_whole_expert_plan
         whole = build_whole_expert_plan(matrix, config, capacity_limit=limit,
             minimum_load_reduction=threshold / 10000, minimum_saved_rows=minimum_saved,
-            minimum_replica_rows=minimum_rows, transfer_row_credit=credit)
+            minimum_replica_rows=minimum_rows, transfer_row_credit=credit, rank_nodes=nodes)
         if (max(whole.destination_loads) <= max(plan.destination_loads) + credit
                 and len(whole.transfers) <= len(plan.transfers)):
             ends = tuple(sum(source[slot] for source in whole.dispatch_counts)

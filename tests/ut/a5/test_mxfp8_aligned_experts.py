@@ -110,3 +110,18 @@ def test_equivalent_whole_experts_preferred_with_same_transfer_count():
         assert sum(stop>start for slot,(start,stop) in enumerate(plan.intervals)
                    if plan.physical_to_logical[slot]==expert)==1
     assert len(plan.transfers)==6
+
+
+def test_equal_load_fragments_prefer_the_owners_node():
+    plan=build_aligned_expert_plan(((0,0,0,256),)*4,ExpertReplicaConfig(4,4,1),capacity_limit=4096,
+                                   rank_nodes=(1,0,1,0))
+    assert len(plan.transfers)==1
+    assert plan.transfers[0].owner_rank==3 and plan.transfers[0].target_rank==1
+    assert_actual_permutation(plan)
+
+
+def test_required_capacity_moves_override_optional_guest_threshold():
+    plan=build_aligned_expert_plan(((6,6,0,0),(0,0,0,0)),ExpertReplicaConfig(4,2,1),
+        capacity_limit=6,minimum_replica_rows=10000,minimum_load_reduction=.9)
+    assert max(plan.destination_loads)==6 and len(plan.transfers)==1
+    assert_actual_permutation(plan)

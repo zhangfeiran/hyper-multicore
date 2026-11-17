@@ -157,7 +157,8 @@ def _build_route_plan(counts: Any, config: ExpertReplicaConfig, complete_experts
             minimum_replica_rows=options.get("minimum_replica_rows", 0),
             minimum_load_reduction=options.get("minimum_load_reduction", 0.0),
             minimum_saved_rows=options.get("minimum_saved_rows", 0),
-            transfer_row_credit=options.get("_replica_transfer_row_credit", 0))
+            transfer_row_credit=options.get("_replica_transfer_row_credit", 0),
+            rank_nodes=options.get("_rank_nodes") or None)
     if not complete_experts:
         return build_expert_replica_plan(counts, config.replica_slots_per_rank, **options)
     if options.get('cost_model') is not None:
