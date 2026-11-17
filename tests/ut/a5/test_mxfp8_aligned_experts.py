@@ -127,6 +127,24 @@ def test_required_capacity_moves_override_optional_guest_threshold():
     assert_actual_permutation(plan)
 
 
+def test_equal_peak_prefers_local_guest_over_three_rows_of_secondary_balance():
+    # EP16 single-hot routing: the last rank owns three fewer cold rows. Both
+    # placements have the same 59345-row peak, so keep the guest on owner0's node.
+    counts=[]
+    for rank in range(16):
+        other=(torch.arange(4096*7)+rank*4096*7)%95+1
+        histogram=torch.bincount(other,minlength=96).tolist()
+        histogram[0]=4096
+        counts.append(histogram)
+    plan=build_aligned_expert_plan(counts,ExpertReplicaConfig(96,16,2),capacity_limit=524288,
+        minimum_replica_rows=8192,minimum_load_reduction=.25,rank_nodes=(0,)*8+(1,)*8)
+    assert len(plan.transfers)==1
+    assert plan.transfers[0].owner_rank==0
+    assert plan.transfers[0].target_rank in range(1,8)
+    assert max(plan.destination_loads)==59345
+    assert sum(plan.destination_loads)==16*4096*8
+
+
 def test_aligned_admission_does_not_require_the_guest_to_fit_the_average():
     from hyper_multicore.replica import _a5_routing as routing
     from hyper_multicore.replica.routing import _GatheredReplicaCounts
