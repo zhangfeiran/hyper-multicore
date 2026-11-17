@@ -110,7 +110,8 @@ def build_framework(python: Path, identity: dict, common: Path, sdks: dict[str, 
     payload.mkdir()
     env = adapter_environment(python, isolated=run.isolated)
     compile_adapter(python, directory / "torch", payload, "torch",
-                    [f"-DHP_MULTICORE_VENDOR_ROOT={common / 'lib/vendors/hyper_multicore_nn'}"],
+                    [f"-DHP_MULTICORE_VENDOR_ROOT={common / 'lib/vendors/hyper_multicore_nn'}",
+                     "-DHP_MULTICORE_NPU_ARCHS=" + ";".join(str(sdk["npu_arch"]) for sdk in sdks.values())],
                     args, run, env, identifier, identity, None, common)
     validate_elf(payload / "libhyper_multicore_torch.so", identity["host_arch"], run.commands, env)
     for backend, sdk in sdks.items():
@@ -155,6 +156,16 @@ def compile_adapter(python: Path, work: Path, output: Path, kind: str, extra: li
         selected_sdk = None if sdk is None else Path(sdk["install_root"])
         inputs, observed, enabled = COMPONENT_INPUTS.component_inputs(
             ROOT, kind, selected_sdk, identity, common, env)
+        if kind == "torch":
+            # A single adapter can contain either or both device providers.
+            # Never reuse a library compiled for a different SoC selection.
+            prefix = "-DHP_MULTICORE_NPU_ARCHS="
+            selected = [value[len(prefix):] for value in extra if value.startswith(prefix)]
+            if len(selected) != 1:
+                raise ValueError("Torch adapter requires one explicit NPU architecture selection")
+            inputs["npu_archs"] = sorted({int(arch) for arch in selected[0].split(";")})
+            if not inputs["npu_archs"] or any(arch not in (2201, 3510) for arch in inputs["npu_archs"]):
+                raise ValueError("Unsupported MoE utility architecture selection")
         if sdk is not None:
             inputs["backend"] = {key: sdk[key] for key in ("sdk_soc_type", "shmem_root", "npu_arch")}
         scanned = time.monotonic() - scan_started

@@ -857,6 +857,39 @@ time.sleep(30)
             self.assertFalse(outputs.payload.exists())
             self.assertFalse(list(outputs.distribution.iterdir()))
 
+    def test_torch_adapter_cache_distinguishes_device_providers(self):
+        """An A3-only adapter must never satisfy a 950 or combined request."""
+        work, output = self.root / "variant/torch", self.root / "payload"
+        work.mkdir(parents=True)
+        requests = []
+        cached = work.parent / "component-torch-torch"
+        write(cached / "libhyper_multicore_torch.so")
+        receipt = work.parent / "component-request-torch-torch.json"
+
+        def prepare(_request, _kind, inputs, *_args, **_kwargs):
+            requests.append(deepcopy(inputs))
+            write(receipt, "{}")
+            return True
+
+        run = SimpleNamespace(commands=_AdapterCommands(lambda *_args, **_kwargs: None))
+        with patch.object(BUILD, "ROOT", self.root), \
+                patch.object(INPUTS, "component_inputs", side_effect=lambda *_: ({}, {}, True)), \
+                patch.object(INPUTS, "origin", return_value={}), \
+                patch.object(CACHE, "prepare", side_effect=prepare):
+            for archs in ("2201", "3510", "2201;3510", "3510;2201"):
+                BUILD.compile_adapter(Path(sys.executable), work, output, "torch",
+                                      ["-DHP_MULTICORE_NPU_ARCHS=" + archs],
+                                      SimpleNamespace(jobs=80), run, {}, "fixture", {"pta_version": "fixture"}, None, self.root)
+            for extra in ([], ["-DHP_MULTICORE_NPU_ARCHS=9999"]):
+                with self.assertRaisesRegex(ValueError, "architecture"):
+                    BUILD.compile_adapter(Path(sys.executable), work, output, "torch", extra,
+                                          SimpleNamespace(jobs=80), run, {}, "fixture", {"pta_version": "fixture"}, None, self.root)
+        keys = [CACHE.fingerprint(inputs) for inputs in requests]
+        self.assertEqual(len(set(keys[:3])), 3)
+        self.assertEqual(keys[2], keys[3])
+        self.assertEqual([inputs["npu_archs"] for inputs in requests],
+                         [[2201], [3510], [2201, 3510], [2201, 3510]])
+
     def test_adapter_hit_restores_all_ctest_executables(self):
         """Warm SHMEM configuration executes all native checks without compiling again."""
         work, output = self.root / "variant/shmem/arch22", self.root / "payload"
