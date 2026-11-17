@@ -63,3 +63,13 @@ SET在MTE拓扑走mapped store；不与token UDMA队列混用。旧固定QP bank
 第二版计划同时删去只改善平方和的副本边，并以既有全局 row credit 比较完整专家候选。
 当整专家最大接收负载只多出允许的行数、却能减少完整权重/dW传输时，优先完整专家。
 该规则是无表启发式，不引入成本模型；准入阈值和共同容量界限仍须满足。
+
+
+## 固定 MX 图的逻辑 counts 复用候选
+
+`PANGU_MX_SHARED_COUNTS=1` 只选择现有逻辑路由 agreement 作为 MX 的 count 控制通道。
+控制spec使用逻辑专家数和已有INT32 wire，执行spec仍固定token数；不切换实际执行图为动态token。
+复用已有ID/容量/grad mask校验及小表阈值，保留原有大表readback策略。planner收到同一次新鲜
+agreement的CPU counts和source summary；home-only把已拥有的小表交给offset打包，避免再次用
+设备算子重建相同metadata。F和R每次仍读取当前counts，不缓存未经本次校验的路由；新开关加入
+EP构造清单和资源生命周期。该候选尚须匹配设备screen，默认关闭。

@@ -176,7 +176,7 @@ def _place_aligned(matrix, config, limit, minimum_rows, threshold, minimum_saved
             minimum_load_reduction=threshold / 10000, minimum_saved_rows=minimum_saved,
             minimum_replica_rows=minimum_rows, transfer_row_credit=credit)
         if (max(whole.destination_loads) <= max(plan.destination_loads) + credit
-                and len(whole.transfers) < len(plan.transfers)):
+                and len(whole.transfers) <= len(plan.transfers)):
             ends = tuple(sum(source[slot] for source in whole.dispatch_counts)
                          for slot in range(config.physical_experts))
             complete = AlignedExpertExecutionPlan(config, matrix, whole.slot_to_logical, whole.dispatch_counts,

@@ -93,3 +93,20 @@ def test_random_exact_conservation_and_order():
                              for e in range(12)) for _ in range(4))
         plan = build_aligned_expert_plan(counts, ExpertReplicaConfig(12, 4, 2), capacity_limit=10000)
         assert_actual_permutation(plan)
+
+
+def test_equivalent_whole_experts_preferred_with_same_transfer_count():
+    rows=[]
+    for rank in range(8):
+        counts=[0]*48
+        for token in range(4096):
+            for lane in range(8):
+                expert=lane if token<3072 else (token*8+lane+rank*4096*8)%48
+                counts[expert]+=1
+        rows.append(counts)
+    plan=build_aligned_expert_plan(rows,ExpertReplicaConfig(48,8,2),capacity_limit=262144,
+        minimum_replica_rows=1024,minimum_load_reduction=.25,transfer_row_credit=896)
+    for expert in range(48):
+        assert sum(stop>start for slot,(start,stop) in enumerate(plan.intervals)
+                   if plan.physical_to_logical[slot]==expert)==1
+    assert len(plan.transfers)==6

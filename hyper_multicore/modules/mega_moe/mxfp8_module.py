@@ -28,6 +28,7 @@ import torch.distributed as dist
 
 from hyper_multicore.replica.recompute import get_recompute_state
 from hyper_multicore.replica.capacity import ExpertReplicaConfig
+from hyper_multicore.replica.routing import _GatheredReplicaCounts
 from hyper_multicore.replica._metadata import _ReplicaCountHeaderCache
 from hyper_multicore import _collective
 from hyper_multicore.shmem._runtime import configured_data_engine, configured_udma_qp_count
@@ -47,6 +48,7 @@ from .mxfp8_prefetch import MXProjectionPrefetch
 from .mxfp8_ops import mxfp8_window_feature_available, require_mxfp8_window_feature
 from .mxfp8_weights import MXFP8ExpertWeightBinding
 from .spec import bind_mega_moe_spec
+from .route import _replica_agreement
 from .workspace import MegaMoeWorkspace
 
 
@@ -133,6 +135,9 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         self.source_row_fp8 = specification.get("mx_source_row_fp8", False)
         self.token_mte_scratch_bytes = 16384
         self._replica_partition = specification.get("mx_replica_partition", "whole")
+        self._shared_counts = specification.get("mx_shared_counts", False)
+        self.replica_control_spec = replace(self.spec, num_experts=self.spec.logical_num_experts or self.spec.num_experts,
+                                           replica_slots_per_rank=0, auto_tokens=True)
         self.weight_prefetch = MXProjectionPrefetch() if specification.get("mx_weight_prefetch", False) else None
         self.replica_headers = _ReplicaCountHeaderCache() if self.spec.replica_slots_per_rank else None
         if self.spec.num_cube_cores != 32:
@@ -212,7 +217,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             self.spec.mx_gradient_udma,
             self.source_row_fp8,
             self.spec.mx_peer_qp0,
-            self._replica_partition,
+            self._replica_partition, self._shared_counts,
         )
 
     def _validate_distributed_configuration(self, specifications: tuple[Mapping[str, Any], ...]) -> None:
@@ -222,7 +227,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             return
         flags = tuple((bool(spec.get("mx_weight_prefetch", False)), bool(spec.get("mx_gradient_udma", False)),
                        bool(spec.get("mx_source_row_fp8", False)), bool(spec.get("mx_peer_qp0", False)),
-                       spec.get("mx_replica_partition", "whole"))
+                       spec.get("mx_replica_partition", "whole"), bool(spec.get("mx_shared_counts", False)))
                       for spec in specifications)
         gathered = [None] * self.spec.ep_size
         dist.all_gather_object(gathered, flags, group=self.spec.ep_group)
@@ -363,6 +368,10 @@ class MXFP8MegaMoeExperts(A5MegaMoeExperts):
         if replica_partition not in ("whole", "aligned64"):
             raise ValueError("MXFP8 replica_partition must be whole or aligned64.")
         self.replica_partition = replica_partition
+        shared_counts = os.environ.get("PANGU_MX_SHARED_COUNTS", "0")
+        if shared_counts not in ("0", "1"):
+            raise ValueError("PANGU_MX_SHARED_COUNTS must be 0 or 1")
+        self._mx_shared_counts = shared_counts == "1"
         if hidden_size % 64 or intermediate_size % 64:
             raise ValueError("MXFP8 hidden and intermediate dimensions must be divisible by 64.")
         if vector_policy not in ("window2", "legacy_odd"):
@@ -412,6 +421,7 @@ class MXFP8MegaMoeExperts(A5MegaMoeExperts):
             "replica_transport": replica_transport,
             "mx_weight_prefetch": overlap_weights,
             "mx_replica_partition": replica_partition,
+            "mx_shared_counts": self._mx_shared_counts,
             "mx_gradient_udma": udma_gradients,
             "mx_peer_qp0": peer_qp0,
             "auto_tokens": False,
@@ -481,12 +491,16 @@ class MXFP8MegaMoeExperts(A5MegaMoeExperts):
                 | (int(topk_weights.requires_grad) << 4)
             )
             with torch.no_grad():
+                gathered = (_gather_mx_replica_counts(flat, topk_ids, resources, tokens_per_expert, mask)
+                            if getattr(self, "_mx_shared_counts", False) else None)
                 replica_route = self._prepare_replica_route(
-                    topk_ids, resources, flat, mask, tokens_per_expert,
+                    topk_ids, resources, flat, mask, tokens_per_expert, gathered,
                     count_header_cache=resources.replica_headers,
                     complete_experts=bool(mask & 1) or get_recompute_state() is not None,
                     aligned_experts=getattr(self, "replica_partition", "whole") == "aligned64",
                 )
+                if replica_route.home_only and gathered is not None and gathered.host_counts is not None:
+                    replica_route = replace(replica_route, _host_counts=tuple(map(tuple, gathered.host_counts)))
                 topk_ids = replica_route.physical_ids
                 tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]
         execution = MXFP8Execution(
@@ -495,3 +509,17 @@ class MXFP8MegaMoeExperts(A5MegaMoeExperts):
         return execute_mxfp8_experts(
             hidden_states, *expert_weights, topk_ids, topk_weights, self._mxfp8_weight_shapes, execution
         )
+
+
+def _gather_mx_replica_counts(hidden: torch.Tensor, ids: torch.Tensor, resources: Any,
+                              counts: torch.Tensor | None, mask: int) -> _GatheredReplicaCounts:
+    """Reuse current validated logical counts for MX admission and physical metadata.
+
+    The control-only automatic spec selects the existing compact wire format;
+    source rows and execution graphs remain fixed. A no-op selector retains the
+    existing replica ID checks and bounded readback policy without making a plan.
+    """
+    agreed = _replica_agreement(hidden, ids, resources.replica_control_spec, counts,
+                                resources.workspace, mask, lambda *_: None)
+    host = None if agreed.raw is None else [list(map(int, row[3:])) for row in agreed.raw]
+    return _GatheredReplicaCounts(agreed.table, agreed.source_summary, host)
