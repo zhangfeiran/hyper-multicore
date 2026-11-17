@@ -48,7 +48,8 @@ def configure_planned_queue(cfg: Any, spec: Any, *, forward: bool) -> None:
 
 
 def install_worker_queues(
-    cfg: Any, cubes: list[list[int]], vectors: list[list[int]], *, communication_lanes: int = 32
+    cfg: Any, cubes: list[list[int]], vectors: list[list[int]], *, communication_lanes: int = 32,
+    communication_queues: list[list[int]] | None = None,
 ) -> None:
     """Install CSR queues while preserving complete work and communication ownership.
 
@@ -69,6 +70,12 @@ def install_worker_queues(
         for pos, tid in enumerate(old_vector[:split])
         if cfg.all_tasks[tid].task_type in (0, 105)
     }
+    if communication_queues is not None:
+        original_communication = [tid for tid in old_vector[:split] if cfg.all_tasks[tid].task_type in (0, 105)]
+        if (len(communication_queues) != 64 or any(communication_queues[worker] for worker in range(0, 64, 2))
+                or sorted(tid for queue in communication_queues for tid in queue) != sorted(original_communication)):
+            raise ValueError("Explicit communication owners must cover original work on odd AIVs")
+        owners = {tid: worker for worker, queue in enumerate(communication_queues) for tid in queue}
     flat_cube = [q[index] for index in range(len(cubes[0])) for q in cubes]
     flat_vector = [tid for q in vectors for tid in q]
     if sorted(flat_cube) != sorted(old_cube) or sorted(flat_vector) != sorted(old_vector):
@@ -87,6 +94,8 @@ def install_worker_queues(
             else []
         )
         actual = [tid for tid in queue if cfg.all_tasks[tid].task_type in (0, 105)]
+        if communication_queues is not None:
+            original = communication_queues[worker]
         if actual != original or any(owners[tid] != worker for tid in actual):
             raise ValueError("Communication/termination QP owner or order changed")
     for i, tid in enumerate(flat_cube):

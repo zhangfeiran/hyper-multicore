@@ -56,7 +56,7 @@ from hyper_multicore.scheduler.vector_roles import configure_vector_roles, confi
 from hyper_multicore.scheduler.dispatch_quant import DispatchQuantStage, configure_dispatch_quant_queue
 from hyper_multicore.scheduler.planned_queue import PLANNED_QUEUE_TAG, configure_planned_queue
 from hyper_multicore.scheduler.window_queue import configure_window_queue
-from hyper_multicore.shmem._runtime import configured_udma_qp_count
+from hyper_multicore.shmem._runtime import configured_data_engine, configured_udma_qp_count
 from hyper_multicore.tasks.alltoall import AllToAllFillConfig, AllToAllType
 from hyper_multicore.tasks.utils import (
     add_dynamic_data,
@@ -335,6 +335,11 @@ def _apply_mx_poll_policy(cfg: Any, policy: str) -> None:
 def _validate_mx_options(spec: MegaMoeSpec, forward: bool, row_only: bool, expert_window: int) -> bool:
     """Validate precision and queues, returning the independent backward dependency policy."""
     b0_backward_dag = _b0_backward_dag_enabled(spec)
+    if not isinstance(spec.mx_peer_qp0, bool):
+        raise ValueError("MX peer QP0 mode must be a boolean")
+    if spec.mx_peer_qp0 and (spec.replica_slots_per_rank or spec.mx_vector_policy != "window2"
+                             or configured_data_engine() != "mte_udma"):
+        raise ValueError("MX peer QP0 requires B0 window2 and mte_udma")
     if not isinstance(spec.mx_skip_gradient_zero, bool):
         raise ValueError("MX gradient initialization mode must be a boolean.")
     if spec.mx_skip_gradient_zero and spec.replica_slots_per_rank:
@@ -488,7 +493,7 @@ def with_source_row_ingress(spec: MegaMoeSpec, runtime: MXFP8Runtime) -> MXFP8Ru
     Returns:
         An independent configuration with source-row byte bindings and the original event protocol.
     """
-    if (not runtime.swiglu_row_only or runtime.buffer_count != 27 or spec.replica_slots_per_rank
+    if (not runtime.swiglu_row_only or runtime.buffer_count != 27 or spec.replica_slots_per_rank or spec.mx_peer_qp0
             or spec.mx_vector_policy != "window2" or runtime.kernel_gradients or runtime.weight_prefetch):
         raise ValueError("Source-row FP8 requires a no-grad B0 window2 forward without guest helpers.")
     config = type(runtime.config).from_buffer_copy(bytes(runtime.config))

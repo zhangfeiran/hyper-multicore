@@ -26,5 +26,6 @@ TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
     "mxfp8_task_graph(Tensor(a!)[] buffers, Tensor(b!) runtime_config, Tensor(c!) events, "
     "Tensor(d!) diagnostic, Tensor launch_metadata) -> ()");
   m.def("mxfp8_task_graph_version() -> int", []() -> int64_t { return 7; });
+  m.def("mxfp8_peer_qp0_version() -> int", []() -> int64_t { return 1; });
 }
 TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) { m.impl("mxfp8_task_graph", &Mxfp8TaskGraph); }

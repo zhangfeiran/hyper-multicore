@@ -23,6 +23,37 @@ from hyper_multicore.shmem._runtime import configured_udma_qp_count
 from .config import TaskType
 from .planned_queue import install_worker_queues
 
+MX_PEER_QP0_TAG = 0x4D585130
+
+
+def _peer_transport_queues(cfg: Any, spec: Any, tasks: list[int]) -> list[list[int]]:
+    """Assign every remote peer one QP0 owner, preserving dispatch/combine FIFO."""
+    if (spec.replica_slots_per_rank or spec.mx_vector_policy != "window2" or spec.dispatch_mode != "push"
+            or spec.num_cube_cores != 32):
+        raise ValueError("MX peer QP0 queues require B0 window2 on 32 Cubes")
+    owners = {peer: 2 * (((peer - spec.rank_id) % spec.ep_size) % 32) + 1
+              for peer in range(spec.ep_size) if peer != spec.rank_id}
+    idle = [worker for worker in range(1, 64, 2) if worker not in owners.values()]
+    local_workers = idle or list(range(1, 64, 2))
+    vectors = [[] for _ in range(64)]
+    for tid in tasks:
+        task = cfg.all_tasks[tid]
+        if task.task_type == TaskType.TASK_TERMINATE:
+            vectors[1].append(tid)
+            continue
+        if int(task.task_type) not in (105, 141):
+            raise ValueError("MX peer QP0 queue contains a non-transport task")
+        width, tiles = task.task_split_num // spec.ep_size, task.task_split_num // spec.num_experts
+        if not width or not tiles:
+            raise ValueError("Invalid MX peer transport partition")
+        peer, slot = divmod(task.task_index, width)
+        expert, tile = divmod(slot, tiles)
+        worker = local_workers[(expert + tile) % len(local_workers)] if peer == spec.rank_id else owners[peer]
+        task.extra_value_0 = MX_PEER_QP0_TAG
+        task.extra_value_2 = 1
+        vectors[worker].append(tid)
+    return vectors
+
 
 def _reuse_post_dispatch_math(
     cfg: Any, vectors: list[list[int]], combine_start: int, first_stage: tuple[int, int], *, active_replicas: bool,
@@ -134,6 +165,7 @@ def configure_window_queue(
     vectors = [[] for _ in range(64)]
     cubes = [[] for _ in range(32)]
     communication = list(cfg.vector_task_indices[: cfg.task_index_num[3]])
+    peer_vectors = _peer_transport_queues(cfg, spec, communication) if getattr(spec, "mx_peer_qp0", False) else None
     for lane in range(32):
         for stage in cube_stages[:front]:
             cubes[lane].extend(tasks(stage, 0, lane))
@@ -144,7 +176,8 @@ def configure_window_queue(
                 cubes[lane].extend(tasks(stage, expert - 1, lane))
         for stage in cube_stages[front:]:
             cubes[lane].extend(tasks(stage, spec.local_experts - 1, lane))
-        vectors[2 * lane + 1] = communication[lane::32]
+        vectors[2 * lane + 1] = (communication[lane::32] if peer_vectors is None
+                                else list(peer_vectors[2 * lane + 1]))
         vectors[2 * lane].extend(tasks(inputs[0], 0, lane))
         for expert in range(spec.local_experts):
             if expert + 1 < spec.local_experts:
@@ -155,4 +188,4 @@ def configure_window_queue(
     qps = configured_udma_qp_count()
     if qps < 32:
         _validate_qp_owners(cfg, spec, vectors, qps)
-    install_worker_queues(cfg, cubes, vectors)
+    install_worker_queues(cfg, cubes, vectors, communication_queues=peer_vectors)

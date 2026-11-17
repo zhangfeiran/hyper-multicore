@@ -109,6 +109,7 @@ class MegaMoeSpec:
     mx_skip_gradient_zero: bool = False
     mx_schedule_dir: str = ""
     mx_gradient_udma: bool = False
+    mx_peer_qp0: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -282,6 +283,7 @@ def bind_mega_moe_spec(specification: Mapping[str, Any], tensor: torch.Tensor) -
         mx_poll_policy=specification.get("mx_poll_policy", "0"),
         mx_skip_gradient_zero=specification.get("mx_skip_gradient_zero", False),
         mx_gradient_udma=specification.get("mx_gradient_udma", False),
+        mx_peer_qp0=specification.get("mx_peer_qp0", False),
         replica_transport=specification.get("replica_transport", "shmem_signal_kernel_gradient_bands"),
         top_k=top_k,
         initial_capacity_factor=initial_capacity_factor,

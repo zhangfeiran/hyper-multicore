@@ -158,6 +158,8 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
                 if configured_data_engine() != "mte_udma":
                     raise ValueError("MX UDMA gradient helpers require mte_udma")
                 require_mxfp8_window_feature("replica_udma_gradient_peer_qp")
+            if self.spec.mx_peer_qp0:
+                require_mxfp8_window_feature("mx_peer_qp0")
             if self.source_row_fp8:
                 require_mxfp8_window_feature("mx_source_row_fp8")
                 require_mxfp8_window_feature("mx_source_row_ready_event")
@@ -166,7 +168,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
                     self.token_mte_scratch_bytes = 65536
 
         if (self.spec.mx_ready_depth or self.spec.mx_swiglu_row_only or self.spec.mx_gradient_udma
-                or self.source_row_fp8):
+                or self.source_row_fp8 or self.spec.mx_peer_qp0):
             _collective.collective_call(validate_features, stage="MXFP8 window capabilities", group=self.spec.ep_group)
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
         reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
@@ -206,6 +208,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             self.weight_prefetch is not None,
             self.spec.mx_gradient_udma,
             self.source_row_fp8,
+            self.spec.mx_peer_qp0,
         )
 
     def _validate_distributed_configuration(self, specifications: tuple[Mapping[str, Any], ...]) -> None:
@@ -214,7 +217,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         if self.spec.ep_size == 1:
             return
         flags = tuple((bool(spec.get("mx_weight_prefetch", False)), bool(spec.get("mx_gradient_udma", False)),
-                       bool(spec.get("mx_source_row_fp8", False)))
+                       bool(spec.get("mx_source_row_fp8", False)), bool(spec.get("mx_peer_qp0", False)))
                       for spec in specifications)
         gathered = [None] * self.spec.ep_size
         dist.all_gather_object(gathered, flags, group=self.spec.ep_group)
@@ -291,6 +294,17 @@ def _mx_b0_options(replica_slots: int) -> tuple[str, bool]:
     return poll, skip_zero == "1"
 
 
+def _mx_peer_qp0_option(replica_slots: int, vector_policy: str, source_row: bool) -> bool:
+    """Keep the PR23 peer-owned transport opt-in and separate from replica QPs."""
+    value = os.environ.get("PANGU_MX_PEER_QP0", "0")
+    if value not in ("0", "1"):
+        raise ValueError("PANGU_MX_PEER_QP0 must be 0 or 1")
+    if value == "1" and (replica_slots or vector_policy != "window2" or source_row
+                         or configured_data_engine() != "mte_udma"):
+        raise ValueError("MX peer QP0 requires B0 window2, mte_udma and ordinary BF16 token ingress")
+    return value == "1"
+
+
 class MXFP8MegaMoeExperts(A5MegaMoeExperts):
     """Execute MXFP8 experts while keeping FSDP root Parameters phase-current.
 
@@ -356,6 +370,7 @@ class MXFP8MegaMoeExperts(A5MegaMoeExperts):
         poll, skip_gradient_zero = _mx_b0_options(replica_slots_per_rank)
         source_row_fp8 = source_row_fp8_enabled(vector_policy=vector_policy, row_only=row_only,
                                                replica_slots=replica_slots_per_rank, hidden_size=hidden_size)
+        peer_qp0 = _mx_peer_qp0_option(replica_slots_per_rank, vector_policy, source_row_fp8)
         config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         self.replica_planner = "cpu"
         self.replica_min_rows = replica_min_rows
@@ -383,6 +398,7 @@ class MXFP8MegaMoeExperts(A5MegaMoeExperts):
             "replica_transport": replica_transport,
             "mx_weight_prefetch": overlap_weights,
             "mx_gradient_udma": udma_gradients,
+            "mx_peer_qp0": peer_qp0,
             "auto_tokens": False,
             "compute_stages": 6,
             "mx_vector_policy": vector_policy,

@@ -60,6 +60,13 @@ def mxfp8_window_feature_available(feature: str) -> bool:
     binary = vendor / "op_impl/ai_core/tbe/kernel/arch35/pangu_mxfp8_task_graph" / expected
     if hashlib.sha256(binary.read_bytes()).hexdigest() != receipt.get("sha256"):
         raise RuntimeError("MX window capability receipt does not match the loaded vendor payload.")
+    if feature == "mx_peer_qp0":
+        # This optional native ABI also requires launch version15, which older
+        # device payloads reject instead of silently treating QP0 tasks as MTE.
+        try:
+            return torch.ops.hyper_multicore.mxfp8_peer_qp0_version() == 1
+        except AttributeError:
+            return False
     return feature in receipt.get("features", ())
 
 
@@ -109,6 +116,12 @@ def serialize_mxfp8_launch(
         event_bytes=events.numel(),
         vector_policy=spec.mx_vector_policy,
     )
+    if getattr(spec, "mx_peer_qp0", False):
+        if source_row_fp8 or kernel_gradients or weight_prefetch:
+            raise ValueError("MX peer QP0 cannot share guest or source-row launch protocols")
+        record = MxLaunchDescriptor.from_buffer_copy(content)
+        record.version, record.reserved = 15, 14
+        return bytes(record)
     if source_row_fp8:
         if kernel_gradients or weight_prefetch:
             raise ValueError("Source-row FP8 ingress cannot use the guest weight or gradient launch protocol.")

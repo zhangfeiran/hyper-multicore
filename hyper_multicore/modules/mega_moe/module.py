@@ -393,6 +393,7 @@ class _MegaMoeExecutionResources:
             "forward_ingress_mode", "backward_ingress_mode", "shared_intermediate_size",
             "shared_placement", "forward_shared_expert", "backward_shared_expert",
             "compute_stages", "mx_vector_policy", "mx_poll_policy", "mx_swiglu_row_only", "mx_ready_depth",
+            "mx_peer_qp0",
         )
         manifest = (
             "dynamic_tokens_v4",

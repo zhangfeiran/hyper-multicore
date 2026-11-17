@@ -149,6 +149,12 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
     src_offset_ = src_offset_ + static_cast<int64_t>(start);
     send_data_size_ = static_cast<int64_t>(send_data_size_);
 
+    constexpr uint32_t kPeerQp0Marker = 0x4D585130U;
+    if (task_desc.extra_value_0 == kPeerQp0Marker) {
+      if (launch->version != 15 || launch->reserved != 14 || this->replica_udma_legacy_qp_bank_) Trap();
+      if (TryPeerQp0Put(task_desc, target_pe, target_offset_, src_offset_, send_data_size_, transport_probe)) return;
+    }
+
     constexpr uint32_t kMixedCombineMarker = 0x4D584D00U;
     const uint32_t transport = static_cast<uint32_t>(task_desc.extra_value_0);
     const bool mixed_combine = (transport & 0xFFFFFFFCU) == kMixedCombineMarker;
@@ -164,6 +170,42 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
                           src_offset_, send_data_size_, signal, static_cast<int64_t>(task_desc.trigger_event), 1,
                           nullptr, 1, target_pe, false, this->replica_udma_legacy_qp_bank_ ? 16 : 0,
                           prefer_mapped_mte, transport_probe, MteScratchBytes(transport));
+  }
+
+  __aicore__ inline bool TryPeerQp0Put(const TaskDesc &task, int32_t peer, int64_t destination_offset,
+                                       int64_t source_offset, int64_t elements, GM_ADDR probe) {
+    auto state = aclshmemi_get_state();
+    if (peer == aclshmem_my_pe()) return false;
+    const uint32_t ep = getExtraValueFromTiling(this->input_list[TILING_IDX], 1);
+    const uint32_t rank = aclshmem_my_pe() % ep;
+    const uint32_t remote = peer % ep;
+    const uint32_t owner = 2 * (((remote + ep - rank) % ep) % 32) + 1;
+    if (this->worker_id_ != owner) Trap();
+    if (!(state->topo_list[peer] & ACLSHMEM_TRANSPORT_UDMA)) return false;
+    const uint32_t qps = aclshmemi_udma_qp_info_fetch()->qp_num;
+    if (qps != 1 && qps != 8 && qps != 16 && qps != 32) Trap();
+    auto destination = reinterpret_cast<__gm__ uint8_t *>(this->input_list[task.outputs[0].input_position] +
+        task.outputs[0].base_ptr_offset * task.outputs[0].data_type + destination_offset * sizeof(bfloat16_t));
+    auto source = reinterpret_cast<__gm__ uint8_t *>(this->input_list[task.inputs[1].input_position] +
+        task.inputs[1].base_ptr_offset * task.inputs[1].data_type + source_offset * sizeof(bfloat16_t));
+    TPipe pipe;
+    TBuf<TPosition::VECOUT> staging;
+    pipe.InitBuffer(staging, ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE);
+    auto scratch = reinterpret_cast<__ubuf__ uint8_t *>(staging.Get<uint8_t>().GetPhyAddr());
+    uint64_t bytes = static_cast<uint64_t>(elements) * sizeof(bfloat16_t);
+    while (bytes) {
+      const uint32_t count = bytes < (1ULL << 28) ? bytes : (1ULL << 28);
+      aclshmemx_udma_qp_put_nbi<uint8_t>(destination, source, scratch, count, peer, 0, 0);
+      aclshmemx_udma_qp_quiet(peer, 0);
+      destination += count;
+      source += count;
+      bytes -= count;
+    }
+    hyper_multicore::shmem::data_plane::signal(
+      reinterpret_cast<__gm__ int32_t *>(this->input_list[EVENT_IDX]) + task.trigger_event,
+      1, hyper_multicore::shmem::data_plane::SignalOp::Add, peer);
+    hyper_multicore::RecordTokenTransport(probe, hyper_multicore::TokenTransportProbeSlot::REMOTE_UDMA);
+    return true;
   }
 
   __aicore__ static inline uint32_t MteScratchBytes(uint32_t transport) {
@@ -274,7 +316,8 @@ __aicore__ inline void RunMxTaskGraph(GM_ADDR buffers, GM_ADDR runtime, GM_ADDR 
   const bool prefetch = HasMxPrefetch(launch);
   const bool gradients = HasMxGradientReturn(launch);
   const bool source_row = launch->version == 14 && launch->reserved == 13;
-  const bool window = (launch->version == 6 && launch->reserved == 5) || gradients || prefetch || source_row;
+  const bool peer_qp0 = launch->version == 15 && launch->reserved == 14;
+  const bool window = (launch->version == 6 && launch->reserved == 5) || gradients || prefetch || source_row || peer_qp0;
   const bool legacy = launch->version == 1 && launch->reserved == 0;
   if (launch->magic != MulticoreMx::MX_LAUNCH_MAGIC || (!window && !legacy) || launch->buffer_count == 0 ||
       launch->buffer_count > 64 || !MulticoreMx::IsMxLaunchTopologyValid(launch->ep, launch->experts))
