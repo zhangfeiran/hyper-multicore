@@ -33,6 +33,7 @@ namespace launch_test {
 extern int callback_status;
 extern int last_status;
 extern int status_reads;
+extern int npu_arch;
 }
 """,
     "torch_npu/csrc/core/npu/NPUStream.h": """#pragma once
@@ -64,8 +65,12 @@ struct OpCommand {
 #include "launch_test_state.h"
 constexpr int ACL_SUCCESS = 0;
 constexpr int ACL_DEV_ATTR_VECTOR_CORE_NUM = 1;
+constexpr int ACL_DEV_ATTR_NPU_ARCH = 601;
 constexpr int ACL_RT_THREAD_LEVEL = 0;
-inline int aclrtGetDeviceInfo(int, int, int64_t* cores) { *cores = 40; return ACL_SUCCESS; }
+inline int aclrtGetDeviceInfo(int, int attr, int64_t* value) {
+    *value = attr == ACL_DEV_ATTR_NPU_ARCH ? launch_test::npu_arch : 40;
+    return ACL_SUCCESS;
+}
 inline int aclrtPeekAtLastError(int) {
     ++launch_test::status_reads;
     return launch_test::last_status;
@@ -92,7 +97,7 @@ def _native_utility_source(root: Path) -> Path:
     return source
 
 
-def _compile_native_utilities(root: Path) -> Path:
+def _compile_native_utilities(root: Path, archs: tuple[int, ...] = (2201, 3510)) -> Path:
     """Compile the real utility with CPU tensors and framework-independent launch stubs."""
     compiler = shutil.which("g++")
     if compiler is None:
@@ -111,7 +116,7 @@ def _compile_native_utilities(root: Path) -> Path:
     library_path = ":".join(str(path) for path in (torch_root / "lib", torch_root.parent / "torch.libs")
                             if path.is_dir())
     result = subprocess.run([
-        compiler, f"-std={cpp_standard}", "-O0",
+        compiler, f"-std={cpp_standard}", "-O0", *[f"-DHMC_UTILITY_ARCH{arch}=1" for arch in archs],
         f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}",
         "-I", str(root), "-I", str(torch_root / "include"),
         "-I", str(torch_root / "include/torch/csrc/api/include"),
@@ -134,13 +139,27 @@ class TestNativeUtilities(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_route_offsets_propagates_launch_status(self) -> None:
         """Feature: Native routing launch error propagation.
-        Description: Execute the real RouteOffsets callback with successful and failed launches.
-        Expectation: RunOpApi receives the immediate status and reports launch failures to the caller.
+        Description: Execute RouteOffsets for supported NPU architectures and an unsupported architecture.
+        Expectation: Select the matching provider, propagate launch errors and reject unsupported devices before launch.
         """
         with tempfile.TemporaryDirectory(prefix="hmc-native-utilities-") as directory:
             executable = _compile_native_utilities(Path(directory))
-            for status in (0, 17):
-                with self.subTest(status=status):
-                    result = subprocess.run([str(executable), str(status)],
+            for arch, status in ((2201, 0), (2201, 17), (3510, 0), (3510, 17), (9999, 0)):
+                with self.subTest(arch=arch, status=status):
+                    result = subprocess.run([str(executable), str(status), str(arch)],
                                             check=False, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_missing_device_provider_rejects_before_launch(self) -> None:
+        """Feature: Architecture-specific utility availability.
+        Description: Use a 950-only build on a supported A3 device.
+        Expectation: Report the missing provider before enqueueing a device kernel.
+        """
+        with tempfile.TemporaryDirectory(prefix="hmc-native-utilities-3510-") as directory:
+            executable = _compile_native_utilities(Path(directory), (3510,))
+            for arch in (2201, 3510):
+                result = subprocess.run([str(executable), "0", str(arch), "3510"],
+                                        check=False, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
