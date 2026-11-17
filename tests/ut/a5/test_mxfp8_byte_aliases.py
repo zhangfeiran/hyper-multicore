@@ -15,6 +15,10 @@
 """Verify exact native byte arguments without NPU initialization or persistent view caches."""
 
 import ctypes
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 import torch
@@ -81,3 +85,40 @@ class TestMXFP8ByteAliases(unittest.TestCase):
         source = torch.arange(24, dtype=torch.float32).reshape(4, 6).t()
         with self.assertRaisesRegex(ValueError, "implicit physical weight copies"):
             _byte_aliases([source])
+
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_native_list_storage_can_cover_a_smaller_packed_view(self) -> None:
+        """Feature: CANN storage shape versus MX logical view bounds.
+        Description: Replay the 950 descriptor for a 48-byte group-list in 4192-byte storage.
+        Expectation: Accept covered views and reject short storage, invalid rank and malformed headers.
+        """
+        compiler = shutil.which("c++")
+        if compiler is None:
+            self.skipTest("A C++ compiler is required")
+        include = Path(__file__).resolve().parents[3] / "hyper_multicore/ops"
+        fixture = r'''
+#include "mxfp8/mx_byte_tensor_list.h"
+#include <cassert>
+int main() {
+  using namespace MulticoreMx;
+  assert(IsMxByteListHeaderValid(440, 27));
+  assert(!IsMxByteListHeaderValid(432, 27));
+  assert(!IsMxByteListHeaderValid(8, 0));
+  assert(!IsMxByteListHeaderValid(1048, 65));
+  assert(IsMxByteVectorShapeValid(0x100000001ULL, 4192, 48));
+  assert(IsMxByteVectorShapeValid(0x100000001ULL, 48, 48));
+  assert(IsMxByteVectorShapeValid(1, 1, 0));
+  assert(!IsMxByteVectorShapeValid(0x100000001ULL, 47, 48));
+  assert(!IsMxByteVectorShapeValid(0x100000000ULL, 4192, 48));
+  assert(!IsMxByteVectorShapeValid(0x100000002ULL, 4192, 48));
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="mx-byte-list-") as directory:
+            source = Path(directory) / "fixture.cpp"
+            executable = Path(directory) / "fixture"
+            source.write_text(fixture)
+            subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                            f"-I{include}", str(source), "-o", str(executable)],
+                           check=True, capture_output=True, text=True)
+            subprocess.run([str(executable)], check=True, capture_output=True, text=True)

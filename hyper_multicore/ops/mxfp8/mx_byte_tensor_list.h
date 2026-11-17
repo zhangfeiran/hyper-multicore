@@ -14,9 +14,14 @@ MX_BYTE_LIST_INLINE bool IsMxByteListHeaderValid(uint64_t pointer_offset, uint32
   return count > 0 && count <= 64 && pointer_offset == sizeof(uint64_t) * (1 + 2 * count);
 }
 
-MX_BYTE_LIST_INLINE bool IsMxByteVectorShapeValid(uint64_t rank_word, uint64_t bytes, uint64_t expected_bytes) {
+MX_BYTE_LIST_INLINE bool IsMxByteVectorShapeValid(uint64_t rank_word, uint64_t storage_bytes, uint64_t logical_bytes) {
   // The upper rank-word bits are CANN descriptor metadata, not the list length.
-  return (rank_word & 0xffffffffULL) == 1 && bytes == expected_bytes;
+  // CANN describes the backing storage, even for a contiguous byte view into
+  // a packed allocation. For example, a 48-byte group-list view can carry a
+  // 4192-byte storage shape. The list data pointer already includes the view
+  // offset. Keep the launch's logical bounds for all task range checks; the
+  // storage descriptor only has to cover those bounds.
+  return (rank_word & 0xffffffffULL) == 1 && storage_bytes >= logical_bytes;
 }
 }  // namespace MulticoreMx
 #undef MX_BYTE_LIST_INLINE
