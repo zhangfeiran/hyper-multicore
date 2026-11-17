@@ -132,6 +132,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         self.spec = bind_mega_moe_spec(specification, tensor)
         self.source_row_fp8 = specification.get("mx_source_row_fp8", False)
         self.token_mte_scratch_bytes = 16384
+        self._replica_partition = specification.get("mx_replica_partition", "whole")
         self.weight_prefetch = MXProjectionPrefetch() if specification.get("mx_weight_prefetch", False) else None
         self.replica_headers = _ReplicaCountHeaderCache() if self.spec.replica_slots_per_rank else None
         if self.spec.num_cube_cores != 32:
@@ -209,6 +210,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             self.spec.mx_gradient_udma,
             self.source_row_fp8,
             self.spec.mx_peer_qp0,
+            self._replica_partition,
         )
 
     def _validate_distributed_configuration(self, specifications: tuple[Mapping[str, Any], ...]) -> None:
@@ -217,7 +219,8 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         if self.spec.ep_size == 1:
             return
         flags = tuple((bool(spec.get("mx_weight_prefetch", False)), bool(spec.get("mx_gradient_udma", False)),
-                       bool(spec.get("mx_source_row_fp8", False)), bool(spec.get("mx_peer_qp0", False)))
+                       bool(spec.get("mx_source_row_fp8", False)), bool(spec.get("mx_peer_qp0", False)),
+                       spec.get("mx_replica_partition", "whole"))
                       for spec in specifications)
         gathered = [None] * self.spec.ep_size
         dist.all_gather_object(gathered, flags, group=self.spec.ep_group)
@@ -294,13 +297,17 @@ def _mx_b0_options(replica_slots: int) -> tuple[str, bool]:
     return poll, skip_zero == "1"
 
 
-def _mx_peer_qp0_option(replica_slots: int, vector_policy: str, source_row: bool) -> bool:
+def _mx_peer_qp0_option(replica_slots: int, vector_policy: str, source_row: bool, transport: str = "p2p") -> bool:
     """Keep the PR23 peer-owned transport opt-in and separate from replica QPs."""
     value = os.environ.get("PANGU_MX_PEER_QP0", "0")
     if value not in ("0", "1"):
         raise ValueError("PANGU_MX_PEER_QP0 must be 0 or 1")
-    if value == "1" and (replica_slots or vector_policy != "window2" or source_row
-                         or configured_data_engine() != "mte_udma"):
+    active = os.environ.get("PANGU_MX_ACTIVE_PEER_QP0", "0")
+    if active not in ("0", "1"):
+        raise ValueError("PANGU_MX_ACTIVE_PEER_QP0 must be 0 or 1")
+    if value == "1" and (
+            (replica_slots and (active != "1" or transport != "p2p"))
+            or vector_policy != "window2" or source_row or configured_data_engine() != "mte_udma"):
         raise ValueError("MX peer QP0 requires B0 window2, mte_udma and ordinary BF16 token ingress")
     return value == "1"
 
@@ -325,6 +332,7 @@ class MXFP8MegaMoeExperts(A5MegaMoeExperts):
         vector_policy: Adopted two-expert lookahead or the legacy control schedule.
         nograd_no_clone: Avoid the intermediate clone for checkpoint forwards.
         replica_transport: Exact weight P2P with optional fused FP32 projection-gradient return.
+        replica_partition: Whole experts, or opt-in contiguous global 64-row fragments with FP32 partial dW.
     """
 
     def __init__(
@@ -347,8 +355,12 @@ class MXFP8MegaMoeExperts(A5MegaMoeExperts):
         nograd_no_clone: bool = True,
         replica_transport: str = "p2p",
         overlap_weights: bool = False,
+        replica_partition: str = "whole",
     ) -> None:
         """Bind validated invocation resources without retaining gathered weight views."""
+        if replica_partition not in ("whole", "aligned64"):
+            raise ValueError("MXFP8 replica_partition must be whole or aligned64.")
+        self.replica_partition = replica_partition
         if hidden_size % 64 or intermediate_size % 64:
             raise ValueError("MXFP8 hidden and intermediate dimensions must be divisible by 64.")
         if vector_policy not in ("window2", "legacy_odd"):
@@ -370,7 +382,7 @@ class MXFP8MegaMoeExperts(A5MegaMoeExperts):
         poll, skip_gradient_zero = _mx_b0_options(replica_slots_per_rank)
         source_row_fp8 = source_row_fp8_enabled(vector_policy=vector_policy, row_only=row_only,
                                                replica_slots=replica_slots_per_rank, hidden_size=hidden_size)
-        peer_qp0 = _mx_peer_qp0_option(replica_slots_per_rank, vector_policy, source_row_fp8)
+        peer_qp0 = _mx_peer_qp0_option(replica_slots_per_rank, vector_policy, source_row_fp8, replica_transport)
         config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         self.replica_planner = "cpu"
         self.replica_min_rows = replica_min_rows
@@ -397,6 +409,7 @@ class MXFP8MegaMoeExperts(A5MegaMoeExperts):
             "replica_slots_per_rank": replica_slots_per_rank,
             "replica_transport": replica_transport,
             "mx_weight_prefetch": overlap_weights,
+            "mx_replica_partition": replica_partition,
             "mx_gradient_udma": udma_gradients,
             "mx_peer_qp0": peer_qp0,
             "auto_tokens": False,
@@ -470,6 +483,7 @@ class MXFP8MegaMoeExperts(A5MegaMoeExperts):
                     topk_ids, resources, flat, mask, tokens_per_expert,
                     count_header_cache=resources.replica_headers,
                     complete_experts=bool(mask & 1) or get_recompute_state() is not None,
+                    aligned_experts=getattr(self, "replica_partition", "whole") == "aligned64",
                 )
                 topk_ids = replica_route.physical_ids
                 tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]

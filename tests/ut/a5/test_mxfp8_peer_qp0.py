@@ -111,3 +111,37 @@ def test_peer_qp0_capability_requires_native_probe_and_matching_object(tmp_path)
         with pytest.raises(RuntimeError,match='does not match'):
             mxfp8_ops.mxfp8_window_feature_available('mx_peer_qp0')
     mxfp8_ops.require_mxfp8_window_feature.cache_clear()
+
+@pytest.mark.parametrize('forward', (False, True))
+def test_active_p2p_peer_queues_preserve_math_and_full_coverage(forward):
+    spec = MegaMoeSpec(4096, 5120, 1792, 64, 8, 1.25, 40960, 8, None, 7, 32,
+                       replica_slots_per_rank=2, logical_num_experts=48, replica_transport='p2p',
+                       mx_vector_policy='window2', dispatch_split=512, combine_split=512, compute_stages=6)
+    with patch.dict(os.environ, {'HYPER_MULTICORE_SHMEM_DATA_ENGINE': 'mte_udma',
+                                 'HYPER_MULTICORE_SHMEM_UDMA_QP_NUM': '32'}):
+        before = build_mxfp8_runtime(spec, forward=forward)
+        after = build_mxfp8_runtime(replace(spec, mx_peer_qp0=True), forward=forward)
+    assert before.gmm_descriptors == after.gmm_descriptors
+    assert before.quant_descriptors == after.quant_descriptors
+    assert bytes(before.config.all_event_num_triggers) == bytes(after.config.all_event_num_triggers)
+    assert Counter(before.config.vector_task_indices[:before.config.task_index_num[1]]) == Counter(
+        after.config.vector_task_indices[:after.config.task_index_num[1]])
+    for peer in range(8):
+        if peer == spec.rank_id:
+            continue
+        owner = 2 * (((peer - spec.rank_id) % 8) % 32) + 1
+        for task_index in after.config.vector_task_indices[
+                after.config.mix_task_indices[owner]:after.config.mix_task_indices[owner + 1]]:
+            task = after.config.all_tasks[task_index]
+            if int(task.task_type) in (105, 141) and task.task_index // (task.task_split_num // 8) == peer:
+                assert task.extra_value_0 == MX_PEER_QP0_TAG
+
+
+def test_active_peer_requires_explicit_p2p_opt_in():
+    with patch.dict(os.environ, {'PANGU_MX_PEER_QP0': '1', 'PANGU_MX_ACTIVE_PEER_QP0': '1',
+                                 'HYPER_MULTICORE_SHMEM_DATA_ENGINE': 'mte_udma'}):
+        assert _mx_peer_qp0_option(2, 'window2', False, 'p2p')
+        with pytest.raises(ValueError):
+            _mx_peer_qp0_option(2, 'window2', False, 'shmem_signal_kernel_gradient')
+        with pytest.raises(ValueError):
+            _mx_peer_qp0_option(2, 'window2', True, 'p2p')

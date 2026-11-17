@@ -958,6 +958,7 @@ class A5MegaMoeExperts(MulticoreModule):
         self, topk_ids: torch.Tensor, resources: _MegaMoeExecutionResources, hidden: torch.Tensor,
         autograd_mask: int, counts: torch.Tensor | None, gathered: _GatheredReplicaCounts | None = None,
         *, count_header_cache: _ReplicaCountHeaderCache | None = None, complete_experts: bool = False,
+        aligned_experts: bool = False,
     ) -> ReplicaRoute:
         """Resolve a placement using current source counts and available calibrated policy."""
         reduction, row_credit = self._replica_route_policy(autograd_mask)
@@ -1001,6 +1002,7 @@ class A5MegaMoeExperts(MulticoreModule):
             _rejected_quota_memo=self._rejected_quota_memo if cost_model is not None or complete_experts else None,
             _count_header_cache=count_header_cache,
             _complete_experts=complete_experts,
+            _aligned_experts=aligned_experts,
         )
 
     def _replica_route_selector(self, resources, hidden, ids, trusted, mask, state):

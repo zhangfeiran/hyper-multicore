@@ -337,7 +337,8 @@ def _validate_mx_options(spec: MegaMoeSpec, forward: bool, row_only: bool, exper
     b0_backward_dag = _b0_backward_dag_enabled(spec)
     if not isinstance(spec.mx_peer_qp0, bool):
         raise ValueError("MX peer QP0 mode must be a boolean")
-    if spec.mx_peer_qp0 and (spec.replica_slots_per_rank or spec.mx_vector_policy != "window2"
+    if spec.mx_peer_qp0 and ((spec.replica_slots_per_rank and spec.replica_transport != "p2p")
+                             or spec.mx_vector_policy != "window2"
                              or configured_data_engine() != "mte_udma"):
         raise ValueError("MX peer QP0 requires B0 window2 and mte_udma")
     if not isinstance(spec.mx_skip_gradient_zero, bool):

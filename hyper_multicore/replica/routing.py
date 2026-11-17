@@ -880,17 +880,19 @@ def _mapped_replica_route(plan, rank, group, topk_ids, summary, reused, route_ca
     )
 
 
-def _plan_replica_route(counts, config, group, rank, _route_cache=None, _complete_experts=False, **options):
+def _plan_replica_route(counts, config, group, rank, _route_cache=None, _complete_experts=False,
+                        _aligned_experts=False, **options):
     """Select the calibrated planner only for policies that need its extra contract."""
     cost = options.pop("cost_model", None)
     adaptive = options.pop("adaptive", bool(config.replica_slots_per_rank))
     nodes = options.pop("_rank_nodes", options.pop("rank_nodes", ()))
     credit = options.pop("_replica_transfer_row_credit", options.pop("transfer_row_credit", 0))
-    if cost is not None or _complete_experts or not adaptive:
+    if cost is not None or _complete_experts or _aligned_experts or not adaptive:
         from . import _a5_routing  # pylint: disable=import-outside-toplevel
         return _a5_routing._plan_replica_route(
             counts.tolist() if isinstance(counts, np.ndarray) else counts, config, group, rank,
-            _complete_experts=_complete_experts, cost_model=cost, adaptive=adaptive,
+            _complete_experts=_complete_experts, _aligned_experts=_aligned_experts,
+            cost_model=cost, adaptive=adaptive,
             _rank_nodes=nodes, _replica_transfer_row_credit=credit, **options)
     return _plan_replica_route_default(counts, config, group, rank, _route_cache,
                                        rank_nodes=nodes, transfer_row_credit=credit, **options)
@@ -902,7 +904,7 @@ def prepare_replica_route(
     max_local_num_tokens=None, receive_capacity=None, _auto_capacity_factor=None, _capacity_budget=None,
     _rank_nodes=(), _cost_model=None, _trusted_counts=None, _gathered_counts=None,
     _replica_transfer_row_credit=0, _route_cache=None, _rejected_quota_memo=None,
-    _count_header_cache=None, _complete_experts=False,
+    _count_header_cache=None, _complete_experts=False, _aligned_experts=False,
 ):
     """Keep the target fast route while retaining A5 device and calibrated policies."""
     from .device import validate_planner_backend  # pylint: disable=import-outside-toplevel
@@ -913,7 +915,7 @@ def prepare_replica_route(
                   _auto_capacity_factor=_auto_capacity_factor, _capacity_budget=_capacity_budget,
                   _rank_nodes=_rank_nodes, _trusted_counts=_trusted_counts, _gathered_counts=_gathered_counts,
                   _replica_transfer_row_credit=_replica_transfer_row_credit)
-    if (planner_backend != "cpu" or _cost_model is not None or _complete_experts or
+    if (planner_backend != "cpu" or _cost_model is not None or _complete_experts or _aligned_experts or
             _count_header_cache is not None or _rejected_quota_memo is not None or max_local_num_tokens is not None):
         from . import _a5_routing  # pylint: disable=import-outside-toplevel
         if _gathered_counts is not None and isinstance(_gathered_counts.host_counts, np.ndarray):
@@ -921,5 +923,6 @@ def prepare_replica_route(
         return _a5_routing.prepare_replica_route(
             topk_ids, config, group, planner_backend=planner_backend, max_local_num_tokens=max_local_num_tokens,
             _cost_model=_cost_model, _rejected_quota_memo=_rejected_quota_memo,
-            _count_header_cache=_count_header_cache, _complete_experts=_complete_experts, **common)
+            _count_header_cache=_count_header_cache, _complete_experts=_complete_experts,
+            _aligned_experts=_aligned_experts, **common)
     return _prepare_default_replica_route(topk_ids, config, group, _route_cache=_route_cache, **common)

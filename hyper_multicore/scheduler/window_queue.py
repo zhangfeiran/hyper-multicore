@@ -28,7 +28,8 @@ MX_PEER_QP0_TAG = 0x4D585130
 
 def _peer_transport_queues(cfg: Any, spec: Any, tasks: list[int]) -> list[list[int]]:
     """Assign every remote peer one QP0 owner, preserving dispatch/combine FIFO."""
-    if (spec.replica_slots_per_rank or spec.mx_vector_policy != "window2" or spec.dispatch_mode != "push"
+    if ((spec.replica_slots_per_rank and spec.replica_transport != "p2p")
+            or spec.mx_vector_policy != "window2" or spec.dispatch_mode != "push"
             or spec.num_cube_cores != 32):
         raise ValueError("MX peer QP0 queues require B0 window2 on 32 Cubes")
     owners = {peer: 2 * (((peer - spec.rank_id) % spec.ep_size) % 32) + 1

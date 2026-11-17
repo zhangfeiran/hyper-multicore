@@ -146,6 +146,18 @@ def _validate_complete_expert_policy(selected: bool, backend: str) -> None:
 def _build_route_plan(counts: Any, config: ExpertReplicaConfig, complete_experts: bool,
                       options: dict[str, Any]) -> ExpertExecutionPlan:
     """Select complete MX reductions before checkpoint caching and metadata upload."""
+    aligned = options.pop("_aligned_experts", False)
+    if aligned:
+        from .aligned import build_aligned_expert_plan
+        _validate_complete_options(options, config)
+        if options.get("cost_model") is not None:
+            raise ValueError("Aligned MXFP8 replicas require an uncalibrated CPU policy")
+        return build_aligned_expert_plan(
+            counts, config, capacity_limit=options["capacity_limit"],
+            minimum_replica_rows=options.get("minimum_replica_rows", 0),
+            minimum_load_reduction=options.get("minimum_load_reduction", 0.0),
+            minimum_saved_rows=options.get("minimum_saved_rows", 0),
+            transfer_row_credit=options.get("_replica_transfer_row_credit", 0))
     if not complete_experts:
         return build_expert_replica_plan(counts, config.replica_slots_per_rank, **options)
     if options.get('cost_model') is not None:
@@ -514,6 +526,7 @@ def prepare_replica_route(
     _rejected_quota_memo: _RejectedQuotaMemo | None = None,
     _count_header_cache: _ReplicaCountHeaderCache | None = None,
     _complete_experts: bool = False,
+    _aligned_experts: bool = False,
 ) -> ReplicaRoute:
     """Gather logical counts once, plan replicas, and preserve every TopK slot.
 
@@ -548,6 +561,7 @@ def prepare_replica_route(
     """
     validate_planner_backend(planner_backend, minimum_replica_rows, _cost_model)
     _validate_complete_expert_policy(_complete_experts, planner_backend)
+    _validate_complete_expert_policy(_aligned_experts, planner_backend)
     if receive_capacity is not None:
         _integer(receive_capacity, "receive_capacity", 0)
     if _capacity_budget is not None and not callable(_capacity_budget):
@@ -630,7 +644,7 @@ def prepare_replica_route(
             minimum_replica_rows=minimum_replica_rows,
             cost_model=_cost_model, rank_nodes=_rank_nodes, capacity_budget=_capacity_budget,
             gathered_counts=_gathered_counts, rejected_quota_memo=_rejected_quota_memo,
-            complete_experts=_complete_experts)
+            complete_experts=_complete_experts and not _aligned_experts)
         if isinstance(ordinary, ReplicaRoute):
             return ordinary
         prepared_candidate = ordinary
@@ -658,7 +672,7 @@ def prepare_replica_route(
         upper = min(upper, receive_capacity)
     plan, reused = _plan_replica_route(
         logical_host, config, group, rank,
-        _complete_experts=_complete_experts,
+        _complete_experts=_complete_experts, _aligned_experts=_aligned_experts,
         target_load=min(upper, target_load) if target_load is not None else None,
         minimum_replica_rows=minimum_replica_rows, capacity_limit=upper, cost_model=_cost_model,
         minimum_load_reduction=minimum_load_reduction,
