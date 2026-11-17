@@ -103,17 +103,16 @@ def _forward_ingress_buffers(spec: Any, workspace: Any, hidden: torch.Tensor, ro
 def _forward_graph_buffers(workspace: Any, metadata: Any, source: torch.Tensor,
                              weights: tuple[Any, Any], activations: tuple[torch.Tensor, torch.Tensor],
                              quantized: tuple[tuple[torch.Tensor, ...], ...], runtime: Any) -> list[torch.Tensor]:
-    """Bind the forward business ABI without changing activation or weight ownership."""
+    """Bind element-unit transport metadata and current activation/weight storage."""
     weight1, weight2 = weights
-    hidden_size = source.shape[1]
     up, down = activations
     (x_row, x_scale, x_col, x_col_scale), (a_row, a_scale, a_col, a_col_scale) = quantized
     return [
         workspace.expert_buffer,
-        metadata.dispatch_target_off * hidden_size,
+        metadata.dispatch_target_off,
         source,
-        metadata.dispatch_src_off * hidden_size,
-        metadata.dispatch_size * hidden_size,
+        metadata.dispatch_src_off,
+        metadata.dispatch_size,
         weight1.col_data,
         metadata.group_list,
         up,
@@ -122,9 +121,9 @@ def _forward_graph_buffers(workspace: Any, metadata: Any, source: torch.Tensor,
         metadata.group_list,
         down,
         workspace.routed_buffer,
-        metadata.combine_target_off * hidden_size,
-        metadata.combine_src_off * hidden_size,
-        metadata.combine_size * hidden_size,
+        metadata.combine_target_off,
+        metadata.combine_src_off,
+        metadata.combine_size,
         x_row,
         x_scale,
         x_col,
@@ -285,6 +284,9 @@ class MXFP8Execution:
                                            home_only=home_only, swiglu_row_only=row_only, source_row_fp8=source_row_fp8)
         resources.last_execution_plan = plan
         metadata = route.metadata
+        # The route producer already owns element-unit descriptors. Retain these
+        # exact invocation views for backward instead of launching six Muls per phase.
+        transport_metadata = metadata.for_kernel(spec.hidden_size)
         capacity, device = metadata.expert_capacity, hidden.device
         dispatch_source, x_buffers, a_buffers, source_bindings, routed_rows = _forward_ingress_buffers(
             spec, workspace, flat, route, source_row_fp8=source_row_fp8, row_only=row_only)
@@ -295,7 +297,7 @@ class MXFP8Execution:
         workspace.claim()
         try:
             buffers = _forward_graph_buffers(
-                workspace, metadata, dispatch_source, (weight1, weight2), (up, down),
+                workspace, transport_metadata, dispatch_source, (weight1, weight2), (up, down),
                 (x_buffers, a_buffers), plan.forward)
             events = workspace.prepare_event_counters(forward=True)
             with self._lease_weights((weight1, weight2), plan.forward, backward=False) as (guests, ready):
@@ -319,12 +321,12 @@ class MXFP8Execution:
                     probabilities,
                     route.unpermute_mapping,
                     metadata.group_list,
-                    metadata.dispatch_target_off,
-                    metadata.dispatch_src_off,
-                    metadata.dispatch_size,
-                    metadata.combine_target_off,
-                    metadata.combine_src_off,
-                    metadata.combine_size,
+                    transport_metadata.dispatch_target_off,
+                    transport_metadata.dispatch_src_off,
+                    transport_metadata.dispatch_size,
+                    transport_metadata.combine_target_off,
+                    transport_metadata.combine_src_off,
+                    transport_metadata.combine_size,
                 )
                 if retain_backward
                 else ()
@@ -350,7 +352,7 @@ class MXFP8Execution:
 
         Args:
             gradient: Gradient of the owned token-major output.
-            saved: Owned forward activations and exact route metadata.
+            saved: Owned forward activations and element-unit transport metadata.
             metadata: Invocation plan, shape, probability dtype and source-row count.
             weight1: Current first-projection physical weight axes.
             weight2: Current second-projection physical weight axes.
@@ -398,10 +400,10 @@ class MXFP8Execution:
             )
             buffers = [
                 workspace.expert_buffer,
-                dispatch_target * spec.hidden_size,
+                dispatch_target,
                 source,
-                dispatch_source * spec.hidden_size,
-                dispatch_size * spec.hidden_size,
+                dispatch_source,
+                dispatch_size,
                 a_col,
                 dw2,
                 weight2.row_data,
@@ -411,9 +413,9 @@ class MXFP8Execution:
                 weight1.row_data,
                 dx,
                 workspace.routed_buffer,
-                combine_target * spec.hidden_size,
-                combine_source * spec.hidden_size,
-                combine_size * spec.hidden_size,
+                combine_target,
+                combine_source,
+                combine_size,
                 x_col,
                 dw1,
                 group_list,

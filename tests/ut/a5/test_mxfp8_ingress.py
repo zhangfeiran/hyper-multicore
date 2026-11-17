@@ -235,8 +235,8 @@ class TestMXFP8Ingress(unittest.TestCase):
         """
         buffers, _ = self._bindings()
         workspace = SimpleNamespace(expert_buffer=buffers[0], routed_buffer=torch.empty(8, 1024))
-        offsets = torch.tensor([0, 4], dtype=torch.int64)
-        sizes = torch.tensor([4, 4], dtype=torch.int32)
+        offsets = torch.tensor([0, 4096], dtype=torch.int64)
+        sizes = torch.tensor([4096, 4096], dtype=torch.int32)
         groups = torch.tensor([4, 8], dtype=torch.int64)
         metadata = SimpleNamespace(dispatch_target_off=offsets, dispatch_src_off=offsets, dispatch_size=sizes,
                                     combine_target_off=offsets, combine_src_off=offsets, combine_size=sizes,
@@ -255,6 +255,6 @@ class TestMXFP8Ingress(unittest.TestCase):
             with self.subTest(position=position):
                 self.assertIs(result[position], value)
         for position in (1, 3, 13, 14):
-            self.assertTrue(torch.equal(result[position], offsets * 1024))
+            self.assertIs(result[position], offsets)
         for position in (4, 15):
-            self.assertTrue(torch.equal(result[position], sizes * 1024))
+            self.assertIs(result[position], sizes)
