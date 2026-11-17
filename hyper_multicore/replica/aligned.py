@@ -125,14 +125,14 @@ def _place_aligned(matrix, config, limit, minimum_rows, threshold, minimum_saved
                     after[owner] -= moved
                     after[target] += moved
                     candidate = (max(after), sum(n * n for n in after))
-                    # At the same receive peak, a few rows of secondary balance
-                    # must not buy a cross-node full weight/dW transfer.
-                    key = (candidate[0], int(nodes[owner] != nodes[target]), candidate[1], expert, target, cut)
+                    # Owner locality breaks exact objective ties only: the
+                    # fragment's source rows can reside on the opposite node.
+                    key = (candidate, int(nodes[owner] != nodes[target]), expert, target, cut)
                     if candidate < score and (best is None or key < best[0]):
                         best = (key, after)
         if best is None:
             break
-        (_, _, _, expert, target, cut), loads = best
+        (_, _, expert, target, cut), loads = best
         selected[expert] = (target, cut)
         guests[target] += 1
     peak = max(loads)

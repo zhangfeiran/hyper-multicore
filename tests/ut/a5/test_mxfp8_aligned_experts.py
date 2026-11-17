@@ -136,9 +136,10 @@ def test_feasible_mandatory_fragment_is_not_vetoed_by_infeasible_whole_expert():
     assert_actual_permutation(plan)
 
 
-def test_equal_peak_prefers_local_guest_over_three_rows_of_secondary_balance():
+def test_secondary_balance_is_preserved_before_owner_locality():
     # EP16 single-hot routing: the last rank owns three fewer cold rows. Both
-    # placements have the same 59345-row peak, so keep the guest on owner0's node.
+    # placements have the same 59345-row peak. The guest suffix originates on
+    # node1, so forcing owner0's node can increase token traffic substantially.
     counts=[]
     for rank in range(16):
         other=(torch.arange(4096*7)+rank*4096*7)%95+1
@@ -149,7 +150,9 @@ def test_equal_peak_prefers_local_guest_over_three_rows_of_secondary_balance():
         minimum_replica_rows=8192,minimum_load_reduction=.25,rank_nodes=(0,)*8+(1,)*8)
     assert len(plan.transfers)==1
     assert plan.transfers[0].owner_rank==0
-    assert plan.transfers[0].target_rank in range(1,8)
+    assert plan.transfers[0].target_rank==15
+    guest_slot=15*config.slots_per_rank+6 if (config:=plan.config) else 0
+    assert sum(plan.dispatch_counts[source][guest_slot] for source in range(8))==0
     assert max(plan.destination_loads)==59345
     assert sum(plan.destination_loads)==16*4096*8
 
