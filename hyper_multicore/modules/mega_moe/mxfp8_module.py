@@ -281,9 +281,9 @@ def _mx_window_options(vector_policy: str) -> tuple[int, bool]:
     return int(depth), row_only == "1"
 
 
-def _mx_b0_options(replica_slots: int, *, peer_qp0: bool = False) -> tuple[str, bool]:
+def _mx_b0_options(replica_slots: int, *, peer_qp0: bool = False, ep_size: int = 8) -> tuple[str, bool]:
     """Freeze the qualified peer-owned polling policy and independent dW mode."""
-    default_poll = "pr7" if peer_qp0 and not replica_slots else "0"
+    default_poll = "pr7" if peer_qp0 and not replica_slots and ep_size == 8 else "0"
     poll = os.environ.get("PANGU_MX_POLL_POLICY", default_poll)
     skip_zero = os.environ.get("PANGU_MX_B0_SKIP_GRAD_ZERO", "0")
     if poll not in ("0", "fast", "pr7"):
@@ -371,7 +371,7 @@ class MXFP8MegaMoeExperts(A5MegaMoeExperts):
         source_row_fp8 = source_row_fp8_enabled(vector_policy=vector_policy, row_only=row_only,
                                                replica_slots=replica_slots_per_rank, hidden_size=hidden_size)
         peer_qp0 = _mx_peer_qp0_option(replica_slots_per_rank, vector_policy, source_row_fp8)
-        poll, skip_gradient_zero = _mx_b0_options(replica_slots_per_rank, peer_qp0=peer_qp0)
+        poll, skip_gradient_zero = _mx_b0_options(replica_slots_per_rank, peer_qp0=peer_qp0, ep_size=ep_size)
         config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         self.replica_planner = "cpu"
         self.replica_min_rows = replica_min_rows

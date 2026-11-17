@@ -111,6 +111,13 @@ def test_explicit_peer_polling_override_retains_rollback(
     assert _mx_b0_options(0, peer_qp0=True) == (poll, False)
 
 
+@pytest.mark.parametrize("ep_size", [1, 16])
+def test_peer_default_preserves_unqualified_topologies(monkeypatch: pytest.MonkeyPatch, ep_size: int) -> None:
+    monkeypatch.delenv("PANGU_MX_POLL_POLICY", raising=False)
+    monkeypatch.setenv("PANGU_MX_B0_SKIP_GRAD_ZERO", "0")
+    assert _mx_b0_options(0, peer_qp0=True, ep_size=ep_size) == ("0", False)
+
+
 @pytest.mark.parametrize("name,value", [("PANGU_MX_POLL_POLICY", "5us"),
                                         ("PANGU_MX_B0_SKIP_GRAD_ZERO", "true")])
 def test_invalid_options_fail_before_resource_creation(name: str, value: str) -> None:
