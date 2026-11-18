@@ -92,6 +92,32 @@ def test_b0_options_are_independent_and_frozen_at_construction(poll: str, clear:
         assert _mx_b0_options(0) == (poll, clear == "1")
 
 
+@pytest.mark.parametrize("replicas,peer,expected", [(0, True, "pr7"), (0, False, "0"),
+                                                  (2, False, "0"), (2, True, "0")])
+def test_default_polling_is_scoped_to_peer_owned_b0(
+    monkeypatch: pytest.MonkeyPatch, replicas: int, peer: bool, expected: str,
+) -> None:
+    monkeypatch.delenv("PANGU_MX_POLL_POLICY", raising=False)
+    monkeypatch.setenv("PANGU_MX_B0_SKIP_GRAD_ZERO", "0")
+    assert _mx_b0_options(replicas, peer_qp0=peer) == (expected, False)
+
+
+@pytest.mark.parametrize("poll", ["0", "fast", "pr7"])
+def test_explicit_peer_polling_override_retains_rollback(
+    monkeypatch: pytest.MonkeyPatch, poll: str,
+) -> None:
+    monkeypatch.setenv("PANGU_MX_POLL_POLICY", poll)
+    monkeypatch.setenv("PANGU_MX_B0_SKIP_GRAD_ZERO", "0")
+    assert _mx_b0_options(0, peer_qp0=True) == (poll, False)
+
+
+@pytest.mark.parametrize("ep_size", [1, 16])
+def test_peer_default_preserves_unqualified_topologies(monkeypatch: pytest.MonkeyPatch, ep_size: int) -> None:
+    monkeypatch.delenv("PANGU_MX_POLL_POLICY", raising=False)
+    monkeypatch.setenv("PANGU_MX_B0_SKIP_GRAD_ZERO", "0")
+    assert _mx_b0_options(0, peer_qp0=True, ep_size=ep_size) == ("0", False)
+
+
 @pytest.mark.parametrize("name,value", [("PANGU_MX_POLL_POLICY", "5us"),
                                         ("PANGU_MX_B0_SKIP_GRAD_ZERO", "true")])
 def test_invalid_options_fail_before_resource_creation(name: str, value: str) -> None:

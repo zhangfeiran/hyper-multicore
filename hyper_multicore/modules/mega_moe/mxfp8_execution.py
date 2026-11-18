@@ -103,7 +103,7 @@ def _forward_ingress_buffers(spec: Any, workspace: Any, hidden: torch.Tensor, ro
 def _forward_graph_buffers(workspace: Any, metadata: Any, source: torch.Tensor,
                              weights: tuple[Any, Any], activations: tuple[torch.Tensor, torch.Tensor],
                              quantized: tuple[tuple[torch.Tensor, ...], ...], runtime: Any) -> list[torch.Tensor]:
-    """Bind precomputed element offsets without changing activation or weight ownership."""
+    """Bind element-unit transport metadata and current activation/weight storage."""
     weight1, weight2 = weights
     up, down = activations
     (x_row, x_scale, x_col, x_col_scale), (a_row, a_scale, a_col, a_col_scale) = quantized
@@ -284,7 +284,9 @@ class MXFP8Execution:
                                            home_only=home_only, swiglu_row_only=row_only, source_row_fp8=source_row_fp8)
         resources.last_execution_plan = plan
         metadata = route.metadata
-        element_metadata = metadata.for_kernel(spec.hidden_size)
+        # The route producer already owns element-unit descriptors. Retain these
+        # exact invocation views for backward instead of launching six Muls per phase.
+        transport_metadata = metadata.for_kernel(spec.hidden_size)
         capacity, device = metadata.expert_capacity, hidden.device
         dispatch_source, x_buffers, a_buffers, source_bindings, routed_rows = _forward_ingress_buffers(
             spec, workspace, flat, route, source_row_fp8=source_row_fp8, row_only=row_only)
@@ -295,7 +297,7 @@ class MXFP8Execution:
         workspace.claim()
         try:
             buffers = _forward_graph_buffers(
-                workspace, element_metadata, dispatch_source, (weight1, weight2), (up, down),
+                workspace, transport_metadata, dispatch_source, (weight1, weight2), (up, down),
                 (x_buffers, a_buffers), plan.forward)
             events = workspace.prepare_event_counters(forward=True)
             with self._lease_weights((weight1, weight2), plan.forward, backward=False) as (guests, ready):
@@ -319,12 +321,12 @@ class MXFP8Execution:
                     probabilities,
                     route.unpermute_mapping,
                     metadata.group_list,
-                    element_metadata.dispatch_target_off,
-                    element_metadata.dispatch_src_off,
-                    element_metadata.dispatch_size,
-                    element_metadata.combine_target_off,
-                    element_metadata.combine_src_off,
-                    element_metadata.combine_size,
+                    transport_metadata.dispatch_target_off,
+                    transport_metadata.dispatch_src_off,
+                    transport_metadata.dispatch_size,
+                    transport_metadata.combine_target_off,
+                    transport_metadata.combine_src_off,
+                    transport_metadata.combine_size,
                 )
                 if retain_backward
                 else ()
@@ -350,7 +352,7 @@ class MXFP8Execution:
 
         Args:
             gradient: Gradient of the owned token-major output.
-            saved: Owned forward activations and exact route metadata.
+            saved: Owned forward activations and element-unit transport metadata.
             metadata: Invocation plan, shape, probability dtype and source-row count.
             weight1: Current first-projection physical weight axes.
             weight2: Current second-projection physical weight axes.
