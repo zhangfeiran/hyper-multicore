@@ -55,6 +55,11 @@ act_grad 与 w2_grad 有共同的 dY 来源，但不存在彼此的数学依赖�
 gate_grad 与 w1_grad 都消费 dU；w1_grad 并不以 gate_grad 的计算结果作为输入。
 combine 需要 dX。实际允许的并行度还取决于任务填充、任务依赖事件（下文简称依赖事件）和核放置，不能仅由数学图推断执行时间线。
 
+![MegaMoE BF16 反向的通信与梯度计算接力示意](../figures/megamoe/backward-pipeline.svg)
+
+*图：以两个专家组说明反向的 DispatchGrad、dW2、dA、SwiGLUGrad、dX、dW1 和 CombineGrad 如何交错执行。图中的 Cube 工作在单核上仍遵守队列顺序，不能把 dW2/dA/dX/dW1 理解为四个 GMM 在同一 Cube 上同时计算。该图来自较早的 BF16 执行方案讲解，队列仅用于理解数据依赖和掩盖机会，不作为所有架构、lowering 或 MXFP8 后端当前排队顺序的权威描述；实际依赖以本分支的后端图和 scheduler 为准。*
+
+
 反向图的任务填充使用不同计数推进方式，将激活梯度、权重梯度与返回传输纳入相应依赖事件和终止条件。
 具体输入布局及依赖计数增量由 [BF16 backward graph](../../hyper_multicore/modules/mega_moe/backends/bf16/backward/graph.py)
 与任务 filler 共同确定，不将某种计数推进模式当成所有反向图的规则。

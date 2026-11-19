@@ -37,6 +37,23 @@ dispatch → up_proj → SwiGLU → down_proj → combine
 路由概率在 FC2 前还是之后参与计算，调度策略不改变这些数学选择。
 每个 token 最终得到一个 H 维输出，汇合所选 K 个专家的贡献。
 
+### 五阶段融合与执行边界
+
+![MegaMoE 前向的五阶段任务及计算通信分工](figures/megamoe/five-stage-flow.svg)
+
+*图：前向 Dispatch、gate/up GMM、SwiGLU、down GMM 与 Combine 的融合核心。通信和激活由 Vector 侧任务承担，GMM 由 Cube 侧任务承担；Router、路由统计、permute 及最终 token 归约仍可能由外围操作完成，不能将完整 MoE 层理解为只有一次 kernel 启动。图源为此前 MegaMoE 技术讲解示意图，表示逻辑关系而非逐任务性能测量。*
+
+### 前向：专家组之间的通算与 Cube/Vector 流水
+
+某组专家的输入及依赖就绪后，其 GMM1 可以启动，而另一组专家的分发仍在推进。前一组等待 SwiGLU 时，Cube 可以处理下一组的矩阵计算；已完成的结果还可与其他专家的计算交错返回。
+
+![按阶段推进与 MegaMoE 前向专家组交错流水示意](figures/megamoe/forward-pipeline.svg)
+
+*图：A/B 代表两组专家；D、S、C 分别表示 Dispatch、SwiGLU、Combine。上半部是为了对比而绘制的阶段式执行模式，不代表所有 native MoE 都按这种顺序执行。下半部通过不同组的通信、计算和激活交错解释可能产生的通算/CV 重叠。图中阶段时长、重叠程度及端点均为机制示意，不是实测数据；当前 BF16、MXFP8 的实际 task 排列和可用并发度仍受调度选项、数学依赖、核资源与 token 分布约束。*
+
+这里的收益来自**减少等待，而不是减少数学工作量**。每个 GMM 必须等待自己消费的输入及相应事件完成；通信分片越细也不一定越快，因为 Vector 通信与激活共享资源，任务及完成通知还会产生开销。实际策略请参阅[队列与通信进展](design/mega_moe_design.md#队列与通信进展)。
+
+
 ## 基本用法
 
 Torch 模型通过 `MegaMoeExperts` 执行 Router 选出的专家。`precision="bf16"` 为默认后端，
