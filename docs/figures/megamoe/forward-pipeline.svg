@@ -1,0 +1,285 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="t6">
+<title id="t6">MegaMoE 前向：通算与 Cube / Vector 同步流水</title>
+<desc>Native指本页阶段式对照，不概括所有MoE实现。A/B表示两组专家，Dispatch将输入送到专家，GMM1使用gate/up，SwiGLU做门控激活，GMM2使用down，Combine返回结果。两种方法使用相同各阶段总工作量与假设时长，Native按整批阶段推进。Hyper的Cube队列按GMM1 A、GMM1 B、GMM2 A、GMM2 B排列，Vector的Dispatch、SwiGLU、Combine按各组完成信号推进。图同时表现通信和Cube计算重叠、SwiGLU和其他专家GMM重叠。通信仍使用Vector及搬运资源，外围准备、路由和最终token归约仍存在。</desc>
+<g id="s06-000" data-role="background">
+<rect x="0" y="0" width="1600" height="900" rx="0" fill="#FFFFFF" stroke="none" stroke-width="1.4"/>
+</g>
+<g id="s06-001" data-role="title">
+<text x="32.0" y="52.5" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="50" font-weight="700" fill="#990000" text-anchor="start" data-editable="true" data-width="1536.0">
+<tspan x="32.0" dy="0">MegaMoE 前向：通算与 Cube / Vector 同步流水</tspan>
+</text>
+</g>
+<g id="s06-002" data-role="subtitle">
+<text x="32.0" y="161.54999999999998" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="27" font-weight="400" fill="#657486" text-anchor="start" data-editable="true" data-width="1536.0">
+<tspan x="32.0" dy="0">Dispatch / Combine 与 GMM、SwiGLU 在同一次执行中按专家组接力</tspan>
+</text>
+</g>
+<g id="s06-003" data-role="">
+<polyline points="32.0,832.0000000000001 1568.0,832.0000000000001" fill="none" stroke="#DCE4EC" stroke-width="1"/>
+</g>
+<g id="s06-004" data-role="footer">
+<text x="32.0" y="867.95" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="19" font-weight="400" fill="#657486" text-anchor="start" data-editable="true" data-width="1387.8260869565217">
+<tspan x="32.0" dy="0">机制示意，非实测；相同阶段工作量与耗时假设，A / B 表示两组专家</tspan>
+</text>
+</g>
+<g id="s06-005" data-role="footer">
+<text x="1568.0" y="867.95" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="19" font-weight="400" fill="#657486" text-anchor="end" data-editable="true" data-width="110.6086956521739">
+<tspan x="1568.0" dy="0">06 / 17</tspan>
+</text>
+</g>
+<g id="s06-006" data-role="">
+<text x="32.0" y="241.42241379310346" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="25" font-weight="400" fill="#1A1A1A" text-anchor="start" data-editable="true" data-width="1536.0">
+<tspan x="32.0" dy="0">GMM1：gate/up　　GMM2：down　　S：SwiGLU　　D / C：Dispatch / Combine</tspan>
+</text>
+</g>
+<g id="s06-007" data-role="">
+<text x="32.0" y="301.0032019704434" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="31" font-weight="700" fill="#84909C" text-anchor="start" data-editable="true" data-width="1536.0">
+<tspan x="32.0" dy="0">Native MoE（阶段式）</tspan>
+</text>
+</g>
+<g id="s06-008" data-role="">
+<text x="32.0" y="362.37955665024634" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="27" font-weight="700" fill="#1A1A1A" text-anchor="start" data-editable="true" data-width="194.08695652173913">
+<tspan x="32.0" dy="0">Cube</tspan>
+</text>
+</g>
+<g id="s06-009" data-role="">
+<polyline points="246.95652173913044,382.1871921182266 1568.0,382.1871921182266" fill="none" stroke="#DCE4EC" stroke-width="1"/>
+</g>
+<g id="s06-010" data-role="">
+<text x="32.0" y="440.25147783251236" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="27" font-weight="700" fill="#1A1A1A" text-anchor="start" data-editable="true" data-width="194.08695652173913">
+<tspan x="32.0" dy="0">Vector</tspan>
+</text>
+</g>
+<g id="s06-011" data-role="">
+<polyline points="246.95652173913044,460.05911330049264 1568.0,460.05911330049264" fill="none" stroke="#DCE4EC" stroke-width="1"/>
+</g>
+<g id="s06-012" data-role="pipeline">
+<rect x="246.95652173913044" y="403.70443349753697" width="186.15652173913043" height="55.33004926108375" rx="0" fill="#EAF5F5" stroke="#28818A" stroke-width="1"/>
+</g>
+<g id="s06-013" data-role="">
+<text x="340.03478260869565" y="439.57034482758627" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="26" font-weight="700" fill="#28818A" text-anchor="middle" data-editable="true" data-width="173.63478260869564">
+<tspan x="340.03478260869565" dy="0">Dispatch</tspan>
+</text>
+</g>
+<g id="s06-014" data-role="pipeline">
+<rect x="433.1130434782608" y="325.83251231527095" width="372.31304347826085" height="55.33004926108375" rx="0" fill="#EDF4FB" stroke="#245E94" stroke-width="1"/>
+</g>
+<g id="s06-015" data-role="">
+<text x="619.2695652173913" y="361.69842364532025" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="26" font-weight="700" fill="#245E94" text-anchor="middle" data-editable="true" data-width="359.7913043478261">
+<tspan x="619.2695652173913" dy="0">GMM1 gate/up</tspan>
+</text>
+</g>
+<g id="s06-016" data-role="pipeline">
+<rect x="805.4260869565218" y="403.70443349753697" width="186.15652173913043" height="55.33004926108375" rx="0" fill="#FDF3E6" stroke="#D38431" stroke-width="1"/>
+</g>
+<g id="s06-017" data-role="">
+<text x="898.5043478260869" y="439.57034482758627" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="26" font-weight="700" fill="#D38431" text-anchor="middle" data-editable="true" data-width="173.63478260869564">
+<tspan x="898.5043478260869" dy="0">SwiGLU</tspan>
+</text>
+</g>
+<g id="s06-018" data-role="pipeline">
+<rect x="991.5826086956522" y="325.83251231527095" width="372.31304347826085" height="55.33004926108375" rx="0" fill="#EDF4FB" stroke="#245E94" stroke-width="1"/>
+</g>
+<g id="s06-019" data-role="">
+<text x="1177.7391304347825" y="361.69842364532025" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="26" font-weight="700" fill="#245E94" text-anchor="middle" data-editable="true" data-width="359.7913043478261">
+<tspan x="1177.7391304347825" dy="0">GMM2 down</tspan>
+</text>
+</g>
+<g id="s06-020" data-role="pipeline">
+<rect x="1363.895652173913" y="403.70443349753697" width="186.15652173913043" height="55.33004926108375" rx="0" fill="#EAF5F5" stroke="#28818A" stroke-width="1"/>
+</g>
+<g id="s06-021" data-role="">
+<text x="1456.9739130434784" y="439.57034482758627" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="26" font-weight="700" fill="#28818A" text-anchor="middle" data-editable="true" data-width="173.63478260869564">
+<tspan x="1456.9739130434784" dy="0">Combine</tspan>
+</text>
+</g>
+<g id="s06-022" data-role="">
+<text x="32.0" y="546.9145320197044" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="31" font-weight="700" fill="#245E94" text-anchor="start" data-editable="true" data-width="1536.0">
+<tspan x="32.0" dy="0">Hyper MegaMoE</tspan>
+</text>
+</g>
+<g id="s06-023" data-role="">
+<text x="32.0" y="608.2908866995075" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="27" font-weight="700" fill="#1A1A1A" text-anchor="start" data-editable="true" data-width="194.08695652173913">
+<tspan x="32.0" dy="0">Cube</tspan>
+</text>
+</g>
+<g id="s06-024" data-role="">
+<polyline points="246.95652173913044,628.0985221674878 1568.0,628.0985221674878" fill="none" stroke="#DCE4EC" stroke-width="1"/>
+</g>
+<g id="s06-025" data-role="">
+<text x="32.0" y="686.1628078817735" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="27" font-weight="700" fill="#1A1A1A" text-anchor="start" data-editable="true" data-width="194.08695652173913">
+<tspan x="32.0" dy="0">Vector</tspan>
+</text>
+</g>
+<g id="s06-026" data-role="">
+<polyline points="246.95652173913044,705.9704433497537 1568.0,705.9704433497537" fill="none" stroke="#DCE4EC" stroke-width="1"/>
+</g>
+<g id="s06-027" data-role="pipeline">
+<rect x="340.03478260869565" y="571.743842364532" width="186.15652173913043" height="55.33004926108375" rx="0" fill="#EDF4FB" stroke="#245E94" stroke-width="1"/>
+</g>
+<g id="s06-028" data-role="">
+<text x="433.11304347826086" y="607.6097536945813" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="26" font-weight="700" fill="#245E94" text-anchor="middle" data-editable="true" data-width="173.63478260869564">
+<tspan x="433.11304347826086" dy="0">GMM1 A</tspan>
+</text>
+</g>
+<g id="s06-029" data-role="pipeline">
+<rect x="526.1913043478261" y="571.743842364532" width="186.15652173913043" height="55.33004926108375" rx="0" fill="#EDF4FB" stroke="#245E94" stroke-width="1"/>
+</g>
+<g id="s06-030" data-role="">
+<text x="619.2695652173912" y="607.6097536945813" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="26" font-weight="700" fill="#245E94" text-anchor="middle" data-editable="true" data-width="173.63478260869564">
+<tspan x="619.2695652173912" dy="0">GMM1 B</tspan>
+</text>
+</g>
+<g id="s06-031" data-role="pipeline">
+<rect x="712.3478260869565" y="571.743842364532" width="186.15652173913043" height="55.33004926108375" rx="0" fill="#EDF4FB" stroke="#245E94" stroke-width="1"/>
+</g>
+<g id="s06-032" data-role="">
+<text x="805.4260869565217" y="607.6097536945813" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="26" font-weight="700" fill="#245E94" text-anchor="middle" data-editable="true" data-width="173.63478260869564">
+<tspan x="805.4260869565217" dy="0">GMM2 A</tspan>
+</text>
+</g>
+<g id="s06-033" data-role="pipeline">
+<rect x="898.5043478260869" y="571.743842364532" width="186.15652173913043" height="55.33004926108375" rx="0" fill="#EDF4FB" stroke="#245E94" stroke-width="1"/>
+</g>
+<g id="s06-034" data-role="">
+<text x="991.5826086956521" y="607.6097536945813" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="26" font-weight="700" fill="#245E94" text-anchor="middle" data-editable="true" data-width="173.63478260869564">
+<tspan x="991.5826086956521" dy="0">GMM2 B</tspan>
+</text>
+</g>
+<g id="s06-035" data-role="pipeline">
+<rect x="246.95652173913044" y="649.6157635467981" width="93.07826086956521" height="55.33004926108375" rx="0" fill="#EAF5F5" stroke="#28818A" stroke-width="1"/>
+</g>
+<g id="s06-036" data-role="">
+<text x="293.495652173913" y="684.2989655172414" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="23" font-weight="700" fill="#28818A" text-anchor="middle" data-editable="true" data-width="80.55652173913043">
+<tspan x="293.495652173913" dy="0">D A</tspan>
+</text>
+</g>
+<g id="s06-037" data-role="pipeline">
+<rect x="340.03478260869565" y="649.6157635467981" width="93.07826086956521" height="55.33004926108375" rx="0" fill="#EAF5F5" stroke="#28818A" stroke-width="1"/>
+</g>
+<g id="s06-038" data-role="">
+<text x="386.5739130434782" y="684.2989655172414" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="23" font-weight="700" fill="#28818A" text-anchor="middle" data-editable="true" data-width="80.55652173913043">
+<tspan x="386.5739130434782" dy="0">D B</tspan>
+</text>
+</g>
+<g id="s06-039" data-role="pipeline">
+<rect x="526.1913043478261" y="649.6157635467981" width="93.07826086956521" height="55.33004926108375" rx="0" fill="#FDF3E6" stroke="#D38431" stroke-width="1"/>
+</g>
+<g id="s06-040" data-role="">
+<text x="572.7304347826087" y="684.2989655172414" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="23" font-weight="700" fill="#D38431" text-anchor="middle" data-editable="true" data-width="80.55652173913043">
+<tspan x="572.7304347826087" dy="0">S A</tspan>
+</text>
+</g>
+<g id="s06-041" data-role="pipeline">
+<rect x="712.3478260869565" y="649.6157635467981" width="93.07826086956521" height="55.33004926108375" rx="0" fill="#FDF3E6" stroke="#D38431" stroke-width="1"/>
+</g>
+<g id="s06-042" data-role="">
+<text x="758.8869565217391" y="684.2989655172414" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="23" font-weight="700" fill="#D38431" text-anchor="middle" data-editable="true" data-width="80.55652173913043">
+<tspan x="758.8869565217391" dy="0">S B</tspan>
+</text>
+</g>
+<g id="s06-043" data-role="pipeline">
+<rect x="898.5043478260869" y="649.6157635467981" width="93.07826086956521" height="55.33004926108375" rx="0" fill="#EAF5F5" stroke="#28818A" stroke-width="1"/>
+</g>
+<g id="s06-044" data-role="">
+<text x="945.0434782608695" y="684.2989655172414" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="23" font-weight="700" fill="#28818A" text-anchor="middle" data-editable="true" data-width="80.55652173913043">
+<tspan x="945.0434782608695" dy="0">C A</tspan>
+</text>
+</g>
+<g id="s06-045" data-role="pipeline">
+<rect x="1084.6608695652174" y="649.6157635467981" width="93.07826086956521" height="55.33004926108375" rx="0" fill="#EAF5F5" stroke="#28818A" stroke-width="1"/>
+</g>
+<g id="s06-046" data-role="">
+<text x="1131.1999999999998" y="684.2989655172414" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="23" font-weight="700" fill="#28818A" text-anchor="middle" data-editable="true" data-width="80.55652173913043">
+<tspan x="1131.1999999999998" dy="0">C B</tspan>
+</text>
+</g>
+<g id="s06-047" data-role="">
+<polyline points="340.03478260869565,645.5172413793103 340.03478260869565,632.1970443349754" fill="none" stroke="#28818A" stroke-width="1.5"/>
+<polygon points="340.03,632.20 334.03,644.20 346.03,644.20" fill="#28818A"/>
+</g>
+<g id="s06-048" data-role="">
+<polyline points="526.1913043478261,627.0738916256158 526.1913043478261,644.4926108374385" fill="none" stroke="#D38431" stroke-width="1.5"/>
+<polygon points="526.19,644.49 532.19,632.49 520.19,632.49" fill="#D38431"/>
+</g>
+<g id="s06-049" data-role="">
+<polyline points="898.5043478260869,627.0738916256158 898.5043478260869,644.4926108374385" fill="none" stroke="#28818A" stroke-width="1.5"/>
+<polygon points="898.50,644.49 904.50,632.49 892.50,632.49" fill="#28818A"/>
+</g>
+<g id="s06-050" data-role="">
+<polyline points="1177.7391304347825,553.3004926108375 1177.7391304347825,718.2660098522168" fill="none" stroke="#245E94" stroke-width="2" stroke-dasharray="8 6"/>
+</g>
+<g id="s06-051" data-role="">
+<text x="1220.5217391304348" y="606.2923645320197" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="29" font-weight="700" fill="#245E94" text-anchor="start" data-editable="true" data-width="347.4782608695652">
+<tspan x="1220.5217391304348" dy="0">通算重叠</tspan>
+<tspan x="1220.5217391304348" dy="37.12">Cube / Vector 接力</tspan>
+</text>
+</g>
+<g id="s06-052" data-role="">
+<text x="246.95652173913044" y="768.082512315271" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="25" font-weight="400" fill="#1A1A1A" text-anchor="start" data-editable="true" data-width="1321.0434782608695">
+<tspan x="246.95652173913044" dy="0">输入就绪即 Dispatch 后开算，结果完成即 Combine；A / B 为两组专家</tspan>
+</text>
+</g>
+<g id="s06-053" data-role="">
+<text x="32.0" y="817.3408866995075" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="28" font-weight="700" fill="#245E94" text-anchor="start" data-editable="true" data-width="1536.0">
+<tspan x="32.0" dy="0">一次执行同时组织通算与 C/V 流水，减少整批阶段切换造成的等待</tspan>
+</text>
+</g>
+<g id="s06-054" data-role="progress">
+<rect x="32" y="74.79802955665025" width="231.30769230769232" height="6" rx="0" fill="#EEE5E5" stroke="none" stroke-width="0"/>
+</g>
+<g id="s06-055" data-role="progress">
+<rect x="32" y="74.79802955665025" width="231.30769230769232" height="6" rx="0" fill="#990000" stroke="none" stroke-width="0"/>
+</g>
+<g id="s06-056" data-role="progress">
+<text x="32" y="111.14802955665024" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="19" font-weight="400" fill="#657486" text-anchor="start" data-editable="true" data-width="226.30769230769232">
+<tspan x="32" dy="0">背景</tspan>
+</text>
+</g>
+<g id="s06-057" data-role="progress">
+<rect x="268.3076923076923" y="74.79802955665025" width="349.46153846153845" height="6" rx="0" fill="#EEE5E5" stroke="none" stroke-width="0"/>
+</g>
+<g id="s06-058" data-role="progress">
+<rect x="268.3076923076923" y="74.79802955665025" width="349.46153846153845" height="6" rx="0" fill="#990000" stroke="none" stroke-width="0"/>
+</g>
+<g id="s06-059" data-role="progress">
+<text x="268.3076923076923" y="111.14802955665024" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="19" font-weight="400" fill="#657486" text-anchor="start" data-editable="true" data-width="344.46153846153845">
+<tspan x="268.3076923076923" dy="0">原理与方案</tspan>
+</text>
+</g>
+<g id="s06-060" data-role="progress">
+<rect x="622.7692307692307" y="74.79802955665025" width="349.46153846153845" height="6" rx="0" fill="#EEE5E5" stroke="none" stroke-width="0"/>
+</g>
+<g id="s06-061" data-role="progress">
+<rect x="622.7692307692307" y="74.79802955665025" width="116.48717948717947" height="6" rx="0" fill="#990000" stroke="none" stroke-width="0"/>
+</g>
+<g id="s06-062" data-role="progress">
+<text x="622.7692307692307" y="111.14802955665024" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="19" font-weight="700" fill="#990000" text-anchor="start" data-editable="true" data-width="344.46153846153845">
+<tspan x="622.7692307692307" dy="0">MegaMoE</tspan>
+</text>
+</g>
+<g id="s06-063" data-role="progress">
+<rect x="977.2307692307692" y="74.79802955665025" width="113.15384615384616" height="6" rx="0" fill="#EEE5E5" stroke="none" stroke-width="0"/>
+</g>
+<g id="s06-064" data-role="progress">
+<text x="977.2307692307692" y="111.14802955665024" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="19" font-weight="400" fill="#657486" text-anchor="start" data-editable="true" data-width="108.15384615384616">
+<tspan x="977.2307692307692" dy="0">扩展示例</tspan>
+</text>
+</g>
+<g id="s06-065" data-role="progress">
+<rect x="1095.3846153846152" y="74.79802955665025" width="231.30769230769232" height="6" rx="0" fill="#EEE5E5" stroke="none" stroke-width="0"/>
+</g>
+<g id="s06-066" data-role="progress">
+<text x="1095.3846153846152" y="111.14802955665024" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="19" font-weight="400" fill="#657486" text-anchor="start" data-editable="true" data-width="226.30769230769232">
+<tspan x="1095.3846153846152" dy="0">收益与规划</tspan>
+</text>
+</g>
+<g id="s06-067" data-role="progress">
+<rect x="1331.6923076923076" y="74.79802955665025" width="231.30769230769232" height="6" rx="0" fill="#EEE5E5" stroke="none" stroke-width="0"/>
+</g>
+<g id="s06-068" data-role="progress">
+<text x="1331.6923076923076" y="111.14802955665024" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="19" font-weight="400" fill="#657486" text-anchor="start" data-editable="true" data-width="226.30769230769232">
+<tspan x="1331.6923076923076" dy="0">优势与总结</tspan>
+</text>
+</g>
+</svg>
