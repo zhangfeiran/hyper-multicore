@@ -194,6 +194,11 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 `defer_forward_copies=True` 在 A3 BF16 EOI Push 上将两份反向保存延后至重算，同时保持输出的概率加权位置。
 `guest_snapshot_bytes` 设置每 rank 每次调用的 guest 权重快照字节预算，EP 全员通过同次参数代际和完整路由检查后才复用。
 
+`defer_expert_recompute=True` 是 A3 BF16 EOI MTE Push 的试验选项，需同时开启 `defer_forward_copies`。
+每个 checkpoint 调用保留一份 token 顺序的专家输出，重放用它恢复下游保存态。
+原始反向节点收到上游梯度后，用重放得到的输入和权重先重算专家，再运行反向。
+EP 组使用相同的配置。重放需要确定性输入、精确路由、概率和同代参数，组内确认失败时整组报错。
+
 ### 从旧 HotReplica 配置迁移
 
 旧的独立 `HotReplica` 和 `plan_native()` 调用迁到 `MegaMoeExperts(expert_placement=placement)`。

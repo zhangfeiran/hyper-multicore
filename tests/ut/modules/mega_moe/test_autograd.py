@@ -21,7 +21,7 @@ from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
 
 import torch
-from torch.utils.checkpoint import DefaultDeviceType, checkpoint
+from torch.utils.checkpoint import DefaultDeviceType, checkpoint, set_checkpoint_early_stop
 
 from hyper_multicore.diagnostics import MegaKernelDiagnostics
 from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as function_module
@@ -162,6 +162,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         context.weight_binding = None
         context.has_unpermute = False
         context.defer_forward_copies = False
+        context.deferred_recompute = None
         context.needs_input_grad = (False,) * 9
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
@@ -226,6 +227,82 @@ class TestMegaMoeFunction(unittest.TestCase):
         for permuted in (False, True):
             with self.subTest(permuted=permuted):
                 self._check_deferred_backward(permuted=permuted, replay=True)
+
+    def test_checkpoint_can_defer_expert_recompute_until_its_original_backward(self) -> None:
+        """Downstream replay gets token output while only the original node launches R and B."""
+        self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
+        DefaultDeviceType.set_device_type("cpu")
+        spec = SimpleNamespace(
+            apply_probs_before_fc2=False, dispatch_mode="push", expert_weight_layout="EOI",
+            hidden_size=2, intermediate_size=1, top_k=1, auto_tokens=True, architecture=2201,
+        )
+        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False, weight_grad_dtype=None, event_counter_bytes=8)
+        metadata = function_module.RouteMetadata(
+            *(torch.zeros(1, dtype=torch.int64) for _ in range(6)),
+            group_list=torch.tensor([2]), expert_capacity=2, all_experts_active=True,
+        )
+        tokens = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        w1 = torch.tensor([2.0], requires_grad=True)
+        w2 = torch.tensor([3.0], requires_grad=True)
+        probs = torch.tensor([[0.25], [0.5]], requires_grad=True)
+        ids = torch.zeros((2, 1), dtype=torch.int32)
+        route = function_module.PreparedTopKRoute(
+            tokens.detach(), torch.arange(2, dtype=torch.int32), None, None, metadata,
+            indexed_dispatch_offsets=torch.zeros(2, dtype=torch.int64),
+        )
+        workspace = Mock(
+            expert_buffer=torch.empty_like(tokens), routed_buffer=torch.empty_like(tokens),
+            gmm_workspace=torch.empty(1), swiglu_grad_workspace=torch.empty(1),
+        )
+        record = SimpleNamespace(route=route, allow_guest_restore=False)
+        launches = []
+        phase = False
+
+        def execute(x, first, second, p):
+            nonlocal phase
+            output = function_module.execute_mega_moe_with_permutation(
+                x, ids, first, second, route, plan, workspace, topk_weights=p,
+                checkpoint_replay=phase, deferred_recompute=record,
+            )
+            phase = True
+            return output.square().sum()
+
+        def forward_kernel(_plan, _metadata, x, first, second, execution, **_options):
+            launches.append("F or R")
+            execution.dispatch.copy_(x)
+            execution.combine.copy_(x + first + second)
+
+        def backward_kernel(_plan, saved, source, execution, **_options):
+            launches.append("B")
+            self.assertTrue(torch.equal(saved.dispatch, tokens))
+            execution.grad_x.copy_(source)
+            execution.intermediates.grad_weight1.fill_(source.sum())
+            execution.intermediates.grad_weight2.fill_(source.sum())
+
+        def unpermute_grad(y, g, _mapping, p, dx, dp):
+            dx.copy_(g * p)
+            dp.copy_((y * g).sum(-1, keepdim=True))
+
+        vendor = SimpleNamespace(npu_moe_token_unpermute=lambda value, _mapping, probs: value * probs)
+        with (
+            patch.object(function_module, "_launch_forward_kernel", side_effect=forward_kernel),
+            patch.object(function_module, "_launch_backward_kernel", side_effect=backward_kernel),
+            patch.object(function_module, "load_torch_npu", return_value=vendor),
+            patch.object(function_module.multicore_ops, "mega_moe_unpermute_grad_out", side_effect=unpermute_grad),
+            patch.object(function_module.multicore_ops, "moe_token_permute_grad",
+                         side_effect=lambda gradient, *_args: gradient.clone()),
+            set_checkpoint_early_stop(False),
+        ):
+            inputs = tokens, w1, w2, probs
+            loss = checkpoint(execute, *inputs, use_reentrant=False)
+            expected = ((tokens + w1 + w2) * probs).square().sum()
+            reference = torch.autograd.grad(expected, inputs)
+            for retain in (True, False):
+                actual = torch.autograd.grad(loss, inputs, retain_graph=retain)
+                for result, wanted in zip(actual, reference):
+                    torch.testing.assert_close(result, wanted, atol=0, rtol=0)
+                self.assertEqual(record.deferred_output is not None, retain)
+        self.assertEqual(launches, ["F or R", "F or R", "B", "F or R", "B"])
 
     def _check_deferred_forward(
         self, source: Any, weight1: Any, weight2: Any, route: Any, plan: Any, workspace: Any,

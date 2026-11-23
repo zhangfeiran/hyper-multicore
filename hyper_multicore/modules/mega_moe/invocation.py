@@ -66,6 +66,9 @@ def prepare_expert_invocation(
                     record, hidden, ids, probs, counts, resources.spec, mask, weight_error=weight_error):
                 placement.statistics["route_replays"] += 1
                 route = record.route
+                if record.defer_expert_recompute:
+                    yield replace(route, checkpoint_record=record)
+                    return
                 resources.workspace.wait_for_reuse()
                 if route.indexed_dispatch_offsets is not None:
                     route = replace(route, routed_tokens=hidden, count_fence=record.replay_count_fence)
@@ -126,7 +129,7 @@ def _record_checkpoint_route(route, record, counts, ids):
     mapping = route.unpermute_mapping if route.indexed_dispatch_offsets is not None else None
     record.route = replace(route, routed_tokens=None, unpermute_mapping=mapping, count_fence=None)
     if counts is not None:
-        return replace(route, checkpoint_record=record) if record.guest_snapshot_bytes else route
+        return replace(route, checkpoint_record=record) if record.guest_snapshot_bytes or record.defer_expert_recompute else route
     record.ids = ids.detach().clone()
     record.weight_binding = route.weight_binding
     return replace(route, checkpoint_record=record)

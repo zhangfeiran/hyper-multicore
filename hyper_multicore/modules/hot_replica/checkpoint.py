@@ -49,6 +49,10 @@ class ReplayRecord:
     guest_weight_snapshot: Any = None
     allow_guest_restore: bool = False
     replay_count_fence: a3_indexed.CountFence | None = None
+    defer_expert_recompute: bool = False
+    deferred_output: torch.Tensor | None = None
+    deferred_probabilities: torch.Tensor | None = None
+    deferred_versions: tuple[int, int] | None = None
 
     @contextmanager
     def save_supplied_route(self, ids: torch.Tensor, counts: torch.Tensor) -> Iterator[None]:
@@ -69,9 +73,12 @@ class _CheckpointScope:
     cursor: int = 0
     defer_forward_copies: bool = False
     guest_snapshot_bytes: int = 0
+    defer_expert_recompute: bool = False
 
 
 _ACTIVE: ContextVar[_CheckpointScope | None] = ContextVar("hmc_hot_replica_checkpoint", default=None)
+_DEFERRED_REPLAY_VALID = 1 << 8
+_DEFERRED_REPLAY_REQUESTED = 1 << 9
 
 
 class ReplayCheckpoint:
@@ -80,6 +87,7 @@ class ReplayCheckpoint:
     def __init__(
         self, parameter_version: Callable[[], Any], *, prepare_replay: bool = False,
         defer_forward_copies: bool = False, guest_snapshot_bytes: int = 0,
+        defer_expert_recompute: bool = False,
     ) -> None:
         """Register the caller's version lookup and optional checkpoint policies.
 
@@ -87,14 +95,20 @@ class ReplayCheckpoint:
         hooks replace original placeholders with materialized replay values.
         A positive guest_snapshot_bytes bounds each invocation's private guest
         weight copy per rank and requires a grad-enabled non-reentrant checkpoint.
+        Deferred expert recompute keeps the owned token output of a BF16 A3
+        MTE Push call until backward. It requires deterministic replay and
+        the same policy on all ranks in the expert group.
         Use a separate tape per invocation and enter both corresponding scopes.
         """
         if type(guest_snapshot_bytes) is not int or guest_snapshot_bytes < 0:
             raise ValueError("guest_snapshot_bytes must be a nonnegative integer")
+        if defer_expert_recompute and not defer_forward_copies:
+            raise ValueError("Deferred expert recompute requires non-reentrant checkpoint copy deferral")
         self.parameter_version = parameter_version
         self.prepare_replay = prepare_replay
         self.defer_forward_copies = defer_forward_copies
         self.guest_snapshot_bytes = guest_snapshot_bytes
+        self.defer_expert_recompute = defer_expert_recompute
         self.records: list[ReplayRecord] = []
         self.forward_version = None
 
@@ -113,6 +127,7 @@ class ReplayCheckpoint:
             self.records, replay, version is not None and version == self.forward_version,
             defer_forward_copies=self.defer_forward_copies,
             guest_snapshot_bytes=self.guest_snapshot_bytes,
+            defer_expert_recompute=self.defer_expert_recompute,
         )
         token = _ACTIVE.set(state)
         try:
@@ -173,7 +188,10 @@ def route_record(owner: Any) -> tuple[ReplayRecord | None, bool]:
     if scope is None:
         return None, False
     if not scope.replay:
-        record = ReplayRecord(owner, guest_snapshot_bytes=scope.guest_snapshot_bytes if scope.same_parameters else 0)
+        record = ReplayRecord(
+            owner, guest_snapshot_bytes=scope.guest_snapshot_bytes if scope.same_parameters else 0,
+            defer_expert_recompute=scope.defer_expert_recompute,
+        )
         scope.records.append(record)
         return record, False
     index = scope.cursor
@@ -202,6 +220,7 @@ def agree_replay(
 ) -> bool:
     """Agree across EP on exact routing and independent activation validity."""
     scope = _ACTIVE.get()
+    deferred = scope is not None and scope.defer_expert_recompute
     if record is not None:
         record.replay_count_fence = None
     valid = (
@@ -232,8 +251,17 @@ def agree_replay(
             flag = torch.zeros(1, dtype=torch.int32, device=hidden.device)
         if valid and record.guest_weight_snapshot is not None:
             flag += 64
+        if deferred:
+            flag += _DEFERRED_REPLAY_REQUESTED
+            if valid:
+                output, saved_probs = record.deferred_output, record.deferred_probabilities
+                if (output is not None and saved_probs is not None and output.shape == hidden.shape
+                        and output.dtype == hidden.dtype and saved_probs.shape == probs.shape
+                        and saved_probs.dtype == probs.dtype
+                        and record.deferred_versions == (output._version, saved_probs._version)):
+                    flag += (saved_probs == probs).all().to(torch.int32).reshape(1) * _DEFERRED_REPLAY_VALID
         replay_fence = None
-        if (valid and counts is None
+        if (valid and not deferred and counts is None
                 and record.route.indexed_dispatch_offsets is not None):
             workspace = record.owner.workspace
             replay_fence = a3_indexed.CountFence.before_gather(workspace, record.stream)
@@ -244,6 +272,9 @@ def agree_replay(
         flags = gathered.tolist()
     first = flags[0] % 32
     reuse = first != 0 and all(value % 32 == first for value in flags)
+    if any(value & _DEFERRED_REPLAY_REQUESTED for value in flags):
+        if not reuse or not all(value & _DEFERRED_REPLAY_VALID for value in flags):
+            raise RuntimeError("Deferred expert recompute requires matching route, probabilities, output and weights")
     if record is not None:
         record.allow_activation = reuse and all(value & 32 for value in flags)
         record.allow_guest_restore = reuse and all(value & 64 for value in flags)
