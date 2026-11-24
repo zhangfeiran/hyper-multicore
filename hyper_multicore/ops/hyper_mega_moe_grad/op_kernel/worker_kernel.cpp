@@ -549,6 +549,23 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 
 }  // namespace MulticoreRuntime
 
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+// Compile the forward and backward workers as separate device functions.
+// Both execute on the same launch and use the same scratch and completion state.
+__aicore__ static __attribute__((noinline)) void RunA3RecomputeForwardFrame(
+    uint32_t worker_id, const __gm__ MulticoreMoE::A3RecomputeCall *call, GM_ADDR cann_workspace) {
+  if (call->magic != MulticoreMoE::kA3RecomputeCall) AscendC::Trap();
+  GM_ADDR inputs[MulticoreMoE::kA3ForwardInputs];
+  for (uint32_t i = 0; i < MulticoreMoE::kA3ForwardInputs; ++i) {
+    inputs[i] = reinterpret_cast<GM_ADDR>(call->forward_inputs[i]);
+  }
+  inputs[22] = cann_workspace;
+  MulticoreRuntime::ForwardKernelWorker forward;
+  forward.Init(worker_id, inputs[20], inputs);
+  forward.RunForward(call);
+}
+#endif
+
 extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr,
                                                 GM_ADDR *input_list) {
   bool dispatched = false;
@@ -557,15 +574,7 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
       MulticoreMoE::kA3RecomputeSequence) {
     const auto call = reinterpret_cast<const __gm__ MulticoreMoE::A3RecomputeCall *>(
         input_list[MulticoreRuntime::KernelWorker::DIAGNOSTIC_IDX]);
-    if (call->magic != MulticoreMoE::kA3RecomputeCall) AscendC::Trap();
-    GM_ADDR forward_inputs[MulticoreMoE::kA3ForwardInputs];
-    for (uint32_t i = 0; i < MulticoreMoE::kA3ForwardInputs; ++i) {
-      forward_inputs[i] = reinterpret_cast<GM_ADDR>(call->forward_inputs[i]);
-    }
-    forward_inputs[22] = input_list[29];  // CANN library workspace after the entry tiling.
-    MulticoreRuntime::ForwardKernelWorker forward;
-    forward.Init(worker_id, forward_inputs[20], forward_inputs);
-    forward.RunForward(call);
+    RunA3RecomputeForwardFrame(worker_id, call, input_list[29]);
     dispatched = true;
   }
 #endif
