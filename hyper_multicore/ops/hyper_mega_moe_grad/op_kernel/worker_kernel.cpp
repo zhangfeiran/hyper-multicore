@@ -147,13 +147,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         if (act_grad_done_ && task_desc.outputs[0].input_position == 8) break;
         const uint32_t output = task_desc.outputs[0].input_position;
         const bool dw = output == 6 || output == 18;
-        auto *trace = output == 8 || dw ? trace_ : nullptr;
+        auto *trace = output == 8 || output == 12 || dw ? trace_ : nullptr;
         const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace);
 #endif
         ExecuteGroupedMatmul(task_desc);
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
         MulticoreMoE::RecordRecomputeStage(
-            trace, dw ? MulticoreMoE::RecomputeStage::DW_CUBE_PROJECTION : MulticoreMoE::RecomputeStage::ACT_GRAD,
+            trace, dw ? MulticoreMoE::RecomputeStage::DW_CUBE_PROJECTION
+                      : (output == 12 ? MulticoreMoE::RecomputeStage::GATE_GRAD : MulticoreMoE::RecomputeStage::ACT_GRAD),
             start, task_desc.task_index / core_num, dw && output == 18 ? 1 : 0);
 #endif
         break;
@@ -174,15 +175,25 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         ExecuteMoeShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc, input_list, input_list[TILING_IDX]);
 #endif
         break;
-      case TaskType::TASK_SWI_GLU_GRAD:
+      case TaskType::TASK_SWI_GLU_GRAD: {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
         if (early_dz_experts_ != 0) {
           const uint32_t expert = SwiGluGradExpert(task_desc, early_dz_groups_);
           if (early_dz_experts_ & (1U << expert)) break;
         }
+        const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace_);
 #endif
         ExecuteSwiGluGrad(task_desc);
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
+        if (trace_ != nullptr) {
+          const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
+          const uint32_t experts = getExtraValueFromTiling(input_list[TILING_IDX], 2) / ep;
+          MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::SWIGLU_GRAD, start,
+                                             SwiGluGradExpert(task_desc, experts));
+        }
+#endif
         break;
+      }
       default:
         break;
     }

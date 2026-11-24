@@ -97,16 +97,18 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
         break;
       case TaskType::TASK_GROUPED_MATMUL: {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-        auto *trace = task_desc.outputs[0].input_position == 11 ? trace_ : nullptr;
+        const bool w2 = task_desc.outputs[0].input_position == 11;
+        auto *trace = w2 || task_desc.outputs[0].input_position == 7 ? trace_ : nullptr;
         const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace);
 #endif
         ExecuteGroupedMatmul(task_desc);
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-        MulticoreMoE::RecordRecomputeStage(trace, MulticoreMoE::RecomputeStage::W2, start,
-                                           task_desc.task_index / core_num);
+        MulticoreMoE::RecordRecomputeStage(
+            trace, w2 ? MulticoreMoE::RecomputeStage::W2 : MulticoreMoE::RecomputeStage::W13,
+            start, task_desc.task_index / core_num);
 #if defined(__DAV_C220_CUBE__) || defined(__DAV_CUBE__)
         if (recompute_ != nullptr && recompute_->aux_ready != 0 &&
-            task_desc.outputs[0].input_position == 11 && task_desc.task_index % core_num == 0) {
+            w2 && task_desc.task_index % core_num == 0) {
           // Withhold this Cube's W2 completion signal until G and p are visible.
           // The AIV queue can keep issuing dispatch tasks while this Cube waits.
           const uint32_t expert = task_desc.task_index / core_num;

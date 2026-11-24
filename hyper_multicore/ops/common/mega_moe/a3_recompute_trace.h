@@ -1,6 +1,7 @@
 // Copyright 2026 Huawei Technologies Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0
-#pragma once
+#ifndef HMC_A3_RECOMPUTE_TRACE_H_
+#define HMC_A3_RECOMPUTE_TRACE_H_
 
 #include "../../runtime/cycle_trace_recorder.h"
 
@@ -29,6 +30,9 @@ enum class RecomputeStage : uint32_t {
   DW_ACK_SLOT,
   EARLY_X_PUT,
   WAIT_GP,
+  W13,
+  SWIGLU_GRAD,
+  GATE_GRAD,
 };
 
 __aicore__ inline uint64_t RecomputeTraceStart(MulticoreRuntime::CycleTraceRecorder *trace) {
@@ -43,3 +47,5 @@ __aicore__ inline void RecordRecomputeStage(MulticoreRuntime::CycleTraceRecorder
   }
 }
 }  // namespace MulticoreMoE
+
+#endif
