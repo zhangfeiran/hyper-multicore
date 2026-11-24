@@ -373,9 +373,9 @@ class TestMegaMoeFunction(unittest.TestCase):
         tiling, = tiling_references
         self.assertIsNotNone(tiling())
         words = call.descriptor.view(torch.int64)
-        self.assertEqual(words.numel(), 37)
+        self.assertEqual(words.numel(), 38)
         self.assertEqual(words[24].item(), tiling().data_ptr())
-        self.assertEqual(words[-3:].tolist(), [trace.data_ptr(), 0, 3])
+        self.assertEqual(words[-4:].tolist(), [trace.data_ptr(), 0, 3, 0])
         self.assertTrue(any(t is trace for t in call.operands))
         self.assertEqual(tiling()[6].item(), runtime.numel())
         del call

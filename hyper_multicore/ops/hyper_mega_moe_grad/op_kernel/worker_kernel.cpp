@@ -90,7 +90,17 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
       const uint64_t barrier_start = MulticoreMoE::RecomputeTraceStart(trace_);
       this->all_event_counters.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(recompute->local_barrier), 8);
       this->TriggerEvent(0);
+#if !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
+      if (recompute->relaxed_aiv_barrier != 0) {
+        // The A3 system counter ticks at 50 MHz. Give the Cube's in-flight dA
+        // room to finish before the parked AIVs refresh the same cache line.
+        MulticoreMoE::WaitReplicaEpoch<true, 5000>(recompute->local_barrier, core_num * 3);
+      } else {
+        MulticoreMoE::WaitReplicaEpoch<true>(recompute->local_barrier, core_num * 3);
+      }
+#else
       MulticoreMoE::WaitReplicaEpoch<true>(recompute->local_barrier, core_num * 3);
+#endif
       this->all_event_counters.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(input_list[EVENT_IDX]),
                                               runtime_event_capacity);
       MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::FORWARD_BARRIER, barrier_start);

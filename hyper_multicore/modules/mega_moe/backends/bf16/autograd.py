@@ -536,7 +536,9 @@ def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime, *, trace=No
     operands = tuple(value for value in references if value is not None)
     for value in operands:
         value.record_stream(workspace.lease_stream)
-    descriptor = torch.tensor((a3_recompute.CALL_MAGIC, *arguments, a3_recompute.gradient_rows_per_batch()),
+    relaxed_barrier = pg_ready is not None and os.environ.get("HMC_A3_RECOMPUTE_RELAX_AIV_BARRIER") == "1"
+    descriptor = torch.tensor((a3_recompute.CALL_MAGIC, *arguments, a3_recompute.gradient_rows_per_batch(),
+                               int(relaxed_barrier)),
                               dtype=torch.int64, device=grad_output.device).view(torch.uint8)
     # Stream recording protects queued consumers. It cannot hold the synthetic
     # tiling allocation through the backward-side allocations before submission.
