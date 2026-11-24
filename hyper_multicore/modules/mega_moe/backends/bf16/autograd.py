@@ -110,6 +110,14 @@ class _RecomputeExecution:
     barrier: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _RecomputeCall:
+    """Keep every address-backed tensor alive through submission of R+B."""
+
+    descriptor: torch.Tensor
+    operands: tuple[torch.Tensor, ...]
+
+
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
     """Return an initialized workspace tensor or raise an invariant error."""
     if tensor is None:
@@ -501,8 +509,8 @@ def _prepare_fused_recompute(ctx, saved_tensors):
     return saved, (mapping,), recompute
 
 
-def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime):
-    """Encode the nested forward frame, retaining every pointer on the launch stream."""
+def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime) -> _RecomputeCall:
+    """Encode the R frame and retain its tensors before and after launch submission."""
     plan, workspace = ctx.plan, ctx.workspace
     spec = plan.spec
     forward = recompute.forward
@@ -518,12 +526,16 @@ def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime):
     )
     sidecars = (recompute.barrier, grad_output, recompute.received_g, recompute.source_p, recompute.received_p,
                 recompute.local_dp, recompute.returned_dp)
-    arguments = tuple(0 if value is None else value.data_ptr() for value in (*inputs, *sidecars))
-    for value in (*inputs, *sidecars):
-        if value is not None:
-            value.record_stream(workspace.lease_stream)
-    return torch.tensor((a3_recompute.CALL_MAGIC, *arguments),
-                        dtype=torch.int64, device=grad_output.device).view(torch.uint8)
+    references = (*inputs, *sidecars)
+    arguments = tuple(0 if value is None else value.data_ptr() for value in references)
+    operands = tuple(value for value in references if value is not None)
+    for value in operands:
+        value.record_stream(workspace.lease_stream)
+    descriptor = torch.tensor((a3_recompute.CALL_MAGIC, *arguments),
+                              dtype=torch.int64, device=grad_output.device).view(torch.uint8)
+    # Stream recording protects queued consumers. It cannot hold the synthetic
+    # tiling allocation through the backward-side allocations before submission.
+    return _RecomputeCall(descriptor, operands)
 
 
 _CAPTURED_WEIGHT_GRADS: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -655,7 +667,7 @@ def _launch_backward_kernel(
     grad_output: Any,
     execution: _BackwardExecution,
     *, stream: Any = None, runtime_override: torch.Tensor | None = None,
-    recompute_call: torch.Tensor | None = None,
+    recompute_call: _RecomputeCall | None = None,
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -698,7 +710,7 @@ def _launch_backward_kernel(
             execution.swiglu_workspace,
             runtime,
             execution.event_counters,
-            *((recompute_call,) if recompute_call is not None else ()),
+            *((recompute_call.descriptor,) if recompute_call is not None else ()),
             spec.rank_id,
             spec.ep_size,
             spec.num_experts,
