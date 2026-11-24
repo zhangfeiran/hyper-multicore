@@ -27,6 +27,7 @@
 #include "a3_indexed_transfer.h"
 #include "a3_recompute_call.h"
 #include "a3_recompute_gradient_tiles.h"
+#include "a3_recompute_trace.h"
 #include "transport.h"
 #include "transport_task.h"
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
@@ -62,18 +63,24 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
   static constexpr int64_t GMM_MATMUL_M_FIELDS_BYTES =
     offsetof(TCubeTiling, singleCoreM) + sizeof(int32_t) - offsetof(TCubeTiling, M);
 
-  __aicore__ inline void RunForward(const __gm__ MulticoreMoE::A3RecomputeCall *recompute = nullptr) {
+  __aicore__ inline void RunForward(const __gm__ MulticoreMoE::A3RecomputeCall *recompute = nullptr,
+                                   CycleTraceRecorder *trace = nullptr) {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
     recompute_ = recompute;
+    trace_ = trace;
     replica_launch_ = MulticoreMoE::GetReplicaLaunch(this->runtimeConfigPtr, input_list[TILING_IDX]);
+    const uint64_t forward_start = MulticoreMoE::RecomputeTraceStart(trace_);
     this->Process(getExtraValueFromTiling(input_list[TILING_IDX], MulticoreMoE::A3_INDEXED_TILING_ROUTE_FENCED) != 0);
+    MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::FORWARD, forward_start);
     if (recompute_ != nullptr) {
       // Every launched Cube and AIV reaches the same rank-local barrier, including
       // lanes with an empty forward queue. No backward task can overwrite R inputs here.
       auto fence = reinterpret_cast<__gm__ int32_t *>(recompute_->local_barrier);
       this->all_event_counters.SetGlobalBuffer(fence, 8);
+      const uint64_t barrier_start = MulticoreMoE::RecomputeTraceStart(trace_);
       this->TriggerEvent(0);
       MulticoreMoE::WaitReplicaEpoch<true>(recompute_->local_barrier, core_num * 3);
+      MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::FORWARD_BARRIER, barrier_start);
     }
 #else
     this->Process();
@@ -88,9 +95,18 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
       case TaskType::TASK_MATMUL:
         ExecuteMatmul(task_desc);
         break;
-      case TaskType::TASK_GROUPED_MATMUL:
+      case TaskType::TASK_GROUPED_MATMUL: {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+        auto *trace = task_desc.outputs[0].input_position == 11 ? trace_ : nullptr;
+        const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace);
+#endif
         ExecuteGroupedMatmul(task_desc);
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+        MulticoreMoE::RecordRecomputeStage(trace, MulticoreMoE::RecomputeStage::W2, start,
+                                           task_desc.task_index / core_num);
+#endif
         break;
+      }
       case TaskType::TASK_SWI_GLU:
         ExecuteSwiglu(task_desc);
         break;
@@ -119,6 +135,7 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
   const __gm__ MulticoreMoE::ReplicaLaunch *replica_launch_ = nullptr;
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
   const __gm__ MulticoreMoE::A3RecomputeCall *recompute_ = nullptr;
+  CycleTraceRecorder *trace_ = nullptr;
 #endif
 
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
@@ -394,6 +411,7 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
       }
       const auto index = reinterpret_cast<__gm__ const int32_t *>(
           input_list[task_desc.inputs[2].input_position] + expert_num * sizeof(int64_t));
+      const uint64_t dispatch_start = MulticoreMoE::RecomputeTraceStart(trace_);
       if (recompute_ != nullptr) {
         const int64_t start_row = src_offset_ / hidden_size;
         const int64_t target_row = target_offset_ / hidden_size;
@@ -414,6 +432,8 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
           input_list[task_desc.outputs[0].input_position], target_offset_, input_list[2],
           index, src_offset_ / hidden_size, send_data_size_ / hidden_size,
           input_rows, target_pe, reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event);
+      MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::DISPATCH_X_G_P, dispatch_start,
+                                         src_offset_ / hidden_size, send_data_size_ / hidden_size, target_pe);
       return;
     }
 #if !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
@@ -424,15 +444,30 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
       // unweighted-G consumer before the same rows become the backward dV.
       auto g = reinterpret_cast<GM_ADDR>(recompute_->received_g);
       auto dp = reinterpret_cast<GM_ADDR>(recompute_->local_dp);
-      MulticoreMoE::RecomputedProbabilityGradientRows(g, input_list[11], dp, first, first + rows, 1);
+      const auto p = reinterpret_cast<GM_ADDR>(recompute_->received_p);
       constexpr int32_t stride = MulticoreMoE::kProbabilityPacketElements;
-      MulticoreMoE::ScaleRecomputedGradientRows(
-          g, reinterpret_cast<GM_ADDR>(recompute_->received_p), g, first, first + rows, 1, stride);
+      const uint64_t arithmetic_start = MulticoreMoE::RecomputeTraceStart(trace_);
+      if (recompute_->gradient_rows_per_batch == 0) {
+        MulticoreMoE::RecomputedProbabilityGradientRows(g, input_list[11], dp, first, first + rows, 1);
+        MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::DP, arithmetic_start,
+                                           first, rows, target_pe);
+        const uint64_t scale_start = MulticoreMoE::RecomputeTraceStart(trace_);
+        MulticoreMoE::ScaleRecomputedGradientRows(g, p, g, first, first + rows, 1, stride);
+        MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::PG, scale_start,
+                                           first, rows, target_pe);
+      } else {
+        MulticoreMoE::RecomputedGradientRows(g, p, input_list[11], dp, first, rows, recompute_->gradient_rows_per_batch);
+        MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::DP_AND_PG, arithmetic_start,
+                                           first, rows, target_pe);
+      }
+      const uint64_t return_start = MulticoreMoE::RecomputeTraceStart(trace_);
       hyper_multicore::PutMemSignalKernel<float> return_probability;
       return_probability.Init(reinterpret_cast<GM_ADDR>(recompute_->returned_dp),
                               target_offset_ / hidden_size * stride, dp, first * stride, rows * stride,
                               signal, task_desc.trigger_event, 1, 1, target_pe, false, nullptr);
       return_probability.Process();
+      MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::RETURN_DP, return_start,
+                                         first, rows, target_pe);
       return;
     }
 #endif

@@ -509,7 +509,7 @@ def _prepare_fused_recompute(ctx, saved_tensors):
     return saved, (mapping,), recompute
 
 
-def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime) -> _RecomputeCall:
+def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime, *, trace=None) -> _RecomputeCall:
     """Encode the R frame and retain its tensors before and after launch submission."""
     plan, workspace = ctx.plan, ctx.workspace
     spec = plan.spec
@@ -525,13 +525,13 @@ def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime) -> _Recompu
         fwd_runtime, None, None, fwd_tiling, forward.event_counters, None,
     )
     sidecars = (recompute.barrier, grad_output, recompute.received_g, recompute.source_p, recompute.received_p,
-                recompute.local_dp, recompute.returned_dp)
+                recompute.local_dp, recompute.returned_dp, trace)
     references = (*inputs, *sidecars)
     arguments = tuple(0 if value is None else value.data_ptr() for value in references)
     operands = tuple(value for value in references if value is not None)
     for value in operands:
         value.record_stream(workspace.lease_stream)
-    descriptor = torch.tensor((a3_recompute.CALL_MAGIC, *arguments),
+    descriptor = torch.tensor((a3_recompute.CALL_MAGIC, *arguments, a3_recompute.gradient_rows_per_batch()),
                               dtype=torch.int64, device=grad_output.device).view(torch.uint8)
     # Stream recording protects queued consumers. It cannot hold the synthetic
     # tiling allocation through the backward-side allocations before submission.

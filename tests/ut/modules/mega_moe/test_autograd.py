@@ -14,6 +14,7 @@
 # ============================================================================
 """CPU storage-lifetime tests for the MegaMoe autograd bridge."""
 
+import os
 import unittest
 import weakref
 from functools import partial
@@ -349,6 +350,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         plan = SimpleNamespace(spec=spec, up_proj_tiling=None, swiglu_tiling=None, down_proj_tiling=None)
         ctx = SimpleNamespace(plan=plan, workspace=SimpleNamespace(lease_stream=None), token_rows=257)
         tensor = torch.ones((1, 4), dtype=torch.bfloat16)
+        trace = torch.empty_like(runtime)
         forward = SimpleNamespace(source=tensor, gmm_workspace=None, event_counters=runtime)
         saved = SimpleNamespace(weight1=tensor, weight2=tensor)
         recompute = SimpleNamespace(forward=forward, metadata=None, dispatch_offsets=None, barrier=None,
@@ -362,14 +364,19 @@ class TestMegaMoeFunction(unittest.TestCase):
                 tiling_references.append(weakref.ref(result))
             return result
 
-        with patch.object(function_module, "_forward_kernel_inputs", return_value=(None,) * 16), \
+        with patch.dict(os.environ, {"HMC_A3_RECOMPUTE_GRADIENT_ROWS": "3"}), \
+                patch.object(function_module, "_forward_kernel_inputs", return_value=(None,) * 16), \
                 patch.object(torch, "tensor", new=watch_tiling), \
                 patch.object(torch.Tensor, "record_stream", new=lambda *_: None):
-            call = function_module._recompute_call(ctx, recompute, saved, tensor, runtime)
+            call = function_module._recompute_call(ctx, recompute, saved, tensor, runtime, trace=trace)
 
         tiling, = tiling_references
         self.assertIsNotNone(tiling())
-        self.assertEqual(call.descriptor.view(torch.int64)[24].item(), tiling().data_ptr())
+        words = call.descriptor.view(torch.int64)
+        self.assertEqual(words.numel(), 36)
+        self.assertEqual(words[24].item(), tiling().data_ptr())
+        self.assertEqual(words[-2:].tolist(), [trace.data_ptr(), 3])
+        self.assertTrue(any(t is trace for t in call.operands))
         self.assertEqual(tiling()[6].item(), runtime.numel())
         del call
         self.assertIsNone(tiling())
