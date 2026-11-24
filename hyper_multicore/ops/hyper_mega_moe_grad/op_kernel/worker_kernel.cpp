@@ -45,6 +45,14 @@ using namespace AscendC;
 
 namespace MulticoreRuntime {
 
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
+// Keep descriptor reads in the caller's frame and pass only GM addresses.
+__aicore__ static __attribute__((noinline)) void ComputeEarlySwiGluGrad(
+    GM_ADDR gradient, GM_ADDR input, GM_ADDR output, GM_ADDR tiling, float clamp, bool clamp_after) {
+  swi_glu_grad(gradient, input, output, nullptr, tiling, clamp, clamp_after);
+}
+#endif
+
 class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::LEGACY_ODD,
                                               RuntimeStorageBoundsPolicy::NATIVE_TILING,
                                               MulticoreMoE::InvocationProtocol> {
@@ -264,7 +272,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         LoadTaskDescriptor(task_ids[expert][--task_counts[expert]], task);
         if (!IsMoeTaskOptionsValid(task, WORKSPACE_IDX)) AscendC::Trap();
         const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace_);
-        ExecuteSwiGluGrad(task);
+        ExecuteSwiGluGrad<true>(task);
         MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::EARLY_SWIGLU_GRAD, start, expert);
         const uint32_t lane = task.task_index % (task.task_split_num / early_dz_groups_);
         if (!(early_dz_experts_ & bit)) early_dz_lanes_[expert] = 0;
@@ -413,13 +421,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     }
   }
 
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-  __aicore__ __attribute__((noinline)) void ExecuteSwiGluGrad(const TaskDesc &task_desc) {
-#else
+  template <bool Early = false>
   __aicore__ inline void ExecuteSwiGluGrad(const TaskDesc &task_desc) {
-#endif
     if (GetSwiGluTaskIteration(task_desc) == SwiGluTaskIteration::TILED) {
-      ExecuteSwiGluGradLegacy(task_desc);
+      ExecuteSwiGluGradLegacy<Early>(task_desc);
       return;
     }
     DynamicData data;
@@ -440,12 +445,21 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     tile.task_split_num = legacy_tiles * data.dynamic_group_size;
     for (uint32_t index = lane; index < tiles; index += lanes) {
       tile.task_index = expert * legacy_tiles + index;
-      ExecuteSwiGluGradLegacy(tile);
+      ExecuteSwiGluGradLegacy<Early>(tile);
     }
   }
 
+  template <bool Early>
   __aicore__ inline void RunSwiGluGrad(const TaskDesc &task, int64_t row, int64_t rows,
                                          GM_ADDR gradient, GM_ADDR input, GM_ADDR output, GM_ADDR tiling) {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
+    if constexpr (Early) {
+      if (GetMegaMoeActivationWeighting(task) == MegaMoeActivationWeighting::BEFORE_FC2) AscendC::Trap();
+      ComputeEarlySwiGluGrad(gradient, input, output, tiling, GetSwiGluClampLimit(task),
+                            GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU);
+      return;
+    }
+#endif
     if (GetMegaMoeActivationWeighting(task) == MegaMoeActivationWeighting::BEFORE_FC2) {
       const auto &aux = task.outputs[task.num_outputs - 1];
       const int64_t width = task.inputs[0].dim[1];
@@ -477,6 +491,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
                  GetSwiGluClampLimit(task), GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU);
   }
 
+  template <bool Early>
   __aicore__ inline void ExecuteSwiGluGradLegacy(const TaskDesc &task_desc) {
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.outputs[0].dynamic_shape == 1) {
       DynamicData dynamic_data;
@@ -515,7 +530,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
                                     ? base_ptr_offset * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
                                     : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
         if (start + current_seq_end <= end) {
-          RunSwiGluGrad(task_desc, base_ptr_offset, task_desc.task_split_value,
+          RunSwiGluGrad<Early>(task_desc, base_ptr_offset, task_desc.task_split_value,
                         input_list[task_desc.inputs[0].input_position] + input_0_offset,
                         input_list[task_desc.inputs[1].input_position] + input_1_offset,
                         input_list[task_desc.outputs[0].input_position] + output_0_offset,
@@ -533,7 +548,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
           cacheWriteThrough(tiling_data_addr + SWIGLU_DYNAMIC_FIELDS_OFFSET, SWIGLU_DYNAMIC_FIELDS_BYTES);
           PipeBarrier<PIPE_ALL>();
 
-          RunSwiGluGrad(task_desc, base_ptr_offset, end - base_ptr_offset,
+          RunSwiGluGrad<Early>(task_desc, base_ptr_offset, end - base_ptr_offset,
                         input_list[task_desc.inputs[0].input_position] + input_0_offset,
                         input_list[task_desc.inputs[1].input_position] + input_1_offset,
                         input_list[task_desc.outputs[0].input_position] + output_0_offset, tiling_data_addr);
