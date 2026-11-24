@@ -320,7 +320,10 @@ class TestMegaMoeFunction(unittest.TestCase):
         workspace = Mock(
             expert_capacity=cap, expert_buffer=hidden.new_empty((cap, 4)),
             routed_buffer=hidden.new_empty((source_slots, 4)), gmm_workspace=torch.empty(16, dtype=torch.uint8),
-            recompute_workspace=torch.empty(cap * (4 * 2 + 32) + source_slots * 32, dtype=torch.uint8),
+            recompute_workspace=torch.empty(
+                function_module.a3_recompute.AUX_READY_BYTES + cap * (4 * 2 + 32) + source_slots * 32,
+                dtype=torch.uint8,
+            ),
         )
         route = SimpleNamespace(metadata=metadata, indexed_dispatch_offsets=None, unpermute_mapping=None)
         context = SimpleNamespace(
@@ -373,9 +376,9 @@ class TestMegaMoeFunction(unittest.TestCase):
         tiling, = tiling_references
         self.assertIsNotNone(tiling())
         words = call.descriptor.view(torch.int64)
-        self.assertEqual(words.numel(), 38)
+        self.assertEqual(words.numel(), 42)
         self.assertEqual(words[24].item(), tiling().data_ptr())
-        self.assertEqual(words[-4:].tolist(), [trace.data_ptr(), 0, 3, 0])
+        self.assertEqual(words[-8:].tolist(), [trace.data_ptr(), 0, 0, 0, 3, 0, 0, 0])
         self.assertTrue(any(t is trace for t in call.operands))
         self.assertEqual(tiling()[6].item(), runtime.numel())
         del call

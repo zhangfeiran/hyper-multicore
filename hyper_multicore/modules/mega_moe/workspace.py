@@ -34,7 +34,7 @@ from hyper_multicore.scheduler.config import (
 )
 from hyper_multicore.shmem import _lifecycle
 
-from .a3_recompute import PACKET_FLOATS
+from .a3_recompute import AUX_READY_BYTES, PACKET_FLOATS
 from .probability import PROBABILITY_PLANES, ProbabilityPlane
 from .spec import MegaMoeSpec, _resolve_receive_capacity
 
@@ -84,7 +84,7 @@ def _workspace_allocation_specs(
         packet_bytes = PACKET_FLOATS * torch.float32.itemsize
         bytes_needed = receive_capacity * (hidden_size * dtype.itemsize + packet_bytes) + routed_slots * packet_bytes
         allocations += (("recompute_workspace", allocation_spec(
-            (bytes_needed,), torch.uint8, _WORKSPACE_ALIGNMENT)),)
+            (AUX_READY_BYTES + bytes_needed,), torch.uint8, _WORKSPACE_ALIGNMENT)),)
     return allocations
 
 

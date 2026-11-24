@@ -84,14 +84,16 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     gradient_bands_[1] = MulticoreMoE::GetReplicaGradientBands(replica_launch_, 1);
     if (recompute != nullptr && recompute->pg_ready != 0) {
 #if defined(__DAV_C220_CUBE__) || defined(__DAV_CUBE__)
-      RunEarlyActGrad(recompute->pg_ready);
+      RunEarlyActGrad(recompute->pg_ready, recompute->da_ready);
       act_grad_done_ = true;
 #endif
       const uint64_t barrier_start = MulticoreMoE::RecomputeTraceStart(trace_);
       this->all_event_counters.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(recompute->local_barrier), 8);
       this->TriggerEvent(0);
 #if !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
-      if (recompute->relaxed_aiv_barrier != 0) {
+      if (recompute->da_ready != 0 && explicit_queues_) {
+        RunSwiGluGradAtBarrier(recompute->da_ready, recompute->local_barrier);
+      } else if (recompute->relaxed_aiv_barrier != 0) {
         // The A3 system counter ticks at 50 MHz. Give the Cube's in-flight dA
         // room to finish before the parked AIVs refresh the same cache line.
         MulticoreMoE::WaitReplicaEpoch<true, 5000>(recompute->local_barrier, core_num * 3);
@@ -117,26 +119,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     const bool merge = first != nullptr && first->owned != 0 && worker_id_ % VECTOR_WORKER_STRIDE == 0;
     if (merge) {
       const uint64_t merge_start = MulticoreMoE::RecomputeTraceStart(trace_);
-      const uint32_t worker = worker_id_ / VECTOR_WORKER_STRIDE;
-      const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
-      // Keep a single scalar frame for the two projections.
-#pragma unroll 1
-      for (uint32_t projection = 0; projection < 2; ++projection) {
-        if (replica_bf16_partials_) {
-          MulticoreMoE::ReturnBf16ReplicaGradientBands(
-              gradient_bands_[projection], input_list[19], worker, core_num, ep);
-        } else {
-          MulticoreMoE::ReturnReplicaGradientBands(
-              gradient_bands_[projection], input_list[19], worker, core_num, ep);
-        }
-      }
+      MergeGradients(recompute != nullptr && recompute->split_dw != 0);
       MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::MERGE_GRAD, merge_start);
     }
     if (first != nullptr && worker_id_ == 0) {
       const uint64_t ack_start = MulticoreMoE::RecomputeTraceStart(trace_);
 #pragma unroll 1
       for (uint32_t projection = 0; projection < 2; ++projection) {
-        MulticoreMoE::WaitReplicaGradientAcks(gradient_bands_[projection]);
+        MulticoreMoE::WaitReplicaGradientAcks(gradient_bands_[projection], trace_, projection);
       }
       MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::WAIT_GRAD_ACK, ack_start);
     }
@@ -155,13 +145,16 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
         // The ordinary task still publishes its original SwiGLUGrad dependency.
         if (act_grad_done_ && task_desc.outputs[0].input_position == 8) break;
-        auto *trace = task_desc.outputs[0].input_position == 8 ? trace_ : nullptr;
+        const uint32_t output = task_desc.outputs[0].input_position;
+        const bool dw = output == 6 || output == 18;
+        auto *trace = output == 8 || dw ? trace_ : nullptr;
         const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace);
 #endif
         ExecuteGroupedMatmul(task_desc);
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-        MulticoreMoE::RecordRecomputeStage(trace, MulticoreMoE::RecomputeStage::ACT_GRAD, start,
-                                           task_desc.task_index / core_num);
+        MulticoreMoE::RecordRecomputeStage(
+            trace, dw ? MulticoreMoE::RecomputeStage::DW_CUBE_PROJECTION : MulticoreMoE::RecomputeStage::ACT_GRAD,
+            start, task_desc.task_index / core_num, dw && output == 18 ? 1 : 0);
 #endif
         break;
       }
@@ -182,6 +175,12 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 #endif
         break;
       case TaskType::TASK_SWI_GLU_GRAD:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
+        if (early_dz_experts_ != 0) {
+          const uint32_t expert = SwiGluGradExpert(task_desc, early_dz_groups_);
+          if (early_dz_experts_ & (1U << expert)) break;
+        }
+#endif
         ExecuteSwiGluGrad(task_desc);
         break;
       default:
@@ -197,10 +196,104 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   bool input_already_dispatched_ = false;
   bool act_grad_done_ = false;
   CycleTraceRecorder *trace_ = nullptr;
+#if !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
+  uint32_t early_dz_experts_ = 0;
+  uint32_t early_dz_groups_ = 0;
+
+  __aicore__ inline uint32_t SwiGluGradExpert(const TaskDesc &task, uint32_t groups) {
+    const uint32_t lanes = task.task_split_num / groups;
+    if (lanes == 0 || task.task_split_num % groups != 0 || task.task_index >= task.task_split_num) {
+      AscendC::Trap();
+    }
+    return task.task_index / lanes;
+  }
+
+  __aicore__ __attribute__((noinline)) void RunSwiGluGradAtBarrier(uint64_t da_address, uint64_t barrier_address) {
+    const auto queue = getWorkerQueue(runtimeConfigPtr, core_num + worker_id_);
+    constexpr uint32_t max_groups = MulticoreMoE::kMaxEarlyExpertsPerRank;
+    const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
+    early_dz_groups_ = getExtraValueFromTiling(input_list[TILING_IDX], 2) / ep;
+    if (early_dz_groups_ == 0 || early_dz_groups_ > max_groups) AscendC::Trap();
+    TaskId task_ids[max_groups];
+    uint32_t pending = 0, repeated = 0;
+    for (uint32_t index = queue.begin; index < queue.end; index += queue.stride) {
+      const TaskId id = GetTaskIndex(index);
+      TaskDesc task;
+      LoadTaskDescriptor(id, task);
+      if (task.task_type != TaskType::TASK_SWI_GLU_GRAD) continue;
+      const uint32_t expert = SwiGluGradExpert(task, early_dz_groups_);
+      const uint32_t bit = 1U << expert;
+      repeated |= pending & bit;
+      pending |= bit;
+      task_ids[expert] = id;
+    }
+    // The early arithmetic is identified by one task per expert and worker.
+    // Dense plans with several tiles on this worker keep their normal tasks.
+    pending &= ~repeated;
+    constexpr uint32_t words = MulticoreMoE::kRecomputeReadyWordsPerExpert;
+    GlobalTensor<int32_t> ready, barrier;
+    ready.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(da_address), early_dz_groups_ * words);
+    barrier.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(barrier_address), 1);
+    while (pending != 0) {
+      DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(barrier[0]);
+      if (barrier.GetValue(0) >= 3 * core_num) return;
+      bool ran_task = false;
+      for (uint32_t expert = 0; expert < early_dz_groups_; ++expert) {
+        const uint32_t bit = 1U << expert;
+        if (!(pending & bit)) continue;
+        const uint32_t slot = expert * words;
+        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(ready[slot]);
+        if (ready.GetValue(slot) < core_num) continue;
+        PipeBarrier<PIPE_ALL>();
+        TaskDesc task;
+        LoadTaskDescriptor(task_ids[expert], task);
+        if (!IsMoeTaskOptionsValid(task, WORKSPACE_IDX)) AscendC::Trap();
+        const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace_);
+        ExecuteSwiGluGrad(task);
+        MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::EARLY_SWIGLU_GRAD, start, expert);
+        pending &= ~bit;
+        early_dz_experts_ |= bit;
+        ran_task = true;
+        break;
+      }
+      if (!ran_task) {
+        // The remaining R lanes and Cubes may still be computing.
+        const uint64_t refresh = AscendC::GetSystemCycle() + 5000;
+        while (AscendC::GetSystemCycle() < refresh) {}
+      }
+    }
+    MulticoreMoE::WaitReplicaEpoch<true, 5000>(barrier_address, core_num * 3);
+  }
+
+  __aicore__ __attribute__((noinline)) void MergeGradients(bool split) {
+    const uint32_t worker = worker_id_ / VECTOR_WORKER_STRIDE;
+    const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
+    // W2 is half the size of W13. Each projection publishes its own ACK
+    // after the lanes assigned to that projection finish.
+    const uint32_t w2_workers = core_num / 3;
+    split = split && w2_workers >= 4;
+    const uint32_t first = split && worker >= w2_workers ? 1 : 0;
+    const uint32_t end = split ? first + 1 : 2;
+    const uint32_t local_worker = first == 0 ? worker : worker - w2_workers;
+    const uint32_t consumers = !split ? core_num : first == 0 ? w2_workers : core_num - w2_workers;
+#pragma unroll 1
+    for (uint32_t projection = first; projection < end; ++projection) {
+      const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace_);
+      if (replica_bf16_partials_) {
+        MulticoreMoE::ReturnBf16ReplicaGradientBands(
+            gradient_bands_[projection], input_list[19], local_worker, core_num, ep, consumers, trace_, projection);
+      } else {
+        MulticoreMoE::ReturnReplicaGradientBands(
+            gradient_bands_[projection], input_list[19], local_worker, core_num, ep, consumers, trace_, projection);
+      }
+      MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::DW_OWNER_PROJECTION, start, projection);
+    }
+  }
+#endif
 #endif
 
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && (defined(__DAV_C220_CUBE__) || defined(__DAV_CUBE__))
-  __aicore__ __attribute__((noinline)) void RunEarlyActGrad(uint64_t pg_address) {
+  __aicore__ __attribute__((noinline)) void RunEarlyActGrad(uint64_t pg_address, uint64_t da_address) {
     const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
     const uint32_t experts = getExtraValueFromTiling(input_list[TILING_IDX], 2) / ep;
     if (experts > MulticoreMoE::kMaxEarlyExpertsPerRank) AscendC::Trap();
@@ -236,6 +329,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     constexpr uint32_t words = MulticoreMoE::kRecomputeReadyWordsPerExpert;
     GlobalTensor<int32_t> ready;
     ready.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(pg_address), experts * words);
+    if (da_address != 0) {
+      this->all_event_counters.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(da_address), experts * words);
+    }
     while (pending != 0) {
       bool advanced = false;
       for (uint32_t expert = 0; expert < experts; ++expert) {
@@ -254,6 +350,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         ExecuteGroupedMatmul(task);
         MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::EARLY_ACT_GRAD,
                                            start, expert, row_counts[expert]);
+        if (da_address != 0) this->TriggerEvent(slot);
         pending &= ~bit;
         advanced = true;
       }

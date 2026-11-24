@@ -108,6 +108,7 @@ class _RecomputeExecution:
     local_dp: torch.Tensor
     returned_dp: torch.Tensor
     barrier: torch.Tensor
+    aux_ready: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -495,7 +496,9 @@ def _prepare_fused_recompute(ctx, saved_tensors):
     receive_capacity = workspace.expert_capacity
     data_bytes = receive_capacity * spec.hidden_size * tokens.element_size()
     probability_bytes = receive_capacity * packet_size * torch.float32.itemsize
-    storage = workspace.recompute_workspace
+    aux_bytes = a3_recompute.AUX_READY_BYTES
+    aux_ready = workspace.recompute_workspace[:aux_bytes].view(torch.int32)
+    storage = workspace.recompute_workspace[aux_bytes:]
     received_g = storage[:data_bytes].view(tokens.dtype).view(receive_capacity, spec.hidden_size)
     received_p = storage[data_bytes:data_bytes + probability_bytes]
     returned_dp = storage[data_bytes + probability_bytes:].view(torch.float32).view(-1, packet_size)
@@ -504,7 +507,7 @@ def _prepare_fused_recompute(ctx, saved_tensors):
     local_dp = source_p.new_empty((capacity, packet_size))
     barrier = torch.zeros(8, dtype=torch.int32, device=tokens.device)
     recompute = _RecomputeExecution(
-        forward, metadata, offsets, source_p, received_g, received_p, local_dp, returned_dp, barrier,
+        forward, metadata, offsets, source_p, received_g, received_p, local_dp, returned_dp, barrier, aux_ready,
     )
     return saved, (mapping,), recompute
 
@@ -518,6 +521,19 @@ def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime, *, trace=No
             and spec.local_experts <= a3_recompute.MAX_EARLY_EXPERTS_PER_RANK):
         pg_ready = torch.zeros(spec.local_experts * a3_recompute.READY_WORDS_PER_EXPERT,
                                dtype=torch.int32, device=grad_output.device)
+    relaxed_barrier = pg_ready is not None and os.environ.get("HMC_A3_RECOMPUTE_RELAX_AIV_BARRIER") == "1"
+    da_ready = (torch.zeros_like(pg_ready) if relaxed_barrier
+                and os.environ.get("HMC_A3_RECOMPUTE_EARLY_DZ") == "1" else None)
+    aux_ready = None
+    aux_expected = 0
+    # Only use split readiness on the compound, unbatched push plan. The
+    # forward ready handshake joins all ranks after the local signal reset.
+    if (os.environ.get("HMC_A3_RECOMPUTE_X_FIRST") == "1" and not spec.batch_experts
+            and spec.local_experts <= a3_recompute.MAX_EARLY_EXPERTS_PER_RANK):
+        dispatch = plan.forward_graph.get_op("dispatch")
+        aux_expected = dispatch.task_num // spec.local_experts
+        aux_ready = recompute.aux_ready.zero_()
+    split_dw = os.environ.get("HMC_A3_RECOMPUTE_SPLIT_DW") == "1"
     forward = recompute.forward
     fwd_tiling = torch.tensor((
         spec.rank_id, spec.ep_size, spec.num_experts, spec.hidden_size, spec.plan_tokens, spec.num_cube_cores,
@@ -530,15 +546,14 @@ def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime, *, trace=No
         fwd_runtime, None, None, fwd_tiling, forward.event_counters, None,
     )
     sidecars = (recompute.barrier, grad_output, recompute.received_g, recompute.source_p, recompute.received_p,
-                recompute.local_dp, recompute.returned_dp, trace, pg_ready)
+                recompute.local_dp, recompute.returned_dp, trace, pg_ready, da_ready, aux_ready)
     references = (*inputs, *sidecars)
     arguments = tuple(0 if value is None else value.data_ptr() for value in references)
     operands = tuple(value for value in references if value is not None)
     for value in operands:
         value.record_stream(workspace.lease_stream)
-    relaxed_barrier = pg_ready is not None and os.environ.get("HMC_A3_RECOMPUTE_RELAX_AIV_BARRIER") == "1"
     descriptor = torch.tensor((a3_recompute.CALL_MAGIC, *arguments, a3_recompute.gradient_rows_per_batch(),
-                               int(relaxed_barrier)),
+                               int(relaxed_barrier), aux_expected, int(split_dw)),
                               dtype=torch.int64, device=grad_output.device).view(torch.uint8)
     # Stream recording protects queued consumers. It cannot hold the synthetic
     # tiling allocation through the backward-side allocations before submission.

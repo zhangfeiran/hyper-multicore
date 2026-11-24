@@ -104,6 +104,19 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
         MulticoreMoE::RecordRecomputeStage(trace, MulticoreMoE::RecomputeStage::W2, start,
                                            task_desc.task_index / core_num);
+#if defined(__DAV_C220_CUBE__) || defined(__DAV_CUBE__)
+        if (recompute_ != nullptr && recompute_->aux_ready != 0 &&
+            task_desc.outputs[0].input_position == 11 && task_desc.task_index % core_num == 0) {
+          // Withhold this Cube's W2 completion signal until G and p are visible.
+          // The AIV queue can keep issuing dispatch tasks while this Cube waits.
+          const uint32_t expert = task_desc.task_index / core_num;
+          const uint64_t flag = recompute_->aux_ready + expert * MulticoreMoE::kRecomputeReadyWordsPerExpert *
+                                                         sizeof(int32_t);
+          const uint64_t wait = MulticoreMoE::RecomputeTraceStart(trace_);
+          MulticoreMoE::WaitReplicaEpoch<true, 500>(flag, recompute_->aux_expected);
+          MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::WAIT_GP, wait, expert);
+        }
+#endif
 #endif
         break;
       }
@@ -386,9 +399,20 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
     int64_t send_data_size_ = partition_rows * hidden_size;
     const int64_t start = (task_desc.task_index % single_expert_task_num) * send_data_size_;
     const int64_t end = start + send_data_size_;
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+    __gm__ int32_t *aux_flag = nullptr;
+    if (recompute_ != nullptr && recompute_->aux_ready != 0 && task_desc.inputs[1].input_position == 2) {
+      const uint32_t expert = task_desc.task_index / single_expert_task_num % expert_num_single_rank;
+      aux_flag = reinterpret_cast<__gm__ int32_t *>(recompute_->aux_ready) +
+                 expert * MulticoreMoE::kRecomputeReadyWordsPerExpert;
+    }
+#endif
     if (start >= size_) {
       aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, 1, ACLSHMEM_SIGNAL_ADD,
                           target_pe);
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+      if (aux_flag != nullptr) aclshmemx_signal_op(aux_flag, 1, ACLSHMEM_SIGNAL_ADD, target_pe);
+#endif
       return;
     } else {
       if (end > size_) {
@@ -412,10 +436,18 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
       const auto index = reinterpret_cast<__gm__ const int32_t *>(
           input_list[task_desc.inputs[2].input_position] + expert_num * sizeof(int64_t));
       const uint64_t dispatch_start = MulticoreMoE::RecomputeTraceStart(trace_);
+      const int64_t start_row = src_offset_ / hidden_size;
+      const int64_t target_row = target_offset_ / hidden_size;
+      const int64_t rows = send_data_size_ / hidden_size;
+      auto x_flag = reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event;
+      if (aux_flag != nullptr) {
+        hyper_multicore::PutIndexedRows<DTYPE_DISPATCH_TARGET>(
+            input_list[task_desc.outputs[0].input_position], target_offset_, input_list[2],
+            index, start_row, rows, input_rows, target_pe, x_flag);
+        MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::EARLY_X_PUT, dispatch_start,
+                                           start_row, rows, target_pe);
+      }
       if (recompute_ != nullptr) {
-        const int64_t start_row = src_offset_ / hidden_size;
-        const int64_t target_row = target_offset_ / hidden_size;
-        const int64_t rows = send_data_size_ / hidden_size;
         hyper_multicore::PutIndexedRows<DTYPE_DISPATCH_TARGET>(
             reinterpret_cast<GM_ADDR>(recompute_->received_g), target_offset_,
             reinterpret_cast<GM_ADDR>(recompute_->source_g), index, start_row, rows,
@@ -424,14 +456,15 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
         constexpr int32_t stride = MulticoreMoE::kProbabilityPacketElements;
         send_probability.Init(reinterpret_cast<GM_ADDR>(recompute_->received_p), target_row * stride,
                               reinterpret_cast<GM_ADDR>(recompute_->source_p), start_row * stride,
-                              rows * stride, signal, task_desc.trigger_event, 0, 1,
+                              rows * stride, reinterpret_cast<GM_ADDR>(aux_flag), 0, 1, 1,
                               target_pe, false, nullptr);
-        send_probability.Process(false);
+        send_probability.Process(aux_flag != nullptr);
       }
-      hyper_multicore::PutIndexedRows<DTYPE_DISPATCH_TARGET>(
-          input_list[task_desc.outputs[0].input_position], target_offset_, input_list[2],
-          index, src_offset_ / hidden_size, send_data_size_ / hidden_size,
-          input_rows, target_pe, reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event);
+      if (aux_flag == nullptr) {
+        hyper_multicore::PutIndexedRows<DTYPE_DISPATCH_TARGET>(
+            input_list[task_desc.outputs[0].input_position], target_offset_, input_list[2],
+            index, start_row, rows, input_rows, target_pe, x_flag);
+      }
       MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::DISPATCH_X_G_P, dispatch_start,
                                          src_offset_ / hidden_size, send_data_size_ / hidden_size, target_pe);
       return;
