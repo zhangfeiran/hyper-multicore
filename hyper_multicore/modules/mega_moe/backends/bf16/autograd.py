@@ -513,6 +513,11 @@ def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime, *, trace=No
     """Encode the R frame and retain its tensors before and after launch submission."""
     plan, workspace = ctx.plan, ctx.workspace
     spec = plan.spec
+    pg_ready = None
+    if (os.environ.get("HMC_A3_RECOMPUTE_EARLY_DA") == "1" and not spec.batch_experts
+            and spec.local_experts <= a3_recompute.MAX_EARLY_EXPERTS_PER_RANK):
+        pg_ready = torch.zeros(spec.local_experts * a3_recompute.READY_WORDS_PER_EXPERT,
+                               dtype=torch.int32, device=grad_output.device)
     forward = recompute.forward
     fwd_tiling = torch.tensor((
         spec.rank_id, spec.ep_size, spec.num_experts, spec.hidden_size, spec.plan_tokens, spec.num_cube_cores,
@@ -525,7 +530,7 @@ def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime, *, trace=No
         fwd_runtime, None, None, fwd_tiling, forward.event_counters, None,
     )
     sidecars = (recompute.barrier, grad_output, recompute.received_g, recompute.source_p, recompute.received_p,
-                recompute.local_dp, recompute.returned_dp, trace)
+                recompute.local_dp, recompute.returned_dp, trace, pg_ready)
     references = (*inputs, *sidecars)
     arguments = tuple(0 if value is None else value.data_ptr() for value in references)
     operands = tuple(value for value in references if value is not None)

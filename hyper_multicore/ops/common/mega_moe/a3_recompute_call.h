@@ -6,8 +6,10 @@
 
 namespace MulticoreMoE {
 constexpr int64_t kA3RecomputeSequence = int64_t{1} << 40;
-constexpr uint64_t kA3RecomputeCall = 0x41335245434f4d51ULL;
+constexpr uint64_t kA3RecomputeCall = 0x41335245434f4d52ULL;
 constexpr uint32_t kA3ForwardInputs = 26;
+constexpr uint32_t kRecomputeReadyWordsPerExpert = 16;
+constexpr uint32_t kMaxEarlyExpertsPerRank = 32;
 
 // All addresses are valid for the entire compound device launch.
 struct A3RecomputeCall {
@@ -21,7 +23,8 @@ struct A3RecomputeCall {
   uint64_t local_dp;
   uint64_t returned_dp;
   uint64_t trace;
+  uint64_t pg_ready;
   uint64_t gradient_rows_per_batch;
 };
-static_assert(sizeof(A3RecomputeCall) == 36 * sizeof(uint64_t));
+static_assert(sizeof(A3RecomputeCall) == 37 * sizeof(uint64_t));
 }  // namespace MulticoreMoE

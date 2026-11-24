@@ -21,6 +21,7 @@ enum class RecomputeStage : uint32_t {
   RETURN_DX,
   MERGE_GRAD,
   WAIT_GRAD_ACK,
+  EARLY_ACT_GRAD,
 };
 
 __aicore__ inline uint64_t RecomputeTraceStart(MulticoreRuntime::CycleTraceRecorder *trace) {

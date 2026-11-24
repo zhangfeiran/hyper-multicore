@@ -171,5 +171,25 @@ __aicore__ static __attribute__((noinline)) void RecomputedGradientRows(
   pipe.Destroy();
 }
 
+// Each physical row has exactly one R producer. Publish completed rows after
+// the gradient routine has drained its MTE3 writes to the pG plane.
+__aicore__ static __attribute__((noinline)) void PublishRecomputedGradientRows(uint64_t address, uint32_t rows) {
+  AscendC::TPipe pipe;
+  AscendC::TBuf<AscendC::TPosition::VECOUT> buffer;
+  constexpr uint32_t words = 8;
+  pipe.InitBuffer(buffer, words * sizeof(int32_t));
+  auto values = buffer.Get<int32_t>();
+  values.SetValue(0, rows);
+  for (uint32_t i = 1; i < words; ++i) values.SetValue(i, 0);
+  AscendC::GlobalTensor<int32_t> flag;
+  flag.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(address), words);
+  AscendC::SetAtomicAdd<int32_t>();
+  RecomputeTileSync<AscendC::HardEvent::S_MTE3>();
+  AscendC::DataCopy(flag, values, words);
+  RecomputeTileSync<AscendC::HardEvent::MTE3_S>();
+  AscendC::SetAtomicNone();
+  pipe.Destroy();
+}
+
 }  // namespace MulticoreMoE
 #endif  // HMC_A3_RECOMPUTE_GRADIENT_TILES_H_

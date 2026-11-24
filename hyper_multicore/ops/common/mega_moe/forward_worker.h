@@ -72,7 +72,7 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
     const uint64_t forward_start = MulticoreMoE::RecomputeTraceStart(trace_);
     this->Process(getExtraValueFromTiling(input_list[TILING_IDX], MulticoreMoE::A3_INDEXED_TILING_ROUTE_FENCED) != 0);
     MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::FORWARD, forward_start);
-    if (recompute_ != nullptr) {
+    if (recompute_ != nullptr && recompute_->pg_ready == 0) {
       // Every launched Cube and AIV reaches the same rank-local barrier, including
       // lanes with an empty forward queue. No backward task can overwrite R inputs here.
       auto fence = reinterpret_cast<__gm__ int32_t *>(recompute_->local_barrier);
@@ -459,6 +459,14 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
         MulticoreMoE::RecomputedGradientRows(g, p, input_list[11], dp, first, rows, recompute_->gradient_rows_per_batch);
         MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::DP_AND_PG, arithmetic_start,
                                            first, rows, target_pe);
+      }
+      if (recompute_->pg_ready != 0) {
+        const uint32_t expert = task_desc.task_index / single_expert_task_num % expert_num_single_rank;
+        const auto group_ends = reinterpret_cast<const __gm__ int64_t *>(input_list[10]);
+        const int64_t start = expert == 0 ? 0 : group_ends[expert - 1];
+        if (first < start || first + rows > group_ends[expert]) AscendC::Trap();
+        const uint64_t flag = recompute_->pg_ready + expert * MulticoreMoE::kRecomputeReadyWordsPerExpert * sizeof(int32_t);
+        MulticoreMoE::PublishRecomputedGradientRows(flag, rows);
       }
       const uint64_t return_start = MulticoreMoE::RecomputeTraceStart(trace_);
       hyper_multicore::PutMemSignalKernel<float> return_probability;

@@ -9,10 +9,12 @@ import os
 from hyper_multicore._loader import require_multicore_environment
 
 SEQUENCE_BIT = 1 << 40
-CALL_MAGIC = 0x41335245434F4D51
+CALL_MAGIC = 0x41335245434F4D52
 PACKET_FLOATS = 8
 MAX_SOURCE_ROWS = 16384
 TRACE_RECORDS_PER_WORKER = 1024
+READY_WORDS_PER_EXPERT = 16
+MAX_EARLY_EXPERTS_PER_RANK = 32
 
 
 def gradient_rows_per_batch() -> int:
@@ -42,5 +44,5 @@ def require_vendor() -> None:
     vendor = require_multicore_environment() / "op_api" / "lib" / "libcust_opapi.so"
     api = ctypes.CDLL(str(vendor), mode=ctypes.RTLD_LOCAL)
     version = getattr(api, "HmcA3RecomputeBackwardVersion", None)
-    if version is None or version() != 2:
+    if version is None or version() != 3:
         raise RuntimeError("The loaded MegaMoE operator package does not support A3 fused recompute")

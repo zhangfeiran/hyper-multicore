@@ -25,6 +25,7 @@
 #endif
 #include "swi_glu_grad/swi_glu_grad.cpp"
 #include "runtime/worker_kernel.h"
+#include "common/mega_moe/a3_recompute_call.h"
 #include "common/mega_moe/invocation_protocol.h"
 #include "common/mega_moe/transport.h"
 #include "common/mega_moe/transport_task.h"
@@ -72,7 +73,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   static constexpr int64_t GMM_MATMUL_K_FIELDS_BYTES =
     offsetof(TCubeTiling, singleCoreK) + sizeof(int32_t) - offsetof(TCubeTiling, Ka);
 
-  __aicore__ inline void RunBackward(bool input_already_dispatched = false, CycleTraceRecorder *trace = nullptr) {
+  __aicore__ inline void RunBackward(bool input_already_dispatched = false, CycleTraceRecorder *trace = nullptr,
+                                    const __gm__ MulticoreMoE::A3RecomputeCall *recompute = nullptr) {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
     input_already_dispatched_ = input_already_dispatched;
     trace_ = trace;
@@ -80,6 +82,19 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     replica_bf16_partials_ = MulticoreMoE::UsesBf16ReplicaPartials(replica_launch_);
     gradient_bands_[0] = MulticoreMoE::GetReplicaGradientBands(replica_launch_, 0);
     gradient_bands_[1] = MulticoreMoE::GetReplicaGradientBands(replica_launch_, 1);
+    if (recompute != nullptr && recompute->pg_ready != 0) {
+#if defined(__DAV_C220_CUBE__) || defined(__DAV_CUBE__)
+      RunEarlyActGrad(recompute->pg_ready);
+      act_grad_done_ = true;
+#endif
+      const uint64_t barrier_start = MulticoreMoE::RecomputeTraceStart(trace_);
+      this->all_event_counters.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(recompute->local_barrier), 8);
+      this->TriggerEvent(0);
+      MulticoreMoE::WaitReplicaEpoch<true>(recompute->local_barrier, core_num * 3);
+      this->all_event_counters.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(input_list[EVENT_IDX]),
+                                              runtime_event_capacity);
+      MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::FORWARD_BARRIER, barrier_start);
+    }
     const uint64_t tasks_start = MulticoreMoE::RecomputeTraceStart(trace_);
 #endif
     // Reserved merge lanes still participate in the ordinary entry handshake.
@@ -128,6 +143,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         break;
       case TaskType::TASK_GROUPED_MATMUL: {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+        // The ordinary task still publishes its original SwiGLUGrad dependency.
+        if (act_grad_done_ && task_desc.outputs[0].input_position == 8) break;
         auto *trace = task_desc.outputs[0].input_position == 8 ? trace_ : nullptr;
         const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace);
 #endif
@@ -168,7 +185,75 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   bool replica_bf16_partials_ = false;
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
   bool input_already_dispatched_ = false;
+  bool act_grad_done_ = false;
   CycleTraceRecorder *trace_ = nullptr;
+#endif
+
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && (defined(__DAV_C220_CUBE__) || defined(__DAV_CUBE__))
+  __aicore__ __attribute__((noinline)) void RunEarlyActGrad(uint64_t pg_address) {
+    const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
+    const uint32_t experts = getExtraValueFromTiling(input_list[TILING_IDX], 2) / ep;
+    if (experts > MulticoreMoE::kMaxEarlyExpertsPerRank) AscendC::Trap();
+    const auto group_ends = reinterpret_cast<const __gm__ int64_t *>(input_list[19]);
+    TaskId act_grad[MulticoreMoE::kMaxEarlyExpertsPerRank];
+    int32_t row_counts[MulticoreMoE::kMaxEarlyExpertsPerRank];
+    uint32_t pending = 0;
+    uint32_t begin = worker_id_;
+    uint32_t end = cube_task_num;
+    uint32_t stride = core_num;
+    if (explicit_queues_) {
+      const auto queue = getWorkerQueue(runtimeConfigPtr, worker_id_);
+      begin = queue.begin;
+      end = queue.end;
+      stride = queue.stride;
+    }
+    for (uint32_t index = begin; index < end; index += stride) {
+      const TaskId id = GetTaskIndex(index);
+      TaskDesc task;
+      LoadTaskDescriptor(id, task);
+      if (task.task_type != TaskType::TASK_GROUPED_MATMUL || task.outputs[0].input_position != 8) continue;
+      const uint32_t expert = task.task_index / core_num;
+      if (expert >= experts || IsBatchedGroupedMatmulTask(task)) AscendC::Trap();
+      const uint32_t bit = 1U << expert;
+      if (pending & bit) AscendC::Trap();
+      const int64_t count = group_ends[expert] - (expert == 0 ? 0 : group_ends[expert - 1]);
+      if (count == 0) continue;
+      act_grad[expert] = id;
+      row_counts[expert] = count;
+      pending |= bit;
+    }
+
+    constexpr uint32_t words = MulticoreMoE::kRecomputeReadyWordsPerExpert;
+    GlobalTensor<int32_t> ready;
+    ready.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(pg_address), experts * words);
+    while (pending != 0) {
+      bool advanced = false;
+      for (uint32_t expert = 0; expert < experts; ++expert) {
+        const uint32_t bit = 1U << expert;
+        if (!(pending & bit)) continue;
+        const uint32_t slot = expert * words;
+        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(ready[slot]);
+        const int32_t received = ready.GetValue(slot);
+        if (received < row_counts[expert]) continue;
+        if (received != row_counts[expert]) AscendC::Trap();
+        PipeBarrier<PIPE_ALL>();
+        TaskDesc task;
+        LoadTaskDescriptor(act_grad[expert], task);
+        if (!IsMoeTaskOptionsValid(task, WORKSPACE_IDX)) AscendC::Trap();
+        const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace_);
+        ExecuteGroupedMatmul(task);
+        MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::EARLY_ACT_GRAD,
+                                           start, expert, row_counts[expert]);
+        pending &= ~bit;
+        advanced = true;
+      }
+      if (!advanced) {
+        constexpr uint64_t kPollCycles = 250;  // 5 us on the A3 system counter.
+        const uint64_t resume = AscendC::GetSystemCycle() + kPollCycles;
+        while (AscendC::GetSystemCycle() < resume) {}
+      }
+    }
+  }
 #endif
 
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
@@ -343,7 +428,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     }
   }
 
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+  __aicore__ __attribute__((noinline)) void ExecuteGroupedMatmul(const TaskDesc &task_desc) {
+#else
   __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {
+#endif
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
     if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
       GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, task_tiling, input_list[task_desc.tiling_data_position]);
@@ -596,11 +685,12 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
                                                 GM_ADDR *input_list) {
   bool dispatched = false;
   MulticoreRuntime::CycleTraceRecorder *trace = nullptr;
+  const __gm__ MulticoreMoE::A3RecomputeCall *call = nullptr;
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
   MulticoreRuntime::CycleTraceRecorder recorder;
   if (MulticoreRuntime::getExtraValueFromTiling(input_list[MulticoreRuntime::KernelWorker::TILING_IDX], 4) &
       MulticoreMoE::kA3RecomputeSequence) {
-    const auto call = reinterpret_cast<const __gm__ MulticoreMoE::A3RecomputeCall *>(
+    call = reinterpret_cast<const __gm__ MulticoreMoE::A3RecomputeCall *>(
         input_list[MulticoreRuntime::KernelWorker::DIAGNOSTIC_IDX]);
     if (call->magic != MulticoreMoE::kA3RecomputeCall) AscendC::Trap();
     if (call->trace != 0) {
@@ -616,5 +706,5 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
 #endif
   MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
-  worker.RunBackward(dispatched, trace);
+  worker.RunBackward(dispatched, trace, call);
 }
