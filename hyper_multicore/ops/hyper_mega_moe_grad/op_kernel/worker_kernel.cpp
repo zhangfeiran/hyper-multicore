@@ -50,6 +50,7 @@ namespace MulticoreRuntime {
 __aicore__ static __attribute__((noinline)) void ComputeEarlySwiGluGrad(
     GM_ADDR gradient, GM_ADDR input, GM_ADDR output, GM_ADDR tiling, float clamp, bool clamp_after) {
   swi_glu_grad(gradient, input, output, nullptr, tiling, clamp, clamp_after);
+  PipeBarrier<PIPE_ALL>();
 }
 #endif
 
@@ -374,6 +375,16 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         if (!IsMoeTaskOptionsValid(task, WORKSPACE_IDX)) AscendC::Trap();
         const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace_);
         ExecuteGroupedMatmul(task);
+        if (da_address != 0) {
+          // Host-local dA is read on another core before the compound barrier.
+          // Join the Cube's final FIX write before making its credit visible.
+          TPipe completion;
+          const auto event = static_cast<event_t>(completion.FetchEventID(HardEvent::FIX_MTE2));
+          SetFlag<HardEvent::FIX_MTE2>(event);
+          WaitFlag<HardEvent::FIX_MTE2>(event);
+          PipeBarrier<PIPE_ALL>();
+          completion.Destroy();
+        }
         MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::EARLY_ACT_GRAD,
                                            start, expert, row_counts[expert]);
         if (da_address != 0) this->TriggerEvent(slot);
