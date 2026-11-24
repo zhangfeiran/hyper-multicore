@@ -457,11 +457,14 @@ class ExpertWeightBinding:
                 self.pool.release()
             raise
 
-    def runtime(self, ordinary, gradients=None):
+    def runtime(self, ordinary, gradients=None, *, cube_queue=None):
         """Select split weights and optional in-kernel dW for this launch."""
         if not self.fused:
             return None
-        return self.pool.pipeline.runtime(ordinary, self, gradients if self.fused_gradients else None)
+        gradients = gradients if self.fused_gradients else None
+        if cube_queue is None:
+            return self.pool.pipeline.runtime(ordinary, self, gradients)
+        return self.pool.pipeline.runtime(ordinary, self, gradients, cube_queue=cube_queue)
 
     def capture_snapshot(self, weights: tuple[torch.Tensor, ...], *, maximum_bytes: int | None = None):
         """Copy the live guest weights while their bank is leased."""

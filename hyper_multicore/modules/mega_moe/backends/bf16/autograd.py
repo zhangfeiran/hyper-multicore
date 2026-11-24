@@ -1000,15 +1000,28 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             )
             grad_weight1 = execution.intermediates.grad_weight1
             grad_weight2 = execution.intermediates.grad_weight2
+            backward_runtime = None
+            if acquired and binding.fused:
+                cube_queue = None
+                if (recompute is not None and binding.fused_gradients and not binding.bf16_partials
+                        and os.environ.get("HMC_A3_W13_REMOTE_FIRST") == "1"):
+                    _, guests, owned = binding.edges
+                    if owned or any(peer < binding.pool.ranks for peer in guests):
+                        owners = tuple(sorted({edge[2] for edge in owned}))
+                        cube_queue = plan.w13_return_queue(binding.pool.local_experts, owners)
+                    if cube_queue is not None:
+                        cube_queue[1].record_stream(workspace.lease_stream)
+                gradients = grad_weight1, grad_weight2
+                if cube_queue is None:
+                    backward_runtime = binding.runtime(plan.bwd_runtime_config, gradients)
+                else:
+                    backward_runtime = binding.runtime(plan.bwd_runtime_config, gradients, cube_queue=cube_queue)
             _launch_backward_kernel(
                 plan,
                 saved,
                 source,
                 execution, stream=workspace.lease_stream,
-                runtime_override=(
-                    binding.runtime(plan.bwd_runtime_config, (grad_weight1, grad_weight2))
-                    if acquired and binding.fused else None
-                ),
+                runtime_override=backward_runtime,
                 recompute_call=recompute_call,
             )
             if recompute is not None and ctx.needs_input_grad[7]:
