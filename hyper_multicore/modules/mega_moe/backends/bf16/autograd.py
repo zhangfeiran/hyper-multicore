@@ -26,7 +26,7 @@ import torch
 from hyper_multicore._loader import load_torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
-from ... import a3_indexed
+from ... import a3_indexed, a3_recompute
 from ...probability import PROBABILITY_PLANES, probability_stride
 from .plan import MegaMoePlan, record_plan_stream
 from ...route import PreparedTopKRoute, RouteMetadata, _materialize_route_permutation, restore_topk_output
@@ -93,6 +93,21 @@ class _BackwardExecution:
     gmm_workspace: Any
     swiglu_workspace: Any
     intermediates: _BackwardIntermediates
+
+
+@dataclass(frozen=True)
+class _RecomputeExecution:
+    """Owned launch inputs and borrowed symmetric sidecars for one R+B."""
+
+    forward: _ForwardExecution
+    metadata: RouteMetadata
+    dispatch_offsets: torch.Tensor
+    source_p: torch.Tensor
+    received_g: torch.Tensor
+    received_p: torch.Tensor
+    local_dp: torch.Tensor
+    returned_dp: torch.Tensor
+    barrier: torch.Tensor
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -272,10 +287,13 @@ def _prepare_backward_execution(
     saved: _SavedBackwardState,
     grad_output: Any,
     *, all_experts_active: bool = False, owner_weights: tuple[torch.Tensor, ...] | None = None,
+    received_grad: torch.Tensor | None = None,
 ) -> _BackwardExecution:
     """Resolve workspace, event counters, and intermediate tensors for backward."""
-    dispatch = (torch.empty_like(saved.dispatch) if plan.spec.dispatch_mode == "pull"
-                else _workspace_tensor(workspace.expert_buffer, "expert_buffer"))
+    dispatch = received_grad
+    if dispatch is None:
+        dispatch = (torch.empty_like(saved.dispatch) if plan.spec.dispatch_mode == "pull"
+                    else _workspace_tensor(workspace.expert_buffer, "expert_buffer"))
     grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
     weights = (saved.weight1, saved.weight2) if owner_weights is None else owner_weights
     groups = saved.group_list if owner_weights is None else saved.group_list[:weights[0].shape[0]]
@@ -441,6 +459,73 @@ def _launch_deferred_recompute(ctx, saved_tensors):
             binding.release()
 
 
+def _prepare_fused_recompute(ctx, saved_tensors):
+    """Bind the frozen physical route without constructing any top-K hidden rows."""
+    tokens, weight1, weight2, probabilities, ids = saved_tensors
+    route = ctx.deferred_recompute.route
+    workspace, plan = ctx.workspace, ctx.plan
+    spec = plan.spec
+    metadata = route.metadata.for_kernel(spec.hidden_size)
+    offsets, mapping = route.indexed_dispatch_offsets, route.unpermute_mapping
+    if offsets is None:
+        binding = ctx.weight_binding
+        physical_ids = ids if binding is None else binding.placement.virtual_ids
+        sorted_slots = torch.argsort(physical_ids.reshape(-1), stable=True)
+        mapping = torch.empty_like(sorted_slots, dtype=torch.int32)
+        mapping.scatter_(0, sorted_slots, torch.arange(sorted_slots.numel(), dtype=torch.int32, device=ids.device))
+        source_rows = sorted_slots.div(spec.top_k, rounding_mode="floor").to(torch.int32)
+        offsets = a3_indexed.pack_dispatch_offsets(metadata.dispatch_src_off, source_rows)
+    capacity = metadata.expert_capacity
+    forward = _prepare_forward_execution(workspace, plan, tokens, capacity)
+    intermediates = forward.intermediates
+    saved = _SavedBackwardState(
+        forward.dispatch[:capacity], intermediates.up_proj, intermediates.activation, weight1, weight2,
+        metadata.group_list, metadata.dispatch_src_off, metadata.dispatch_target_off, metadata.dispatch_size,
+        metadata.combine_src_off, metadata.combine_target_off, metadata.combine_size,
+    )
+    packet_size = a3_recompute.PACKET_FLOATS
+    receive_capacity = workspace.expert_capacity
+    data_bytes = receive_capacity * spec.hidden_size * tokens.element_size()
+    probability_bytes = receive_capacity * packet_size * torch.float32.itemsize
+    storage = workspace.recompute_workspace
+    received_g = storage[:data_bytes].view(tokens.dtype).view(receive_capacity, spec.hidden_size)
+    received_p = storage[data_bytes:data_bytes + probability_bytes]
+    returned_dp = storage[data_bytes + probability_bytes:].view(torch.float32).view(-1, packet_size)
+    source_p = torch.zeros((mapping.numel(), packet_size), dtype=torch.float32, device=tokens.device)
+    source_p[:, 0].scatter_(0, mapping.to(torch.int64), probabilities.reshape(-1).float())
+    local_dp = source_p.new_empty((capacity, packet_size))
+    barrier = torch.zeros(8, dtype=torch.int32, device=tokens.device)
+    recompute = _RecomputeExecution(
+        forward, metadata, offsets, source_p, received_g, received_p, local_dp, returned_dp, barrier,
+    )
+    return saved, (mapping,), recompute
+
+
+def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime):
+    """Encode the nested forward frame, retaining every pointer on the launch stream."""
+    plan, workspace = ctx.plan, ctx.workspace
+    spec = plan.spec
+    forward = recompute.forward
+    fwd_tiling = torch.tensor((
+        spec.rank_id, spec.ep_size, spec.num_experts, spec.hidden_size, spec.plan_tokens, spec.num_cube_cores,
+        fwd_runtime.numel(), forward.event_counters.numel(), ctx.token_rows, 0,
+    ), dtype=torch.int64, device=grad_output.device)
+    inputs = (
+        *_forward_kernel_inputs(recompute.metadata, forward.source, saved.weight1, saved.weight2, forward,
+                                recompute.dispatch_offsets),
+        forward.gmm_workspace, plan.up_proj_tiling, plan.swiglu_tiling, plan.down_proj_tiling,
+        fwd_runtime, None, None, fwd_tiling, forward.event_counters, None,
+    )
+    sidecars = (recompute.barrier, grad_output, recompute.received_g, recompute.source_p, recompute.received_p,
+                recompute.local_dp, recompute.returned_dp)
+    arguments = tuple(0 if value is None else value.data_ptr() for value in (*inputs, *sidecars))
+    for value in (*inputs, *sidecars):
+        if value is not None:
+            value.record_stream(workspace.lease_stream)
+    return torch.tensor((a3_recompute.CALL_MAGIC, *arguments),
+                        dtype=torch.int64, device=grad_output.device).view(torch.uint8)
+
+
 _CAPTURED_WEIGHT_GRADS: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
@@ -478,22 +563,13 @@ def _diagnostic_runtime(runtime, ordinary, extended):
     return torch.cat((runtime, extended[ordinary.numel():]))
 
 
-def _launch_forward_kernel(
-    plan: MegaMoePlan,
-    metadata: RouteMetadata,
-    routed_tokens: Any,
-    weight1: Any,
-    weight2: Any,
-    execution: _ForwardExecution,
-    *, stream: Any = None, runtime_override: torch.Tensor | None = None,
-    dispatch_offsets: torch.Tensor | None = None, counts_fenced: bool = False,
-) -> None:
-    """Launch the internal forward ABI with prepared buffers and metadata."""
-    spec = plan.spec
-    sequence = getattr(spec, "plan_tokens", spec.local_num_tokens)
-    if dispatch_offsets is not None:
-        sequence = a3_indexed.launch_sequence(sequence, routed_tokens.shape[0], counts_fenced)
-    kernel_parameters = (
+def _forward_kernel_inputs(
+    metadata: RouteMetadata, routed_tokens: torch.Tensor,
+    weight1: torch.Tensor, weight2: torch.Tensor, execution: _ForwardExecution,
+    dispatch_offsets: torch.Tensor | None,
+) -> tuple:
+    """Use the same operand slots for an ordinary F and the R frame inside B."""
+    return (
         execution.dispatch,
         metadata.dispatch_target_off,
         _native_source(routed_tokens),
@@ -511,6 +587,25 @@ def _launch_forward_kernel(
         metadata.combine_src_off,
         metadata.combine_size,
     )
+
+
+def _launch_forward_kernel(
+    plan: MegaMoePlan,
+    metadata: RouteMetadata,
+    routed_tokens: Any,
+    weight1: Any,
+    weight2: Any,
+    execution: _ForwardExecution,
+    *, stream: Any = None, runtime_override: torch.Tensor | None = None,
+    dispatch_offsets: torch.Tensor | None = None, counts_fenced: bool = False,
+) -> None:
+    """Launch the internal forward ABI with prepared buffers and metadata."""
+    spec = plan.spec
+    sequence = getattr(spec, "plan_tokens", spec.local_num_tokens)
+    if dispatch_offsets is not None:
+        sequence = a3_indexed.launch_sequence(sequence, routed_tokens.shape[0], counts_fenced)
+    kernel_parameters = _forward_kernel_inputs(metadata, routed_tokens, weight1, weight2, execution,
+                                               dispatch_offsets)
     if not plan.fwd_diagnostics.is_active:
         runtime = plan.fwd_runtime_config if runtime_override is None else runtime_override
         record_plan_stream(plan, runtime, stream=stream)
@@ -560,6 +655,7 @@ def _launch_backward_kernel(
     grad_output: Any,
     execution: _BackwardExecution,
     *, stream: Any = None, runtime_override: torch.Tensor | None = None,
+    recompute_call: torch.Tensor | None = None,
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -589,7 +685,9 @@ def _launch_backward_kernel(
     if not plan.bwd_diagnostics.is_active:
         runtime = plan.bwd_runtime_config if runtime_override is None else runtime_override
         record_plan_stream(plan, runtime, stream=stream)
-        multicore_ops.mega_moe_grad(
+        launch = (multicore_ops.mega_moe_grad if recompute_call is None
+                  else multicore_ops.mega_moe_grad_with_diagnostic_buffer)
+        launch(
             *kernel_parameters,
             plan.act_grad_tiling,
             plan.gate_grad_tiling,
@@ -600,11 +698,13 @@ def _launch_backward_kernel(
             execution.swiglu_workspace,
             runtime,
             execution.event_counters,
+            *((recompute_call,) if recompute_call is not None else ()),
             spec.rank_id,
             spec.ep_size,
             spec.num_experts,
             spec.hidden_size,
-            getattr(spec, "plan_tokens", spec.local_num_tokens),
+            (getattr(spec, "plan_tokens", spec.local_num_tokens)
+             | (a3_recompute.SEQUENCE_BIT if recompute_call is not None else 0)),
         )
         return
 
@@ -829,9 +929,14 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         workspace.claim()
         binding = ctx.weight_binding
         acquired = False
+        recompute = None
         try:
             if getattr(ctx, "deferred_recompute", None) is not None:
-                saved, permutation_inputs = _launch_deferred_recompute(ctx, saved_tensors)
+                if (workspace.a3_fused_recompute and plan.spec.plan_tokens <= a3_recompute.MAX_SOURCE_ROWS
+                        and not plan.fwd_diagnostics.is_active and not plan.bwd_diagnostics.is_active):
+                    saved, permutation_inputs, recompute = _prepare_fused_recompute(ctx, saved_tensors)
+                else:
+                    saved, permutation_inputs = _launch_deferred_recompute(ctx, saved_tensors)
             else:
                 saved = _saved_backward_state(saved_tensors)
                 permutation_inputs = saved_tensors[12:]
@@ -842,10 +947,20 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             del saved_tensors
             owner_weights = saved.weight1, saved.weight2
             if binding is not None:
-                operands = binding.acquire(owner_weights, backward=True)
+                options = {}
+                if recompute is not None and ctx.deferred_recompute.allow_guest_restore:
+                    options["replay_snapshot"] = ctx.deferred_recompute.guest_weight_snapshot
+                operands = binding.acquire(owner_weights, backward=True, **options)
                 acquired = True
                 saved = replace(saved, weight1=operands[0], weight2=operands[1])
-            source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
+            recompute_call = None
+            if recompute is None:
+                source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
+            else:
+                source, grad_topk_weights = grad_output.contiguous(), None
+                fwd_runtime = (binding.runtime(plan.fwd_runtime_config)
+                               if acquired and binding.fused else plan.fwd_runtime_config)
+                recompute_call = _recompute_call(ctx, recompute, saved, source, fwd_runtime)
             saved_probabilities = permutation_inputs[-1] if plan.spec.apply_probs_before_fc2 else None
             permutation_inputs = permutation_inputs[:1]
             fused_owner_weights = owner_weights if acquired and binding.fused_gradients else None
@@ -862,6 +977,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 grad_output,
                 all_experts_active=all_experts_active,
                 owner_weights=fused_owner_weights,
+                received_grad=recompute.received_g if recompute is not None else None,
             )
             grad_weight1 = execution.intermediates.grad_weight1
             grad_weight2 = execution.intermediates.grad_weight2
@@ -874,8 +990,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                     binding.runtime(plan.bwd_runtime_config, (grad_weight1, grad_weight2))
                     if acquired and binding.fused else None
                 ),
+                recompute_call=recompute_call,
             )
-            if plan.spec.apply_probs_before_fc2 and ctx.needs_input_grad[7]:
+            if recompute is not None and ctx.needs_input_grad[7]:
+                route_dp = recompute.returned_dp[:, 0].index_select(0, permutation_inputs[0])
+                grad_topk_weights = route_dp.view(ctx.token_rows, plan.spec.top_k).to(ctx.topk_dtype)
+            elif plan.spec.apply_probs_before_fc2 and ctx.needs_input_grad[7]:
                 grad_topk_weights = (
                     workspace.probabilities(plan.spec).slice(ctx.source_rows, gradient=True).index_select(
                     0, permutation_inputs[0]).reshape_as(saved_probabilities).to(ctx.topk_dtype)

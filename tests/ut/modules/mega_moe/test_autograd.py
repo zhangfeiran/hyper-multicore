@@ -253,6 +253,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         workspace = Mock(
             expert_buffer=torch.empty_like(tokens), routed_buffer=torch.empty_like(tokens),
             gmm_workspace=torch.empty(1), swiglu_grad_workspace=torch.empty(1),
+            a3_fused_recompute=False,
         )
         record = SimpleNamespace(route=route, allow_guest_restore=False)
         launches = []
@@ -303,6 +304,41 @@ class TestMegaMoeFunction(unittest.TestCase):
                     torch.testing.assert_close(result, wanted, atol=0, rtol=0)
                 self.assertEqual(record.deferred_output is not None, retain)
         self.assertEqual(launches, ["F or R", "F or R", "B", "F or R", "B"])
+
+    def test_compound_recompute_binds_disjoint_owner_buffers_in_physical_route_order(self) -> None:
+        """Allocate both expert operands and restore the source-slot probability order."""
+        hidden = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+        ids = torch.tensor([[1, 0], [0, 1], [1, 0]], dtype=torch.int32)
+        probs = torch.arange(6, dtype=torch.float32).reshape_as(ids) / 5
+        cap, source_slots = 8, ids.numel()
+        metadata = function_module.RouteMetadata(
+            *(torch.zeros(2, dtype=torch.int64) for _ in range(6)),
+            group_list=torch.tensor([3, 6]), expert_capacity=6,
+        )
+        workspace = Mock(
+            expert_capacity=cap, expert_buffer=hidden.new_empty((cap, 4)),
+            routed_buffer=hidden.new_empty((source_slots, 4)), gmm_workspace=torch.empty(16, dtype=torch.uint8),
+            recompute_workspace=torch.empty(cap * (4 * 2 + 32) + source_slots * 32, dtype=torch.uint8),
+        )
+        route = SimpleNamespace(metadata=metadata, indexed_dispatch_offsets=None, unpermute_mapping=None)
+        context = SimpleNamespace(
+            weight_binding=None, workspace=workspace, deferred_recompute=SimpleNamespace(route=route),
+            plan=SimpleNamespace(spec=SimpleNamespace(
+                hidden_size=4, intermediate_size=2, top_k=2, dispatch_mode="push", apply_probs_before_fc2=False,
+            ), event_counter_bytes=64),
+        )
+        weight = hidden.new_empty(0)
+        saved, (inverse,), launch = function_module._prepare_fused_recompute(
+            context, (hidden, weight, weight, probs, ids),
+        )
+        self.assertIs(launch.forward.source, hidden)
+        self.assertEqual(saved.dispatch.data_ptr(), workspace.expert_buffer.data_ptr())
+        self.assertEqual(launch.received_g.shape, (cap, 4))
+        self.assertEqual(launch.received_p.data_ptr(), launch.received_g.data_ptr() + cap * 4 * 2)
+        self.assertEqual(launch.returned_dp.data_ptr(), launch.received_p.data_ptr() + cap * 32)
+        torch.testing.assert_close(launch.source_p[inverse, 0], probs.flatten(), atol=0, rtol=0)
+        source_rows = launch.dispatch_offsets[2:].view(torch.int32)
+        torch.testing.assert_close(source_rows, torch.argsort(inverse).div(2, rounding_mode="floor").int())
 
     def _check_deferred_forward(
         self, source: Any, weight1: Any, weight2: Any, route: Any, plan: Any, workspace: Any,

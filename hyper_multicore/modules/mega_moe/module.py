@@ -30,7 +30,7 @@ from hyper_multicore.modules.mega_moe.numerics import (
 )
 from hyper_multicore.experimental import MegaMoeTuningOptions
 
-from . import a3_indexed
+from . import a3_indexed, a3_recompute
 from ..module import MulticoreModule
 from .backends import get_backend
 from .invocation import prepare_expert_invocation
@@ -245,6 +245,7 @@ class MegaMoeExperts(MulticoreModule):
         if planner is not None and specification["ep_size"] <= 1:
             raise ValueError("HotReplica requires an explicit EP group with more than one rank")
         specification["auto_tokens"] = True
+        specification["a3_recompute"] = a3_recompute.requested(specification)
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())

@@ -34,6 +34,7 @@ from hyper_multicore.scheduler.config import (
 )
 from hyper_multicore.shmem import _lifecycle
 
+from .a3_recompute import PACKET_FLOATS
 from .probability import PROBABILITY_PLANES, ProbabilityPlane
 from .spec import MegaMoeSpec, _resolve_receive_capacity
 
@@ -61,6 +62,7 @@ def _workspace_allocation_specs(
     dtype: torch.dtype,
     apply_probs_before_fc2: bool = False,
     compute_stages: int = 3,
+    a3_fused_recompute: bool = False,
 ) -> tuple[tuple[str, _lifecycle._AllocationSpec], ...]:  # pylint: disable=protected-access
     """Return the single ordered physical Allocation description for a workspace."""
     data_field = "source_buffer" if dispatch_mode == "pull" else "expert_buffer"
@@ -77,6 +79,12 @@ def _workspace_allocation_specs(
         # Cover every lossless destination before expert placement changes rows.
         allocations += (("probability_workspace", allocation_spec(
             (PROBABILITY_PLANES, ep_size * routed_slots), torch.float32, _WORKSPACE_ALIGNMENT)),)
+    if a3_fused_recompute:
+        # Remote raw G and p have the receive capacity. Returned dP uses source slots.
+        packet_bytes = PACKET_FLOATS * torch.float32.itemsize
+        bytes_needed = receive_capacity * (hidden_size * dtype.itemsize + packet_bytes) + routed_slots * packet_bytes
+        allocations += (("recompute_workspace", allocation_spec(
+            (bytes_needed,), torch.uint8, _WORKSPACE_ALIGNMENT)),)
     return allocations
 
 
@@ -105,6 +113,7 @@ def _spec_workspace_bytes(
         compute_stages=6 if specification.get("precision") == 'mxfp8' else 3,
         dtype=dtype,
         apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
+        a3_fused_recompute=specification.get("a3_recompute", False),
     )
     return sum(spec.dtype.itemsize * math.prod(spec.shape) + spec.alignment_bytes - 1 for _, spec in allocations)
 
@@ -154,6 +163,8 @@ class MegaMoeWorkspace:
     backward_event_counters: Any | None = None
     gmm_workspace: Any | None = None
     probability_workspace: Any | None = None
+    a3_fused_recompute: bool = False
+    recompute_workspace: Any | None = None
     probability_views: ProbabilityWorkspace | None = field(default=None, init=False, repr=False)
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
@@ -192,6 +203,7 @@ class MegaMoeWorkspace:
             compute_stages=6 if precision == "mxfp8" else 3,
             dtype=dtype,
             apply_probs_before_fc2=spec.apply_probs_before_fc2,
+            a3_fused_recompute=self.a3_fused_recompute,
         )
         return allocations
 
@@ -481,7 +493,8 @@ class MegaMoeWorkspace:
         if self.closing:
             remaining = tuple(tensor is not None for tensor in (
                 self.source_buffer, self.expert_buffer, self.routed_buffer,
-                self.forward_event_counters, self.backward_event_counters, self.probability_workspace))
+                self.forward_event_counters, self.backward_event_counters, self.probability_workspace,
+                self.recompute_workspace))
             peers = _collective.exchange(
                 remaining,
                 group=self._root_group(),
@@ -496,6 +509,7 @@ class MegaMoeWorkspace:
             "forward_event_counters",
             "backward_event_counters",
             "probability_workspace",
+            "recompute_workspace",
         ):
             tensor = getattr(self, field_name)
             if tensor is None:

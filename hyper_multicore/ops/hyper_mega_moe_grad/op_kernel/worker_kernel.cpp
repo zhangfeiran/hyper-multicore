@@ -16,10 +16,14 @@
 #include <cstddef>
 
 #include "kernel_operator.h"
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+#include "common/mega_moe/forward_worker.h"
+#else
 #include "swi_glu/swi_glu.cpp"
-#include "swi_glu_grad/swi_glu_grad.cpp"
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
+#endif
+#include "swi_glu_grad/swi_glu_grad.cpp"
 #include "runtime/worker_kernel.h"
 #include "common/mega_moe/invocation_protocol.h"
 #include "common/mega_moe/transport.h"
@@ -68,8 +72,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   static constexpr int64_t GMM_MATMUL_K_FIELDS_BYTES =
     offsetof(TCubeTiling, singleCoreK) + sizeof(int32_t) - offsetof(TCubeTiling, Ka);
 
-  __aicore__ inline void RunBackward() {
+  __aicore__ inline void RunBackward(bool input_already_dispatched = false) {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+    input_already_dispatched_ = input_already_dispatched;
     replica_launch_ = MulticoreMoE::GetReplicaLaunch(this->runtimeConfigPtr, input_list[TILING_IDX]);
     replica_bf16_partials_ = MulticoreMoE::UsesBf16ReplicaPartials(replica_launch_);
     gradient_bands_[0] = MulticoreMoE::GetReplicaGradientBands(replica_launch_, 0);
@@ -143,6 +148,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   const __gm__ MulticoreMoE::ReplicaLaunch *replica_launch_ = nullptr;
   const __gm__ MulticoreMoE::ReplicaGradientBandRecord *gradient_bands_[2] = {nullptr, nullptr};
   bool replica_bf16_partials_ = false;
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+  bool input_already_dispatched_ = false;
+#endif
 
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
     union {
@@ -473,6 +481,15 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     int64_t rank_id = (*(__gm__ int64_t *)(input_list[TILING_IDX])) / ep * ep;
     int64_t single_expert_task_num = task_desc.task_split_num / expert_num;
     int64_t target_pe = rank_id + task_desc.task_index / (expert_num_single_rank * single_expert_task_num);
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+    if (input_already_dispatched_ && task_desc.inputs[1].input_position == 2) {
+      // R has already published dV on its owner. Keep the existing backward
+      // event contract while retaining the original group sizes and GMM schedule.
+      aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, 1,
+                          ACLSHMEM_SIGNAL_ADD, target_pe);
+      return;
+    }
+#endif
 
     int64_t target_offset_ = *((__gm__ int64_t *)(input_list[task_desc.inputs[0].input_position] +
                                                   task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type));
@@ -534,7 +551,25 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 
 extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr,
                                                 GM_ADDR *input_list) {
+  bool dispatched = false;
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+  if (MulticoreRuntime::getExtraValueFromTiling(input_list[MulticoreRuntime::KernelWorker::TILING_IDX], 4) &
+      MulticoreMoE::kA3RecomputeSequence) {
+    const auto call = reinterpret_cast<const __gm__ MulticoreMoE::A3RecomputeCall *>(
+        input_list[MulticoreRuntime::KernelWorker::DIAGNOSTIC_IDX]);
+    if (call->magic != MulticoreMoE::kA3RecomputeCall) AscendC::Trap();
+    GM_ADDR forward_inputs[MulticoreMoE::kA3ForwardInputs];
+    for (uint32_t i = 0; i < MulticoreMoE::kA3ForwardInputs; ++i) {
+      forward_inputs[i] = reinterpret_cast<GM_ADDR>(call->forward_inputs[i]);
+    }
+    forward_inputs[22] = input_list[29];  // CANN library workspace after the entry tiling.
+    MulticoreRuntime::ForwardKernelWorker forward;
+    forward.Init(worker_id, forward_inputs[20], forward_inputs);
+    forward.RunForward(call);
+    dispatched = true;
+  }
+#endif
   MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
-  worker.RunBackward();
+  worker.RunBackward(dispatched);
 }
