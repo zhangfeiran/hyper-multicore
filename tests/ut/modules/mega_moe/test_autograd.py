@@ -15,6 +15,7 @@
 """CPU storage-lifetime tests for the MegaMoe autograd bridge."""
 
 import unittest
+import weakref
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -339,6 +340,39 @@ class TestMegaMoeFunction(unittest.TestCase):
         torch.testing.assert_close(launch.source_p[inverse, 0], probs.flatten(), atol=0, rtol=0)
         source_rows = launch.dispatch_offsets[2:].view(torch.int32)
         torch.testing.assert_close(source_rows, torch.argsort(inverse).div(2, rounding_mode="floor").int())
+
+    def test_compound_call_owns_tiling_before_backward_submission(self) -> None:
+        """Retain the tensor behind the nested tiling address while preparing B."""
+        runtime = torch.zeros(128, dtype=torch.uint8)
+        spec = SimpleNamespace(rank_id=0, ep_size=2, num_experts=24, hidden_size=4096,
+                               plan_tokens=384, num_cube_cores=24)
+        plan = SimpleNamespace(spec=spec, up_proj_tiling=None, swiglu_tiling=None, down_proj_tiling=None)
+        ctx = SimpleNamespace(plan=plan, workspace=SimpleNamespace(lease_stream=None), token_rows=257)
+        tensor = torch.ones((1, 4), dtype=torch.bfloat16)
+        forward = SimpleNamespace(source=tensor, gmm_workspace=None, event_counters=runtime)
+        saved = SimpleNamespace(weight1=tensor, weight2=tensor)
+        recompute = SimpleNamespace(forward=forward, metadata=None, dispatch_offsets=None, barrier=None,
+                                    received_g=None, source_p=None, received_p=None, local_dp=None, returned_dp=None)
+        original_tensor = torch.tensor
+        tiling_references = []
+
+        def watch_tiling(words, **options):
+            result = original_tensor(words, **options)
+            if len(words) == 10:
+                tiling_references.append(weakref.ref(result))
+            return result
+
+        with patch.object(function_module, "_forward_kernel_inputs", return_value=(None,) * 16), \
+                patch.object(torch, "tensor", new=watch_tiling), \
+                patch.object(torch.Tensor, "record_stream", new=lambda *_: None):
+            call = function_module._recompute_call(ctx, recompute, saved, tensor, runtime)
+
+        tiling, = tiling_references
+        self.assertIsNotNone(tiling())
+        self.assertEqual(call.descriptor.view(torch.int64)[24].item(), tiling().data_ptr())
+        self.assertEqual(tiling()[6].item(), runtime.numel())
+        del call
+        self.assertIsNone(tiling())
 
     def _check_deferred_forward(
         self, source: Any, weight1: Any, weight2: Any, route: Any, plan: Any, workspace: Any,
