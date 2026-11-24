@@ -179,7 +179,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
         if (early_dz_experts_ != 0) {
           const uint32_t expert = SwiGluGradExpert(task_desc, early_dz_groups_);
-          if (early_dz_experts_ & (1U << expert)) break;
+          if (early_dz_experts_ & (1U << expert)) {
+            const uint32_t lane = task_desc.task_index % (task_desc.task_split_num / early_dz_groups_);
+            if (lane < 64 && (early_dz_lanes_[expert] & (uint64_t{1} << lane))) break;
+          }
         }
         const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace_);
 #endif
@@ -210,6 +213,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 #if !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
   uint32_t early_dz_experts_ = 0;
   uint32_t early_dz_groups_ = 0;
+  uint64_t early_dz_lanes_[MulticoreMoE::kMaxEarlyExpertsPerRank];
 
   __aicore__ inline uint32_t SwiGluGradExpert(const TaskDesc &task, uint32_t groups) {
     const uint32_t lanes = task.task_split_num / groups;
@@ -225,22 +229,22 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
     early_dz_groups_ = getExtraValueFromTiling(input_list[TILING_IDX], 2) / ep;
     if (early_dz_groups_ == 0 || early_dz_groups_ > max_groups) AscendC::Trap();
-    TaskId task_ids[max_groups];
-    uint32_t pending = 0, repeated = 0;
+    // The odd AIVs can own two tiles per expert when even AIVs merge dW.
+    constexpr uint32_t kTasksPerExpert = 2;
+    TaskId task_ids[max_groups][kTasksPerExpert];
+    uint8_t task_counts[max_groups] = {};
+    uint32_t pending = 0;
     for (uint32_t index = queue.begin; index < queue.end; index += queue.stride) {
       const TaskId id = GetTaskIndex(index);
       TaskDesc task;
       LoadTaskDescriptor(id, task);
-      if (task.task_type != TaskType::TASK_SWI_GLU_GRAD) continue;
+      if (task.task_type != TaskType::TASK_SWI_GLU_GRAD ||
+          GetSwiGluTaskIteration(task) != SwiGluTaskIteration::PERSISTENT_LANES) continue;
       const uint32_t expert = SwiGluGradExpert(task, early_dz_groups_);
-      const uint32_t bit = 1U << expert;
-      repeated |= pending & bit;
-      pending |= bit;
-      task_ids[expert] = id;
+      if (task.task_split_num / early_dz_groups_ > 64 || task_counts[expert] >= kTasksPerExpert) continue;
+      task_ids[expert][task_counts[expert]++] = id;
+      pending |= 1U << expert;
     }
-    // The early arithmetic is identified by one task per expert and worker.
-    // Dense plans with several tiles on this worker keep their normal tasks.
-    pending &= ~repeated;
     constexpr uint32_t words = MulticoreMoE::kRecomputeReadyWordsPerExpert;
     GlobalTensor<int32_t> ready, barrier;
     ready.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(da_address), early_dz_groups_ * words);
@@ -257,12 +261,15 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         if (ready.GetValue(slot) < core_num) continue;
         PipeBarrier<PIPE_ALL>();
         TaskDesc task;
-        LoadTaskDescriptor(task_ids[expert], task);
+        LoadTaskDescriptor(task_ids[expert][--task_counts[expert]], task);
         if (!IsMoeTaskOptionsValid(task, WORKSPACE_IDX)) AscendC::Trap();
         const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace_);
         ExecuteSwiGluGrad(task);
         MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::EARLY_SWIGLU_GRAD, start, expert);
-        pending &= ~bit;
+        const uint32_t lane = task.task_index % (task.task_split_num / early_dz_groups_);
+        if (!(early_dz_experts_ & bit)) early_dz_lanes_[expert] = 0;
+        early_dz_lanes_[expert] |= uint64_t{1} << lane;
+        if (task_counts[expert] == 0) pending &= ~bit;
         early_dz_experts_ |= bit;
         ran_task = true;
         break;
@@ -406,7 +413,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     }
   }
 
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+  __aicore__ __attribute__((noinline)) void ExecuteSwiGluGrad(const TaskDesc &task_desc) {
+#else
   __aicore__ inline void ExecuteSwiGluGrad(const TaskDesc &task_desc) {
+#endif
     if (GetSwiGluTaskIteration(task_desc) == SwiGluTaskIteration::TILED) {
       ExecuteSwiGluGradLegacy(task_desc);
       return;
