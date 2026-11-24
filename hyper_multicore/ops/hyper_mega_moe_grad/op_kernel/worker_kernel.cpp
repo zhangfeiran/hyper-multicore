@@ -238,6 +238,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
     early_dz_groups_ = getExtraValueFromTiling(input_list[TILING_IDX], 2) / ep;
     if (early_dz_groups_ == 0 || early_dz_groups_ > max_groups) AscendC::Trap();
+    const auto group_ends = reinterpret_cast<const __gm__ int64_t *>(input_list[19]);
     // The odd AIVs can own two tiles per expert when even AIVs merge dW.
     constexpr uint32_t kTasksPerExpert = 2;
     TaskId task_ids[max_groups][kTasksPerExpert];
@@ -250,7 +251,15 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
       if (task.task_type != TaskType::TASK_SWI_GLU_GRAD ||
           GetSwiGluTaskIteration(task) != SwiGluTaskIteration::PERSISTENT_LANES) continue;
       const uint32_t expert = SwiGluGradExpert(task, early_dz_groups_);
-      if (task.task_split_num / early_dz_groups_ > 64 || task_counts[expert] >= kTasksPerExpert) continue;
+      const uint32_t lanes = task.task_split_num / early_dz_groups_;
+      if (lanes > 64 || task_counts[expert] >= kTasksPerExpert) continue;
+      if (task.task_split_value == 0) AscendC::Trap();
+      const auto rows = group_ends[expert] - (expert == 0 ? 0 : group_ends[expert - 1]);
+      const auto lane = task.task_index % lanes;
+      // Keep the task containing a short final tile on the ordinary path,
+      // which owns the mutable per-AIV tail tiling.
+      if (rows == 0 || (rows % task.task_split_value != 0 &&
+                        (rows / task.task_split_value) % lanes == lane)) continue;
       task_ids[expert][task_counts[expert]++] = id;
       pending |= 1U << expert;
     }
@@ -274,8 +283,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         if (!IsMoeTaskOptionsValid(task, WORKSPACE_IDX)) AscendC::Trap();
         const uint64_t start = MulticoreMoE::RecomputeTraceStart(trace_);
         ExecuteSwiGluGrad<true>(task);
-        MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::EARLY_SWIGLU_GRAD, start, expert);
-        const uint32_t lane = task.task_index % (task.task_split_num / early_dz_groups_);
+        const uint32_t lanes = task.task_split_num / early_dz_groups_;
+        const uint32_t lane = task.task_index % lanes;
+        MulticoreMoE::RecordRecomputeStage(trace_, MulticoreMoE::RecomputeStage::EARLY_SWIGLU_GRAD, start,
+                                           expert, lane, lanes);
         if (!(early_dz_experts_ & bit)) early_dz_lanes_[expert] = 0;
         early_dz_lanes_[expert] |= uint64_t{1} << lane;
         if (task_counts[expert] == 0) pending &= ~bit;
