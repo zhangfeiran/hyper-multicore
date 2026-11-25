@@ -70,9 +70,17 @@ __aicore__ inline bool IsTransportTaskOptionsValid(const TaskDesc &task, uint32_
   constexpr uint32_t scalar_bits = static_cast<uint32_t>(MegaMoeTransportPayload::TOKENS_WITH_PROBABILITIES) |
       static_cast<uint32_t>(MegaMoeTransportPayload::TOKENS_WITH_PROBABILITY_GRADIENTS);
   constexpr uint32_t allowed = static_cast<uint32_t>(ShmemTaskPartition::RUNTIME_ROWS) | scalar_bits |
-      static_cast<uint32_t>(ShmemTransferEngine::UDMA);
+      static_cast<uint32_t>(ShmemTransferEngine::UDMA)
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+      | SHMEM_UDMA_QP1
+#endif
+      ;
   if ((task.extra_value_1 & ~allowed) != 0) return false;
   const auto payload = GetMegaMoeTransportPayload(task);
+  if (GetShmemUdmaQp(task) &&
+      (task.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL ||
+       GetShmemTransferEngine(task) != ShmemTransferEngine::UDMA ||
+       payload != MegaMoeTransportPayload::TOKENS)) return false;
   if (static_cast<uint32_t>(payload) == scalar_bits) return false;
   if (task.task_type == TaskType::TASK_SHMEM_GET_MEM &&
       payload == MegaMoeTransportPayload::TOKENS_WITH_PROBABILITY_GRADIENTS) return false;

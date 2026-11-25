@@ -173,6 +173,11 @@ class MegaMoeExperts(MulticoreModule):
         planner = tuning.expert_placement
         if planner is not None and not isinstance(planner, BasePlanner):
             raise TypeError("expert_placement must be a BasePlanner or None")
+        if scheduler.udma_qp_policy and (
+            precision != "bf16" or tuning.dispatch_mode != "push" or planner is not None
+            or numerics.apply_probs_before_fc2
+        ):
+            raise ValueError("udma_qp_policy requires home-only BF16 Push with after-FC2 weighting")
         if tuning.replica_bank not in ("shared", "dedicated"):
             raise ValueError("replica_bank must be shared or dedicated")
         if tuning.replica_bank == "dedicated" and planner is None:
@@ -231,6 +236,8 @@ class MegaMoeExperts(MulticoreModule):
             "indexed_push": indexed_push,
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
+            "math_dependency_poll_interval_us": scheduler.math_dependency_poll_interval_us,
+            "udma_qp_policy": scheduler.udma_qp_policy,
             "schedule_policy": scheduler.policy or "auto",
             "batch_experts": bool(scheduler.batch_experts),
             "nominal_schedule": bool(scheduler.nominal_schedule),

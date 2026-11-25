@@ -194,12 +194,12 @@ __aicore__ inline void get_complete(GM_ADDR destination, GM_ADDR source, int64_t
 
 /**
  * @brief Complete one PUT before publishing its separate remote-ready Signal.
- * @pre UDMA callers exclusively own the peer's QP0 across post and quiet.
+ * @pre UDMA callers exclusively own the selected peer and QP across post and quiet.
  * @note Return permits source reuse; no expert, credit or task policy is implied.
  */
 template <typename T>
 __aicore__ inline void put_complete(GM_ADDR destination, GM_ADDR source, int64_t elements,
-                                  int32_t peer, TransferEngine engine) {
+                                  int32_t peer, TransferEngine engine, uint32_t qp = 0) {
   if (elements < 0 || static_cast<uint64_t>(elements) > ~uint64_t{0} / sizeof(T)) AscendC::Trap();
   if (elements == 0) return;
   if (peer == my_pe()) {
@@ -218,7 +218,8 @@ __aicore__ inline void put_complete(GM_ADDR destination, GM_ADDR source, int64_t
   }
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
   if (engine == TransferEngine::Udma) {
-    put_udma<T>(destination, source, elements, peer, 0);
+    if (qp != 0 && qp >= udma_qp_count()) AscendC::Trap();
+    put_udma<T>(destination, source, elements, peer, qp);
     return;
   }
 #endif

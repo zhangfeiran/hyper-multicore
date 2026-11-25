@@ -3,7 +3,7 @@ import os
 from functools import lru_cache
 
 from hyper_multicore.scheduler.config import TaskType
-from hyper_multicore.tasks.alltoall import set_transfer_engine
+from hyper_multicore.tasks.alltoall import SHMEM_UDMA_QP1, set_transfer_engine
 
 TRANSPORT_TASKS = (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM)
 
@@ -31,18 +31,24 @@ def requested_transport() -> str | None:
     return "udma" if engine == "mte_udma" else "mte"
 
 
-def transport_queues(cfg, spec, task_ids):
-    """Preserve RATR order on each QP0 owner and distribute independent copies.
+def transport_queues(cfg, spec, task_ids, *, combine_position=None):
+    """Preserve RATR order on each peer and QP, and distribute independent copies.
 
     This is a MoE planning policy, not a SHMEM hardware requirement. Different
     peers remain independent; all posts and quiet calls for one UDMA peer share
-    one odd AIV owner. MTE Pull can parallelize disjoint reads of a remote source.
+    one odd AIV owner by default. MTE Pull can parallelize disjoint remote reads.
     """
     lanes = spec.num_cube_cores
     vectors = [[] for _ in range(2 * lanes)]
     peer_owners = {peer: 2 * (((peer - spec.rank_id) % spec.ep_size) % lanes) + 1
                    for peer in range(spec.ep_size) if peer != spec.rank_id}
     idle = [worker for worker in range(1, 2 * lanes, 2) if worker not in peer_owners.values()]
+    split_owners = {}
+    if spec.udma_qp_policy:
+        if len(idle) <= len(peer_owners) or spec.transport_engine != "udma":
+            raise ValueError("Two UDMA queues per peer require an additional AIV for self traffic")
+        split_owners = dict(zip(peer_owners, idle[:len(peer_owners)], strict=True))
+        idle = idle[len(peer_owners):]
     self_workers = idle or list(range(1, 2 * lanes, 2))
     read_lanes = max(1, lanes // spec.ep_size)
     for tid in task_ids:
@@ -67,6 +73,12 @@ def transport_queues(cfg, spec, task_ids):
         else:
             worker = peer_owners[peer]
         set_transfer_engine(task, spec.transport_engine)
+        if peer in split_owners:
+            use_qp1 = (task.outputs[0].input_position == combine_position
+                       if spec.udma_qp_policy == "phase" else local_slot % 2 != 0)
+            if use_qp1:
+                worker = split_owners[peer]
+                task.extra_value_1 |= SHMEM_UDMA_QP1
         # Preserve the previously effective runtime wait, without borrowing the engine bit.
         task.dependency_poll_interval_us = 1 if spec.transport_engine == 'udma' else 0
         vectors[worker].append(tid)
@@ -87,5 +99,6 @@ def validate_transport_owners(cfg, spec, vectors):
             peer = task.task_index // (task.task_split_num // spec.ep_size)
             if peer == spec.rank_id:
                 continue
-            if owners.setdefault(peer, worker) != worker:
-                raise ValueError(f"Multiple AIV owners of peer {peer}/QP0")
+            qp = int(bool(task.extra_value_1 & SHMEM_UDMA_QP1))
+            if owners.setdefault((peer, qp), worker) != worker:
+                raise ValueError(f"Multiple AIV owners of peer {peer}/QP{qp}")

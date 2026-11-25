@@ -69,6 +69,8 @@ class MegaMoeSpec:
     schedule_policy: str = "auto"
     lowering: str = "auto"
     compact_pull: bool = False
+    math_dependency_poll_interval_us: int | None = None
+    udma_qp_policy: str | None = None
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -205,6 +207,13 @@ def bind_mega_moe_spec(
     transport_engine = specification.get("transport_engine", "mte")
     if transport_engine == "udma" and architecture != 3510:
         raise ValueError("UDMA expert transport requires arch35")
+    interval = specification.get("math_dependency_poll_interval_us")
+    if interval is not None and architecture != 3510:
+        raise ValueError("math_dependency_poll_interval_us requires arch35")
+    qp_policy = specification.get("udma_qp_policy")
+    if qp_policy and (architecture != 3510 or transport_engine == "mte"
+                      or ep_size <= 1 or 2 * (ep_size - 1) >= core_spec.num_cube_cores):
+        raise ValueError("udma_qp_policy requires arch35 and enough AIV peers for two queues per peer")
 
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
@@ -246,4 +255,6 @@ def bind_mega_moe_spec(
         schedule_policy=specification.get("schedule_policy", "auto"),
         lowering=specification.get("lowering", "auto"),
         compact_pull=specification.get("compact_pull", False),
+        math_dependency_poll_interval_us=interval,
+        udma_qp_policy=qp_policy,
     )

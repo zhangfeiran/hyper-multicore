@@ -67,7 +67,7 @@ __aicore__ inline void ExecuteTransfer(const MulticoreRuntime::TaskDesc &task, G
     auto dst = inputs[task.outputs[0].input_position] + (destination + first) * sizeof(T);
     auto src = inputs[task.inputs[1].input_position] + (source + first) * sizeof(T);
     if (pull) plane::get_complete<T>(dst, src, count, peer, engine);
-    else plane::put_complete<T>(dst, src, count, peer, engine);
+    else plane::put_complete<T>(dst, src, count, peer, engine, MulticoreRuntime::GetShmemUdmaQp(task));
     // Finish every payload before the original data credit. The RMA provider
     // supplies complete semantics even when token and scalar engines differ.
     TransferProbability(task, inputs, first, count, source, destination, hidden, peer, engine, pull);

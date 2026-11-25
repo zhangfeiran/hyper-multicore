@@ -12,8 +12,12 @@ enum class ShmemTaskPartition : uint32_t {
   RUNTIME_ROWS = 2,
 };
 enum class ShmemTransferEngine : uint32_t { MTE = 0, UDMA = 16 };
+constexpr uint32_t SHMEM_UDMA_QP1 = 1U << 5;
 inline __aicore__ ShmemTransferEngine GetShmemTransferEngine(const TaskDesc &task) {
   return static_cast<ShmemTransferEngine>(task.extra_value_1 & 16U);
+}
+inline __aicore__ uint32_t GetShmemUdmaQp(const TaskDesc &task) {
+  return (task.extra_value_1 & SHMEM_UDMA_QP1) ? 1 : 0;
 }
 }  // namespace MulticoreRuntime
 #endif  // HYPER_MULTICORE_OPS_COMMON_SHMEM_TASK_OPTIONS_H_

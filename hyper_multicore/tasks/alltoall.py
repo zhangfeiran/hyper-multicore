@@ -162,6 +162,9 @@ class ShmemTransferEngine(IntEnum):
     UDMA = 16
 
 
+SHMEM_UDMA_QP1 = 1 << 5
+
+
 def set_transfer_engine(task: TaskDescC, engine: str) -> None:
     """Encode an engine without touching partition, scalar payload or runtime fields."""
     if engine not in ("mte", "udma"):

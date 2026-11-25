@@ -8,7 +8,7 @@ import struct
 from types import MappingProxyType
 
 from hyper_multicore.experimental import MegaMoeSchedulerOptions
-from hyper_multicore.scheduler.config import TaskType
+from hyper_multicore.scheduler.config import FAST_DEPENDENCY_POLL_INTERVAL_US, TaskType
 from hyper_multicore.scheduler.runtime import cube_task_index_offset, serialize_runtime_config
 from hyper_multicore.scheduler.worker_queues import install_worker_queues
 from .transport import TRANSPORT_TASKS, transport_queues
@@ -28,6 +28,13 @@ def validate_schedule_options(options):
     value = options.queue_ready_lookahead
     if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value not in (0, 1, 8)):
         raise ValueError('MegaMoE queue ready lookahead must be 0, 1 or 8')
+    interval = options.math_dependency_poll_interval_us
+    if interval is not None and (
+        not isinstance(interval, int) or isinstance(interval, bool) or not 0 <= interval < 2**32
+    ):
+        raise ValueError("math_dependency_poll_interval_us must fit uint32")
+    if options.udma_qp_policy not in (None, "phase", "tile"):
+        raise ValueError("udma_qp_policy must be phase, tile or None")
     if options.lowering not in ('auto', 'dense', 'compact'):
         raise ValueError('MegaMoE lowering must be auto, dense or compact')
     for name, flag in (('batch_experts', options.batch_experts), ('nominal_schedule', options.nominal_schedule)):
@@ -182,17 +189,25 @@ def configure_expert_queues(
         _reserve_replica_workers(math, mx_gradient_helpers=mx_gradient_helpers)
     communication = [tid for tid in cfg.vector_task_indices[:cfg.task_index_num[1]]
                      if cfg.all_tasks[tid].task_type in (*TRANSPORT_TASKS, TaskType.TASK_TERMINATE)]
-    vectors = transport_queues(cfg, spec, communication)
-    if spec.architecture == 3510 and spec.precision == 'mxfp8' and spec.transport_engine == 'udma':
-        # These queues own arithmetic dependencies only. Transport keeps its QP0 polling interval.
+    combine_position = graph.get_op("combine").param_positions[-1] if spec.udma_qp_policy else None
+    vectors = transport_queues(cfg, spec, communication, combine_position=combine_position)
+    interval = spec.math_dependency_poll_interval_us
+    if interval is None and spec.precision == 'mxfp8' and spec.transport_engine == 'udma':
+        interval = FAST_DEPENDENCY_POLL_INTERVAL_US
+    if interval:
         for queue in (*cubes, *math):
             for tid in queue:
-                cfg.all_tasks[tid].dependency_poll_interval_us = 5
+                cfg.all_tasks[tid].dependency_poll_interval_us = interval
     for queue, compute in zip(vectors, math):
         queue.extend(compute)
     result = install_worker_queues(cfg, cubes, vectors, cube_ready_depth=spec.ready_depth or 0,
                                    vector_ready_depths=[(spec.ready_depth or 0) if i % 2 == 0 else 0
                                                         for i in range(2 * stages.cores)])
+    if spec.math_dependency_poll_interval_us:
+        for queue in result.worker_queues[:stages.cores]:
+            queue.poll_interval_us = spec.math_dependency_poll_interval_us
+        for queue in result.worker_queues[stages.cores::2]:
+            queue.poll_interval_us = spec.math_dependency_poll_interval_us
     result.schedule_info = {'policy': spec.schedule_policy, 'precision': spec.precision,
                             'phase': 'forward' if forward else 'backward',
                             'ep_size': spec.ep_size, 'ep_rank': spec.rank_id,

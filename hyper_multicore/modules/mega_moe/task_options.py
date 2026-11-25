@@ -17,7 +17,7 @@ from enum import IntEnum
 from typing import Any
 
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
-from hyper_multicore.tasks.alltoall import ShmemTaskPartition, ShmemTransferEngine
+from hyper_multicore.tasks.alltoall import SHMEM_UDMA_QP1, ShmemTaskPartition, ShmemTransferEngine
 from hyper_multicore.scheduler.config import TaskType
 from hyper_multicore.tasks.swiglu import SwiGluClampPosition, SwiGluTaskIteration
 from .probability_abi import PROBABILITY_POSITION_BACKWARD, PROBABILITY_POSITION_FORWARD, ProbabilityLayout
@@ -39,7 +39,8 @@ class MegaMoeTransportPayload(IntEnum):
 _ACTIVATION_MASK = int(SwiGluTaskIteration.PERSISTENT_LANES | SwiGluClampPosition.AFTER_SILU
                        | MegaMoeActivationWeighting.BEFORE_FC2)
 _TRANSPORT_MASK = int(ShmemTaskPartition.RUNTIME_ROWS | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITIES
-                      | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS | ShmemTransferEngine.UDMA)
+                      | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS | ShmemTransferEngine.UDMA
+                      | SHMEM_UDMA_QP1)
 _GMM_MODES = frozenset(GroupedMatmulTaskMode)
 _ACTIVATION_PORT = {TaskType.TASK_SWI_GLU: PROBABILITY_POSITION_FORWARD,
                     TaskType.TASK_SWI_GLU_GRAD: PROBABILITY_POSITION_BACKWARD}
@@ -71,6 +72,12 @@ def _transport_options(task: Any) -> bool:
     if task.extra_value_1 & ~_TRANSPORT_MASK:
         raise ValueError(f"invalid transport flags {task.extra_value_1:#x}")
     payload = transport_payload(task)
+    if task.extra_value_1 & SHMEM_UDMA_QP1 and (
+        not task.extra_value_1 & ShmemTransferEngine.UDMA
+        or task.task_type != TaskType.TASK_SHMEM_PUT_MEM_SIGNAL
+        or payload != MegaMoeTransportPayload.TOKENS
+    ):
+        raise ValueError("QP1 requires a token-only UDMA PUT")
     if (task.task_type == TaskType.TASK_SHMEM_GET_MEM
             and payload == MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS):
         raise ValueError("GET cannot return probability gradients")

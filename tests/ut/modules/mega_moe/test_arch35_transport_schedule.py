@@ -28,6 +28,7 @@ from hyper_multicore.shmem._ordering import SubmissionOrder
 from hyper_multicore.modules.mega_moe.backends.mxfp8.graph import build_mxfp8_runtime
 from hyper_multicore.scheduler.config import TaskType
 from hyper_multicore.scheduler.runtime import serialize_runtime_config
+from hyper_multicore.tasks.alltoall import SHMEM_UDMA_QP1
 
 
 @pytest.mark.parametrize('ep,mode', [(4, 'push'), (8, 'pull'), (64, 'push')])
@@ -55,6 +56,60 @@ def test_qp0_owners_and_complete_bf16_work(ep, mode):
                         self_workers.add(worker)
         assert len(self_workers) > 1
         assert all(q.ready_depth == 8 for q in cfg.worker_queues[:32])
+
+
+def test_bf16_math_poll_interval_leaves_transport_queues_unchanged():
+    """Apply the experimental interval only to arithmetic dependencies in F and B."""
+    spec = MegaMoeSpec(4096, 5120, 1792, 96, 8, 5.0, 163840, 16, None, 0, 32,
+                       architecture=3510, transport_engine="udma", ready_depth=1,
+                       dispatch_split=4096, combine_split=4096)
+    baseline = _build_runtime_artifacts(spec)
+    tuned = _build_runtime_artifacts(replace(spec, math_dependency_poll_interval_us=5))
+    math_types = {TaskType.TASK_GROUPED_MATMUL, TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD}
+    for original, candidate in ((baseline[1], tuned[1]), (baseline[3], tuned[3])):
+        assert original.task_num == candidate.task_num
+        assert tuple(original.cube_task_indices) == tuple(candidate.cube_task_indices)
+        assert tuple(original.vector_task_indices) == tuple(candidate.vector_task_indices)
+        for worker, queue in enumerate(candidate.worker_queues):
+            math_queue = worker < spec.num_cube_cores or (worker - spec.num_cube_cores) % 2 == 0
+            expected_interval = 5 if math_queue else original.worker_queues[worker].poll_interval_us
+            assert queue.poll_interval_us == expected_interval
+        for index in range(original.task_num):
+            original_task = original.all_tasks[index]
+            revised_task = candidate.all_tasks[index]
+            assert original_task.task_type == revised_task.task_type
+            expected = 5 if original_task.task_type in math_types else original_task.dependency_poll_interval_us
+            assert revised_task.dependency_poll_interval_us == expected
+
+
+@pytest.mark.parametrize("policy", ("phase", "tile"))
+def test_bf16_push_splits_each_remote_peer_into_two_exclusive_queues(policy):
+    """Retain all dispatch and combine credits while binding one AIV per peer and QP."""
+    spec = MegaMoeSpec(4096, 5120, 1792, 96, 8, 5.0, 163840, 16, None, 7, 32,
+                       architecture=3510, transport_engine="udma", udma_qp_policy=policy,
+                       dispatch_split=2048, combine_split=2048)
+    forward_graph, forward, backward_graph, backward = _build_runtime_artifacts(spec)
+    for graph, config in ((forward_graph, forward), (backward_graph, backward)):
+        queues = [list(config.vector_task_indices[q.begin:q.end]) for q in config.worker_queues[32:]]
+        validate_transport_owners(config, spec, queues)
+        combine_position = graph.get_op("combine").param_positions[-1]
+        owners = {}
+        for worker, queue in enumerate(queues):
+            for tid in queue:
+                task = config.all_tasks[tid]
+                if task.task_type not in TRANSPORT_TASKS:
+                    continue
+                peer, slot = divmod(task.task_index, task.task_split_num // spec.ep_size)
+                qp = int(bool(task.extra_value_1 & SHMEM_UDMA_QP1))
+                if peer == spec.rank_id:
+                    assert qp == 0
+                    continue
+                assert worker % 2 == 1
+                expected_qp = int(task.outputs[0].input_position == combine_position) if policy == "phase" else slot % 2
+                assert qp == expected_qp
+                owners[peer, qp] = worker
+        assert len(owners) == len(set(owners.values())) == 2 * (spec.ep_size - 1)
+        serialize_runtime_config(config)
 
 
 def test_qp0_submission_order_reuses_completion_event():
