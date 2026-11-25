@@ -267,6 +267,7 @@ TILING_DATA_FIELD_DEF(int64_t, runtimeConfigBytes);
 TILING_DATA_FIELD_DEF(int64_t, eventCounterBytes);
 TILING_DATA_FIELD_DEF(int64_t, indexedSourceRows);
 TILING_DATA_FIELD_DEF(int64_t, indexedRouteFenced);
+TILING_DATA_FIELD_DEF(int64_t, indexedSourceSlots);
 TILING_DATA_FIELD_DEF_STRUCT(TilingData, tilingData);
 TILING_DATA_FIELD_DEF_STRUCT(SwiGluTilingData, swiGluTilingData);
 TILING_DATA_FIELD_DEF_STRUCT(MatmulTilingData, matmulTilingData);

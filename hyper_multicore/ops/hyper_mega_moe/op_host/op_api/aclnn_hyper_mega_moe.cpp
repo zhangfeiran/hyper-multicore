@@ -109,4 +109,4 @@ aclnnStatus aclnnHyperMegaMoe(void *workspace, uint64_t workspaceSize, aclOpExec
 #endif
 
 // Indexed dispatch requires the matching vendor tiler and device object.
-extern "C" __attribute__((visibility("default"))) int HmcA3IndexedPushVersion() { return 1; }
+extern "C" __attribute__((visibility("default"))) int HmcA3IndexedPushVersion() { return 2; }

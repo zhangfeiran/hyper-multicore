@@ -21,9 +21,14 @@ if TYPE_CHECKING:
 
 
 MAX_INDEXED_TOKENS = 16384
+MAX_INDEXED_EXPERTS = 512
+MAX_INDEXED_TOP_K = 8
+MAX_INDEXED_HIDDEN = 8192
+INDEXED_HIDDEN_ALIGNMENT = 16
 COUNT_FENCE_BIT = 1 << 10
 REPLAY_FENCE_BIT = 1 << 7
-_SOURCE_BITS = 17
+_SOURCE_BITS = 21
+_TOP_K_SHIFT = 17
 _FENCED = 1 << 16
 
 
@@ -46,7 +51,7 @@ def _ordered_operator():
     vendor = require_multicore_environment() / "op_api" / "lib" / "libcust_opapi.so"
     api = ctypes.CDLL(str(vendor), mode=ctypes.RTLD_LOCAL)
     version = getattr(api, "HmcA3IndexedPushVersion", None)
-    if version is None or version() != 1:
+    if version is None or version() != 2:
         return None
     return namespace.a3_ordered_replica_route, library
 
@@ -56,9 +61,10 @@ def qualify(spec: MegaMoeSpec, enabled: bool, rank_nodes: tuple[int, ...]) -> bo
     if (not enabled or len(rank_nodes) != spec.ep_size or len(set(rank_nodes)) != 1
             or spec.architecture != 2201 or spec.precision != "bf16"
             or not spec.auto_tokens or spec.dispatch_mode != "push" or spec.transport_engine != "mte"
-            or spec.expert_weight_layout != "EOI" or spec.apply_probs_before_fc2 or spec.batch_experts
-            or (spec.ep_size, spec.num_experts, spec.top_k, spec.hidden_size, spec.intermediate_size)
-            != (16, 128, 8, 4096, 1408)):
+            or spec.apply_probs_before_fc2 or spec.batch_experts
+            or not 1 <= spec.top_k <= min(MAX_INDEXED_TOP_K, spec.num_experts)
+            or spec.num_experts > MAX_INDEXED_EXPERTS
+            or not supports_hidden_size(spec.hidden_size)):
         return False
     local_error = None
     try:
@@ -76,15 +82,21 @@ def qualify(spec: MegaMoeSpec, enabled: bool, rank_nodes: tuple[int, ...]) -> bo
     return all(support)
 
 
-def ordered_count(ids: torch.Tensor, mask: int):
+def supports_hidden_size(hidden_size: int) -> bool:
+    """Check the A3 BF16 row alignment and indexed-transfer UB budget."""
+    return 0 < hidden_size <= MAX_INDEXED_HIDDEN and hidden_size % INDEXED_HIDDEN_ALIGNMENT == 0
+
+
+def ordered_count(ids: torch.Tensor, num_experts: int, mask: int):
     """Return the validated local wire, stable inverse and stable source rows."""
     operator, library = _ordered_operator()
-    return operator(ids, mask, library)
+    return operator(ids, num_experts, mask, library)
 
 
 def note_source_ready(ids: torch.Tensor) -> None:
     """Mark final Router IDs on their producer stream before expert weights materialize."""
-    if (requested() and ids.device.type == "npu" and ids.ndim == 2 and ids.shape[1] == 8
+    if (requested() and ids.device.type == "npu" and ids.ndim == 2
+            and 1 <= ids.shape[1] <= MAX_INDEXED_TOP_K
             and 0 < ids.shape[0] <= MAX_INDEXED_TOKENS
             and not ids.is_inference() and not hasattr(ids, "_hmc_indexed_source_ready")):
         ready = torch.npu.Event()
@@ -105,12 +117,14 @@ def take_source_ready(ids: torch.Tensor):
 
 def pack_dispatch_offsets(offsets: torch.Tensor, source_rows: torch.Tensor) -> torch.Tensor:
     """Append the int32 source rows after the ordinary int64 offsets."""
+    if source_rows.numel() % 2:
+        source_rows = torch.cat((source_rows, source_rows.new_zeros(1)))
     return torch.cat((offsets, source_rows.view(torch.int64)))
 
 
-def launch_sequence(plan_tokens: int, source_rows: int, fenced: bool) -> int:
-    """Encode the source extent and readiness in the private launch attribute."""
-    return -((plan_tokens << _SOURCE_BITS) | source_rows | (_FENCED if fenced else 0))
+def launch_sequence(plan_tokens: int, source_rows: int, top_k: int, fenced: bool) -> int:
+    """Encode the source extent, Top-K and readiness in the private launch attribute."""
+    return -((plan_tokens << _SOURCE_BITS) | (top_k << _TOP_K_SHIFT) | source_rows | (_FENCED if fenced else 0))
 
 
 @dataclass(frozen=True)

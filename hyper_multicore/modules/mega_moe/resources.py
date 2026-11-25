@@ -85,9 +85,8 @@ class _MegaMoeExecutionResources:
                     moe_transport.require_queue_backend()
                 fused_recompute = specification.get("a3_recompute", False)
                 if fused_recompute:
-                    if (self.spec.architecture != 2201 or transport != "mte"
-                            or self.spec.expert_weight_layout != "EOI"):
-                        raise ValueError("Fused recompute requires A3 BF16 EOI MTE Push")
+                    if self.spec.architecture != 2201 or transport != "mte":
+                        raise ValueError("Fused recompute requires A3 BF16 MTE Push")
                     a3_recompute.require_vendor()
                 self.plan = self._initial_plan(tensor)
                 self.workspace = MegaMoeWorkspace(

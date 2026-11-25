@@ -82,6 +82,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   const int64_t seqSize = indexed ? marker >> A3_INDEXED_SOURCE_BITS : encodedSeq;
   const int64_t sourceRows = marker & A3_INDEXED_SOURCE_MASK;
   const bool routeFenced = (marker & A3_INDEXED_ROUTE_FENCED) != 0;
+  const int64_t topK = (marker >> A3_INDEXED_TOP_K_SHIFT) & A3_INDEXED_TOP_K_MASK;
+  const int64_t sourceSlots = sourceRows * topK;
   if (rankId < 0 || ep <= 0 || expertNum <= 0 || expertNum % ep != 0 || hiddenSize <= 0 || seqSize <= 0) {
     OP_LOGE(context->GetNodeName(),
             "Invalid topology: rankId=%ld, ep=%ld, expertNum=%ld, hiddenSize=%ld, seqSize=%ld.", rankId, ep,
@@ -113,8 +115,14 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     auto source = context->GetInputShape(2);
     OP_CHECK_NULL_WITH_CONTEXT(context, indices);
     OP_CHECK_NULL_WITH_CONTEXT(context, source);
+    if (input0DType != ge::DT_BF16 || hiddenSize > A3_INDEXED_MAX_HIDDEN ||
+        hiddenSize % A3_INDEXED_HIDDEN_ALIGNMENT != 0 || topK < 1 || topK > A3_INDEXED_MAX_TOP_K ||
+        topK > expertNum || sourceRows <= 0 || sourceRows > A3_INDEXED_MAX_TOKENS || sourceRows > seqSize) {
+      OP_LOGE(context->GetNodeName(), "Unsupported A3 indexed dispatch geometry.");
+      return ge::GRAPH_FAILED;
+    }
     const auto expectedElements = sourceRows * hiddenSize;
-    const auto expectedWords = expertNum + sourceRows * A3_INDEXED_TOP_K / 2;
+    const auto expectedWords = expertNum + (sourceSlots + 1) / 2;
     const auto sourceStorage = source->GetStorageShape().GetShapeSize();
     const auto sourceOrigin = source->GetOriginShape().GetShapeSize();
     const auto indexStorage = indices->GetStorageShape().GetShapeSize();
@@ -123,9 +131,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
                             (sourceStorage == expectedElements || sourceOrigin == expectedElements);
     const bool indexFits = indexStorage >= expectedWords &&
                            (indexStorage == expectedWords || indexOrigin == expectedWords);
-    if (input0DType != ge::DT_BF16 || ep != 16 || expertNum < 128 || expertNum > 256 ||
-        hiddenSize != 4096 || sourceRows <= 0 || sourceRows > A3_INDEXED_MAX_TOKENS ||
-        sourceRows > seqSize || !sourceFits || !indexFits) {
+    if (!sourceFits || !indexFits) {
       OP_LOGE(context->GetNodeName(),
               "Invalid A3 indexed dispatch: dtype=%d ep=%ld experts=%ld hidden=%ld tokens=%ld plan=%ld "
               "source=%ld/%ld (expected %ld) offsets=%ld/%ld (expected %ld).",
@@ -136,6 +142,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   }
   tiling.set_indexedSourceRows(sourceRows);
   tiling.set_indexedRouteFenced(routeFenced);
+  tiling.set_indexedSourceSlots(sourceSlots);
 
   auto rawTilingData = context->GetRawTilingData();
   OP_CHECK_NULL_WITH_CONTEXT(context, rawTilingData);

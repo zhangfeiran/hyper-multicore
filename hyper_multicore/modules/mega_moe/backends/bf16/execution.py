@@ -65,6 +65,9 @@ def forward(
         output = _execute_mega_moe_without_autograd(
             topk_weights, *weights, route, plan, resources.workspace,
             workspace_claimed=pull, save_activation=save, **options)
+        if record is not None and record.defer_expert_recompute:
+            record.retain_output(output, topk_weights)
+        _record_indexed_push(route, resources)
         if record is not None and binding is not route.weight_binding:
             # Both bank layouts save the same owned guest records. The
             # original binding still selects its own replay protocol.
@@ -80,13 +83,16 @@ def forward(
     checkpoint_replay = forward_copy_phase()
     if checkpoint_replay is not None:
         if (not pull and not before_fc2 and resources.spec.architecture == 2201
-                and resources.spec.transport_engine == "mte" and resources.spec.expert_weight_layout == "EOI"):
+                and resources.spec.transport_engine == "mte"):
             options["checkpoint_replay"] = checkpoint_replay
         else:
             checkpoint_replay = None
     if record is not None and record.defer_expert_recompute:
-        if checkpoint_replay is None:
-            raise RuntimeError("Deferred expert recompute requires non-reentrant A3 BF16 EOI MTE Push")
+        if record.reentrant:
+            checkpoint_replay = True
+            options["checkpoint_replay"] = True
+        elif checkpoint_replay is None:
+            raise RuntimeError("Deferred expert recompute requires A3 BF16 MTE Push")
         options["deferred_recompute"] = record
     if binding is not None and binding.fused and resources.spec.architecture == 2201:
         replay_weights = guest_weight_replay(record)
@@ -97,11 +103,8 @@ def forward(
         hidden_flat, topk_ids, *weights, route, plan, resources.workspace,
         topk_weights=topk_weights if integrated_unpermute else None,
         workspace_claimed=pull, **options)
-    if route.indexed_dispatch_offsets is not None:
-        stats = resources.placement.statistics
-        stats["indexed_push_calls"] = stats.get("indexed_push_calls", 0) + 1
-        if route.count_fence is not None:
-            stats["indexed_count_fences"] = stats.get("indexed_count_fences", 0) + 1
+    if not (record is not None and record.defer_expert_recompute and checkpoint_replay):
+        _record_indexed_push(route, resources)
     if checkpoint_replay is False and resources.placement is not None:
         stats = resources.placement.statistics
         for field in ("original_dispatch_copies_skipped", "original_combine_copies_skipped"):
@@ -109,6 +112,15 @@ def forward(
     if not integrated_unpermute:
         output = restore_topk_output(output, route.unpermute_mapping, topk_weights)
     return output.reshape_as(hidden_states)
+
+
+def _record_indexed_push(route, resources) -> None:
+    """Count launches that consumed original tokens in the Push worker."""
+    if route.indexed_dispatch_offsets is not None:
+        stats = resources.placement.statistics
+        stats["indexed_push_calls"] = stats.get("indexed_push_calls", 0) + 1
+        if route.count_fence is not None:
+            stats["indexed_count_fences"] = stats.get("indexed_count_fences", 0) + 1
 
 
 def _save_replay_activations(record, spec, route, hidden: torch.Tensor, probs: torch.Tensor):

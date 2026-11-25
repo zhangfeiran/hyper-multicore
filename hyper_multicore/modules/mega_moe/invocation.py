@@ -61,9 +61,11 @@ def prepare_expert_invocation(
         if placement is not None:
             from hyper_multicore.modules.hot_replica.checkpoint import agree_replay, route_record  # pylint: disable=import-outside-toplevel
 
-            record, replay = route_record(resources)
+            defer_reentrant = resources.workspace.a3_fused_recompute and counts is None
+            record, replay = route_record(resources, defer_reentrant=defer_reentrant)
             if replay and agree_replay(
-                    record, hidden, ids, probs, counts, resources.spec, mask, weight_error=weight_error):
+                    record, hidden, ids, probs, counts, resources.spec, mask, weight_error=weight_error,
+                    defer_reentrant=defer_reentrant):
                 placement.statistics["route_replays"] += 1
                 route = record.route
                 if record.defer_expert_recompute:
@@ -91,7 +93,7 @@ def prepare_expert_invocation(
         options = {"autograd_mask": mask}
         if planner is not None:
             options["select_placement"] = partial(placement.select, planner=planner)
-            if record is not None and not replay and counts is None and mask & 1 and placement.indexed_push:
+            if counts is None and placement.indexed_push:
                 options["indexed_placement"] = True
             if placement.uses_placement_wire():
                 options["reuse_placement_geometry"] = resources.spec.ep_size * resources.spec.num_experts <= 16384

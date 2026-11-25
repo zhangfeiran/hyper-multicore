@@ -6,7 +6,7 @@
 
 namespace MulticoreMoE {
 constexpr int64_t kA3RecomputeSequence = int64_t{1} << 40;
-constexpr uint64_t kA3RecomputeCall = 0x41335245434f4d53ULL;
+constexpr uint64_t kA3RecomputeCall = 0x41335245434f4d35ULL;
 constexpr uint32_t kA3ForwardInputs = 26;
 constexpr uint32_t kRecomputeReadyWordsPerExpert = 16;
 constexpr uint32_t kMaxEarlyExpertsPerRank = 32;

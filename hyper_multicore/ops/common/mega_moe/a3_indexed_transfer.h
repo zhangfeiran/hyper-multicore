@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "a3_indexed_push.h"
 #include "data_plane/rma.h"
 #include "data_plane/sync.h"
 #include "kernel_operator.h"
@@ -14,27 +15,27 @@ namespace hyper_multicore {
 template <typename T>
 __aicore__ inline void PutIndexedRows(
     GM_ADDR target, int64_t target_offset, GM_ADDR source, __gm__ const int32_t *rows,
-    int64_t first, int64_t count, int64_t source_rows, int64_t peer, __gm__ int32_t *signal,
+    int64_t first, int64_t count, int64_t source_rows, int64_t hidden, int64_t peer, __gm__ int32_t *signal,
     bool publish = true) {
 #if !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
-  constexpr int64_t hidden = 4096;
-  constexpr int64_t row_bytes = hidden * sizeof(T);
+  const int64_t row_bytes = hidden * sizeof(T);
   constexpr int64_t kPackets = 4;
   __gm__ aclshmem_device_host_state_t *state = aclshmemi_get_state();
-  if (state->mte_config.aclshmem_ub != 0 || state->mte_config.ub_size != 2 * row_bytes) {
+  if (hidden <= 0 || hidden > MulticoreMoE::A3_INDEXED_MAX_HIDDEN ||
+      row_bytes % 32 != 0 || state->mte_config.aclshmem_ub != 0 || state->mte_config.ub_size != 2 * row_bytes) {
     AscendC::Trap();
   }
-  // This is an isolated AIV task. Its two 32 KiB ping-pong packets and
-  // 128 index words are disjoint, and no other AIV task shares its UB.
-  constexpr int64_t kGroupBytes = kPackets * row_bytes;
-  constexpr int64_t kBankBytes = 2 * kGroupBytes;
+  // Each AIV task owns two packets followed by its local index words.
+  const int64_t group_bytes = kPackets * row_bytes;
+  const int64_t bank_bytes = 2 * group_bytes;
   constexpr int64_t kGroupIndexRows = 128;
-  static_assert(kBankBytes + kGroupIndexRows * sizeof(int32_t) <= 192 * 1024);
+  static_assert(2 * kPackets * MulticoreMoE::A3_INDEXED_MAX_HIDDEN * sizeof(T) +
+                    kGroupIndexRows * sizeof(int32_t) <= 192 * 1024);
   auto target_row = reinterpret_cast<__gm__ T *>(target) + target_offset;
   auto receive = reinterpret_cast<__gm__ T *>(shmem_data_plane::remote_ptr(target_row, peer));
   if (receive == nullptr) AscendC::Trap();
   auto input = reinterpret_cast<__gm__ T *>(source);
-  auto ids = reinterpret_cast<__ubuf__ int32_t *>(kBankBytes);
+  auto ids = reinterpret_cast<__ubuf__ int32_t *>(bank_bytes);
   SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
   SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
   for (int64_t offset = 0; offset < count; offset += kGroupIndexRows) {
@@ -47,7 +48,7 @@ __aicore__ inline void PutIndexedRows(
       const int64_t base = offset + local;
       const bool odd = (base / kPackets) % 2 != 0;
       const TEventID event = odd ? EVENT_ID1 : EVENT_ID0;
-      auto packet = reinterpret_cast<__ubuf__ T *>(odd * kGroupBytes);
+      auto packet = reinterpret_cast<__ubuf__ T *>(odd * group_bytes);
       WaitFlag<HardEvent::MTE3_MTE2>(event);
       for (int64_t i = 0; i < n; ++i) {
         const int64_t source_row = ids[local + i];

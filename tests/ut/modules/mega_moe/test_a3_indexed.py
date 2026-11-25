@@ -67,7 +67,7 @@ def test_placed_route_reuses_count_fence_only_for_same_allocation(all_ready, reb
         torch.tensor(wire, dtype=torch.int32), None, "compute", prepare,
         lambda *_args, **kwargs: binding if kwargs["indexed"] else None,
         logical_inverse=order, logical_order=order, count_fence=fence,
-        indexed_readback=(route._RouteSummary(4, 128, 4), wire, [4, 4]),
+        indexed_readback=(route._RouteSummary(4, 128, 4), wire, [4, 4]), indexed_placement=True,
     )
     assert result.routed_tokens is hidden
     assert result.count_fence is (fence if all_ready and not rebound else None)
@@ -77,3 +77,12 @@ def test_placed_route_reuses_count_fence_only_for_same_allocation(all_ready, reb
     torch.testing.assert_close(result.indexed_dispatch_offsets[:4], native_offsets)
     torch.testing.assert_close(result.indexed_dispatch_offsets[4:].view(torch.int32),
                                order[placement.physical_to_logical])
+
+
+def test_odd_slot_count_keeps_logical_rows_outside_padding():
+    offsets = torch.tensor([0, 512, 1536], dtype=torch.int64)
+    rows = torch.tensor([4, 1, 2, 4, 0], dtype=torch.int32)
+    packed = a3_indexed.pack_dispatch_offsets(offsets, rows)
+    torch.testing.assert_close(packed[:offsets.numel()], offsets)
+    torch.testing.assert_close(packed[offsets.numel():].view(torch.int32)[:rows.numel()], rows)
+    assert packed.numel() == offsets.numel() + 3
