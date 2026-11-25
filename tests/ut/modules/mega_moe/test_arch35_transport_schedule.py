@@ -179,3 +179,35 @@ def test_bf16_communication_tiles_cover_short_and_tail_plans(tokens, mode):
         vectors = [list(config.vector_task_indices[q.begin:q.end]) for q in config.worker_queues[32:]]
         validate_transport_owners(config, spec, vectors)
         assert serialize_runtime_config(config)
+
+
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+def test_a5_w13_prioritizes_return_work_with_complete_cube_coverage(precision):
+    """Permit the terminal waiter while keeping W13 off dX's dependency chain."""
+    import struct
+    from hyper_multicore.modules.mega_moe.schedule import defer_local_w13
+    from hyper_multicore.scheduler.runtime import cube_task_index_offset
+
+    spec = MegaMoeSpec(4096, 5120, 1792, 64, 8, 2.5, 49152, 8, None, 0, 32,
+                       architecture=3510, precision=precision, transport_engine="udma",
+                       partial_weight_grad_dtype="float32", dispatch_split=4096,
+                       combine_split=4096, ready_depth=1)
+    if precision == "bf16":
+        config = _build_runtime_artifacts(spec)[3]
+    else:
+        config = build_mxfp8_runtime(spec, forward=False, home_experts=6, gradient_helpers=True,
+                                     independent_dx=True).config
+    offset, revised = defer_local_w13(config, 8, 6, (0, 3))
+    count = config.task_index_num[0]
+    after = struct.unpack(f"<{count}I", revised)
+    before = tuple(config.cube_task_indices[:count])
+    assert after != before and sorted(after) == sorted(before)
+    assert offset == cube_task_index_offset(config)
+    start, size = config.schedule_info["stages"]["dw_up"]
+    width = size // 8
+    delayed = {start + expert * width + lane for expert in (1, 2, 4, 5) for lane in range(width)}
+    for queue in config.worker_queues[:spec.num_cube_cores]:
+        positions = range(queue.begin, queue.end, queue.stride)
+        tasks = [before[position] for position in positions]
+        assert [after[position] for position in positions] == (
+            [task for task in tasks if task not in delayed] + [task for task in tasks if task in delayed])

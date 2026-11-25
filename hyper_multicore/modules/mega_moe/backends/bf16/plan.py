@@ -49,7 +49,7 @@ from hyper_multicore.modules.mega_moe.backends.bf16.forward.tiling_tables import
     get_down_proj_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
-from hyper_multicore.modules.mega_moe.schedule import configure_expert_queues
+from hyper_multicore.modules.mega_moe.schedule import configure_expert_queues, defer_local_w13
 from hyper_multicore.scheduler.config import (
     FAST_DEPENDENCY_POLL_INTERVAL_US,
     TaskSplitValue,
@@ -93,7 +93,7 @@ class MegaMoePlan:
     reuse_backward_dispatch: bool = False
     weight_grad_dtype: torch.dtype | None = None
     _recorded_streams: set = field(default_factory=set, repr=False, compare=False)
-    _w13_return_queues: dict[tuple[int, tuple[int, ...]], tuple[int, torch.Tensor]] = field(
+    _w13_return_queues: dict[tuple[int, tuple[int, ...]], tuple[int, torch.Tensor] | None] = field(
         default_factory=dict, repr=False, compare=False,
     )
 
@@ -138,6 +138,19 @@ class MegaMoePlan:
 
     def w13_return_queue(self, home: int, owners: tuple[int, ...]) -> tuple[int, torch.Tensor] | None:
         """Move full export/merge waves before local-only W13 after GateGrad."""
+        key = home, owners
+        if self.spec.architecture == 3510:
+            if key not in self._w13_return_queues:
+                if len(self._w13_return_queues) >= 32:
+                    del self._w13_return_queues[next(iter(self._w13_return_queues))]
+                config = self.bwd_diagnostics._runtime._host_config
+                revised = defer_local_w13(config, self.spec.local_experts, home, owners)
+                if revised is not None:
+                    offset, queue = revised
+                    self._w13_return_queues[key] = offset, _tensor_from_bytes(queue, self.bwd_runtime_config.device)
+                else:
+                    self._w13_return_queues[key] = None
+            return self._w13_return_queues.get(key)
         wave_layout = self._w13_cube_waves
         if wave_layout is None or len(owners) == home:
             return None
@@ -147,7 +160,6 @@ class MegaMoePlan:
         order = (*owners, *range(home, len(waves)), *(expert for expert in range(home) if expert not in owners))
         if order == tuple(range(len(waves))):
             return None
-        key = home, owners
         if key not in self._w13_return_queues:
             queue = np.asarray([waves[expert] for expert in order], dtype="<i4").tobytes()
             self._w13_return_queues[key] = offset, _tensor_from_bytes(queue, self.bwd_runtime_config.device)

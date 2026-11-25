@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from functools import partial
+import os
 from typing import Any
 
 import torch
@@ -198,10 +199,20 @@ class MXFP8Execution:
             if self.placement is None:
                 self._launch(buffers, plan.backward, events, plan, direction="backward")
             else:
+                backward = plan.backward
+                if os.environ.get("HMC_A5_W13_REMOTE_FIRST") == "1":
+                    home, rank = plan.home_experts, spec.rank_id
+                    bases = self.placement.copies_by_rank
+                    owners = tuple(sorted({expert % home for group in bases for expert in group
+                                           if expert >= 0 and expert // home == rank}))
+                    if owners or any(expert >= 0 for expert in bases[rank]):
+                        backward = backward.prioritize_w13(home, owners)
+                        if backward is not plan.backward:
+                            self.resources.placement.statistics["w13_prioritized_calls"] += 1
                 with self.weight_prefetch.lease((weight1, weight2), self.placement,
                                                 backward=True) as (guests, ready), \
                         self.gradient_pool.native_return(self.placement, plan.backward, (dw1, dw2)) as returns:
-                    self._launch([*buffers, *guests, ready, *returns], plan.backward, events, plan, direction="backward")
+                    self._launch([*buffers, *guests, ready, *returns], backward, events, plan, direction="backward")
             grad_hidden = multicore_ops.moe_token_permute_grad(
                 routed_buffer[:metadata.source_rows], mapping,
                 gradient.numel() // spec.hidden_size, spec.top_k,

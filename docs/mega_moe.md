@@ -224,6 +224,10 @@ A3 BF16 EOI MTE Push 上可同时设置 `defer_expert_recompute=True` 和 `defer
 以一次设备调用执行两段。该选项需匹配的原生制品，重放需要确定性输入、精确路由、概率和同代参数。
 已测的 HY106 单机配置还开启了三行梯度流水、专家级早发 dA、低频 AIV 轮询和有远端依赖的 W13 优先执行。
 
+Ascend 950 的 BF16 和 MXFP8 HotReplica Push 可用实验开关 `HMC_A5_W13_REMOTE_FIRST=1`。
+当专家有跨 rank 梯度返回且队列允许重排时，先执行涉及梯度返回的 W13，再执行只在本地使用的 W13。
+MXFP8 继续使用 FP32 根参数和 FP32 专家梯度。
+
 ### 旧 HotReplica 接口退役
 
 独立 Native EP 的 `HotReplica`、`plan_native()` 和旧输入预留参数 `source_token_bound` 已退役。

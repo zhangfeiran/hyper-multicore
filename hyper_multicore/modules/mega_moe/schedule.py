@@ -4,11 +4,12 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
+import struct
 from types import MappingProxyType
 
 from hyper_multicore.experimental import MegaMoeSchedulerOptions
 from hyper_multicore.scheduler.config import TaskType
-from hyper_multicore.scheduler.runtime import serialize_runtime_config
+from hyper_multicore.scheduler.runtime import cube_task_index_offset, serialize_runtime_config
 from hyper_multicore.scheduler.worker_queues import install_worker_queues
 from .transport import TRANSPORT_TASKS, transport_queues
 
@@ -197,6 +198,40 @@ def configure_expert_queues(
                             'ep_size': spec.ep_size, 'ep_rank': spec.rank_id,
                             'stages': dict(stages.ranges)}
     return result
+
+
+def defer_local_w13(config, experts: int, home: int, owners: tuple[int, ...]) -> tuple[int, bytes] | None:
+    """Keep return-related W13 work ahead of independent local-only gradients."""
+    stage = getattr(config, "schedule_info", {}).get("stages", {}).get("dw_up")
+    if stage is None or config.queue_layout != 2 or not 0 < home <= experts:
+        return None
+    start, size = stage
+    if size == 0 or size % experts:
+        return None
+    width = size // experts
+    local = {expert for expert in range(home) if expert not in owners}
+    deferred = {task for expert in local
+                for task in range(start + expert * width, start + (expert + 1) * width)}
+    if not deferred:
+        return None
+    # A return runs on its reserved helper. Never delay a queued arithmetic or
+    # transport consumer behind the gradient producer it is waiting for.
+    produced = {config.all_tasks[task].trigger_event for task in deferred}
+    if any(task.dependent_event in produced and task.task_type != TaskType.TASK_TERMINATE
+           for task in config.all_tasks[:config.task_num + 1]):
+        return None
+    indices = list(config.cube_task_indices[:config.task_index_num[0]])
+    updated = indices.copy()
+    for queue in config.worker_queues[:config.num_workers // 2]:
+        positions = range(queue.begin, queue.end, queue.stride)
+        tasks = [indices[position] for position in positions]
+        reordered = [task for task in tasks if task not in deferred]
+        reordered.extend(task for task in tasks if task in deferred)
+        for position, task in zip(positions, reordered):
+            updated[position] = task
+    if updated == indices:
+        return None
+    return cube_task_index_offset(config), struct.pack(f"<{len(updated)}I", *updated)
 
 
 def explain_schedule(cfg):

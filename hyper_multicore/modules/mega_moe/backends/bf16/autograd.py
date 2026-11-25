@@ -1020,8 +1020,11 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             backward_runtime = None
             if acquired and binding.fused:
                 cube_queue = None
-                if (recompute is not None and binding.uses_fp32_bands
-                        and os.environ.get("HMC_A3_W13_REMOTE_FIRST") == "1"):
+                prioritize_returns = ((plan.spec.architecture == 3510
+                                       and os.environ.get("HMC_A5_W13_REMOTE_FIRST") == "1")
+                                      or (recompute is not None and plan.spec.architecture == 2201
+                                          and os.environ.get("HMC_A3_W13_REMOTE_FIRST") == "1"))
+                if prioritize_returns and binding.uses_fp32_bands:
                     _, guests, owned = binding.edges
                     if owned or any(peer < binding.pool.ranks for peer in guests):
                         owners = tuple(sorted({edge[2] for edge in owned}))
@@ -1033,6 +1036,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                     backward_runtime = binding.runtime(plan.bwd_runtime_config, gradients)
                 else:
                     backward_runtime = binding.runtime(plan.bwd_runtime_config, gradients, cube_queue=cube_queue)
+                    statistics = binding.pool.statistics
+                    statistics["w13_prioritized_calls"] = statistics.get("w13_prioritized_calls", 0) + 1
             _launch_backward_kernel(
                 plan,
                 saved,

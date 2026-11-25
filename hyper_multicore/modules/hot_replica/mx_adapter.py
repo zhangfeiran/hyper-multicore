@@ -137,7 +137,7 @@ class MXPlacementResources:
         self._previous_active = False
         self.statistics = dict(invocations=0, placements=0, mx_full_route_readbacks=0,
                                mx_packed_route_readbacks=0, mx_packed_home_routes=0, mx_geometry_hits=0,
-                               mx_geometry_misses=0, mx_geometry_cache_peak_bytes=0)
+                               mx_geometry_misses=0, mx_geometry_cache_peak_bytes=0, w13_prioritized_calls=0)
 
     def _read_route(self, gathered, hidden, stream, source_rows, *, use_snapshot):
         spec, workspace = self.parent.spec, self.parent.workspace

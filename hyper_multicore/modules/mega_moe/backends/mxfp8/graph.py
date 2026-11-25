@@ -135,7 +135,8 @@ def _mx_gradient_ready_events(cfg: Any, experts: int, cubes: int) -> tuple:
 
 
 def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool,
-                       home_experts: int | None = None, gradient_helpers: bool = False) -> MXFP8Runtime:
+                       home_experts: int | None = None, gradient_helpers: bool = False,
+                       independent_dx: bool = False) -> MXFP8Runtime:
     """Wire per-expert dependencies; preserve adopted math, transport and task boundaries."""
     activation_parameters = spec.activation_parameters
     if not isinstance(activation_parameters, SwiGLUParameters) or activation_parameters.clamp_limit is not None:
@@ -192,6 +193,9 @@ def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool,
     for left, right in zip(order, order[1:]):
         if activation_first and right == 'da':
             left = 'quant_dy'
+        if independent_dx and right == 'dx':
+            # Both consume the completed SwiGLU gradient. dX has no dW13 input.
+            left = 'swiglu_grad_quant'
         graph.add_edge(left, right)
     graph.propagate_splits(values)
     tasks = 1 + sum(op.task_num for op in graph.topological_sort())
@@ -200,6 +204,7 @@ def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool,
     init_task_split_value(values)
     values.rank_id = spec.rank_id
     dw2_start = 0
+    activation_grad_start = 0
     for op in graph.topological_sort():
         start = values.pre_task_num
         op.fill_config.fill(cfg, op, values)
@@ -210,6 +215,13 @@ def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool,
             # on dW2 for return helpers while SwiGLU can start as dW2 runs.
             for offset in range(op.task_num):
                 cfg.all_tasks[start + offset].dependent_event = cfg.all_tasks[dw2_start + offset].dependent_event
+        if independent_dx and op.name == 'swiglu_grad_quant':
+            activation_grad_start = start
+        if independent_dx and op.name == 'dx':
+            for offset in range(op.task_num):
+                expert = offset // cubes
+                producer = cfg.all_tasks[activation_grad_start + expert * vectors]
+                cfg.all_tasks[start + offset].dependent_event = producer.trigger_event
     combine = graph.get_op('combine')
     add_terminate(cfg, values, combine.task_num)
     middle_vectors = sum(graph.get_op(name).task_num for name in order

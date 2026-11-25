@@ -1,13 +1,15 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 """MX experts reuse the managed MoE lifecycle and precision-independent transport."""
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import cached_property
+import os
 
 import torch
 
 from hyper_multicore.scheduler.runtime import serialize_runtime_config
 from ...resources import _MegaMoeExecutionResources
+from ...schedule import defer_local_w13
 from .diagnostics import prepare_mx_diagnostics
 from .execution import MXFP8Execution
 from .autograd import execute_mxfp8_experts
@@ -28,11 +30,31 @@ class _DeviceRuntime:
     event_capacity: int
     host: object
     spec: object
+    w13_variants: OrderedDict = field(default_factory=OrderedDict)
 
     @cached_property
     def diagnostics(self):
         """Build the diagnostic binding only on first use."""
         return prepare_mx_diagnostics(self.host, self.spec, self.runtime.device)
+
+    def prioritize_w13(self, home: int, owners: tuple[int, ...]) -> "_DeviceRuntime":
+        """Keep the ordinary descriptor and replace only the proven Cube index order."""
+        key = (home, owners)
+        variants = self.w13_variants
+        if key not in variants:
+            reordered = defer_local_w13(self.host.config, self.spec.local_experts, home, owners)
+            if reordered is None:
+                variants[key] = None
+            else:
+                offset, indices = reordered
+                wire = bytearray(serialize_runtime_config(self.host.config))
+                wire[offset:offset + len(indices)] = indices
+                variants[key] = replace(self, runtime=_device_bytes(wire, self.runtime.device),
+                                        w13_variants=OrderedDict())
+        variants.move_to_end(key)
+        if len(variants) > 16:
+            variants.popitem(last=False)
+        return variants[key] or self
 
 
 def _device_runtime(host, device, spec):
@@ -79,7 +101,9 @@ class Resources(_MegaMoeExecutionResources):
             home_experts = self.spec.local_experts if route_experts is not None else None
             forward = build_mxfp8_runtime(spec, forward=True, home_experts=home_experts)
             backward = build_mxfp8_runtime(spec, forward=False, home_experts=home_experts,
-                                          gradient_helpers=home_experts is not None)
+                                          gradient_helpers=home_experts is not None,
+                                          independent_dx=home_experts is not None
+                                          and os.environ.get("HMC_A5_W13_REMOTE_FIRST") == "1")
             self._plans[key] = _MXFP8Plan(spec, _device_runtime(forward, device, spec),
                                         _device_runtime(backward, device, spec))
         self._plans.move_to_end(key)
