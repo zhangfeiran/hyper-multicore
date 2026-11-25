@@ -436,6 +436,11 @@ class ExpertWeightBinding:
     def fused_gradients(self) -> bool:
         return self.mode in (ReplicaExecutionMode.FP32_BAND, ReplicaExecutionMode.BF16_BAND)
 
+    @property
+    def uses_fp32_bands(self) -> bool:
+        """Whether this binding writes and merges FP32 replica partials."""
+        return self.mode is ReplicaExecutionMode.FP32_BAND
+
     def for_tensor_dump(self) -> ExpertWeightBinding:
         """Use materialized bank operands without changing a saved binding."""
         return ExpertWeightBinding(self.pool, self.placement, self.layout,
@@ -483,13 +488,13 @@ class ExpertWeightBinding:
                 self.pool.release()
             raise
 
-    def runtime(self, ordinary, gradients=None):
+    def runtime(self, ordinary, gradients=None, *, cube_queue=None):
         """Select split weights and optional in-kernel dW for this launch."""
         if not self.fused:
             return None
         return self.pool.pipeline.runtime(
             ordinary, self, gradients if self.fused_gradients else None,
-            bf16_partials=self.mode is ReplicaExecutionMode.BF16_BAND,
+            bf16_partials=self.mode is ReplicaExecutionMode.BF16_BAND, cube_queue=cube_queue,
         )
 
     def capture_snapshot(self, weights: tuple[torch.Tensor, ...], *, maximum_bytes: int | None = None):

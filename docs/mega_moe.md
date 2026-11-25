@@ -186,6 +186,23 @@ tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
 反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，
 测量稳态性能前应覆盖代表性的路由和容量。
 
+#### A3 Indexed Push 与 non-reentrant checkpoint
+
+单机 ascend910_93、EP16/E128、H4096/I1408/K8 的 BF16 EOI MTE Push 可以在构造执行器前设置
+`HMC_A3_INDEXED_PUSH=1`。使用内置 planner 的 checkpoint 原前向在设备有序计数后按索引发送原始输入行，
+无需为各 Top-K 选择复制完整 token。重放经 EP 一致性校验后复用索引。SHMEM 扩容后使用常规设备就绪握手。
+在最终 Top-K ID 的生产流上调用 `hyper_multicore.modules.mega_moe.a3_indexed.note_source_ready(topk_ids)`，
+再将同一个张量交给执行器，可让符合条件的原前向旁流提交计数与交换。
+
+使用 non-reentrant checkpoint 时，为每次调用创建一个 `ReplayCheckpoint`，在 `context_fn` 中分别返回
+`scope(False)` 和 `scope(True)`，并提供真实的参数代际回调。设置 `defer_forward_copies=True` 可将反向需要的
+两份保存延后到重算。`guest_snapshot_bytes` 为每 rank 每次调用的 guest 权重快照预算，EP 组确认同一路由和参数代际后复用。
+
+A3 BF16 EOI MTE Push 上可同时设置 `defer_expert_recompute=True` 和 `defer_forward_copies=True`，
+让收到上游梯度的节点执行专家重算和反向。H4096/I1408/K8 的场景可在组内启用 `HMC_A3_FUSED_RECOMPUTE=1`，
+以一次设备调用执行两段。该选项需匹配的原生制品，重放需要确定性输入、精确路由、概率和同代参数。
+已测的 HY106 单机配置还开启了三行梯度流水、专家级早发 dA、低频 AIV 轮询和有远端依赖的 W13 优先执行。
+
 ### 旧 HotReplica 接口退役
 
 独立 Native EP 的 `HotReplica`、`plan_native()` 和旧输入预留参数 `source_token_bound` 已退役。

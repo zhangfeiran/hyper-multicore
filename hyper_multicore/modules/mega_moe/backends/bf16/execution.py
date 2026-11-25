@@ -96,6 +96,10 @@ def forward(
             options["checkpoint_replay"] = checkpoint_replay
         else:
             checkpoint_replay = None
+    if record is not None and record.defer_expert_recompute:
+        if checkpoint_replay is None:
+            raise RuntimeError("Deferred expert recompute requires non-reentrant A3 BF16 EOI MTE Push")
+        options["deferred_recompute"] = record
     if binding is not None and binding.fused and resources.spec.architecture == 2201:
         replay_weights = guest_weight_replay(record)
         if replay_weights is not None:

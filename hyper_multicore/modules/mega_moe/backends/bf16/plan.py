@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from typing import Any
 
 import numpy as np
@@ -51,8 +53,10 @@ from hyper_multicore.modules.mega_moe.schedule import configure_expert_queues
 from hyper_multicore.scheduler.config import (
     FAST_DEPENDENCY_POLL_INTERVAL_US,
     TaskSplitValue,
+    TaskType,
 )
 from hyper_multicore.scheduler.graph import ComputeGraph
+from hyper_multicore.scheduler.runtime import cube_task_index_offset
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 
 from ...diagnostics import REPLICA_TRACE_STAGES, _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
@@ -91,6 +95,9 @@ class MegaMoePlan:
     weight_grad_dtype: torch.dtype | None = None
     backward_outputs: BackwardOutputs = BackwardOutputs()
     _recorded_streams: set = field(default_factory=set, repr=False, compare=False)
+    _w13_return_queues: dict[tuple[int, tuple[int, ...]], tuple[int, torch.Tensor]] = field(
+        default_factory=dict, repr=False, compare=False,
+    )
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -102,6 +109,51 @@ class MegaMoePlan:
         """Return the original ordinary backward RuntimeConfig."""
         return self.bwd_diagnostics.runtime_config
 
+    @cached_property
+    def _w13_cube_waves(self):
+        config = self.bwd_diagnostics._runtime._host_config
+        cubes = self.spec.num_cube_cores
+        experts = self.spec.local_experts
+        count = config.task_index_num[0]
+        start = count - experts * cubes
+        if config.queue_layout != 2 or start < 0 or start % cubes:
+            return None
+        for lane, queue in enumerate(config.worker_queues[:cubes]):
+            if (queue.begin, queue.end, queue.stride, queue.ready_depth) != (lane, count, cubes, 0):
+                return None
+        prefix_events = Counter(config.all_tasks[task].trigger_event for task in config.cube_task_indices[:start]
+                                if config.all_tasks[task].outputs[0].input_position == 12)
+        waves = []
+        for expert in range(experts):
+            begin = start + expert * cubes
+            wave = config.cube_task_indices[begin:begin + cubes]
+            for lane, task_id in enumerate(wave):
+                task = config.all_tasks[task_id]
+                dependency = task.dependent_event
+                if (task.task_type != TaskType.TASK_GROUPED_MATMUL or task.outputs[0].input_position != 18
+                        or task.extra_value_1 != GroupedMatmulTaskMode.SINGLE_GROUP
+                        or task.task_index != expert * cubes + lane or dependency not in prefix_events
+                        or prefix_events[dependency] != config.all_event_num_triggers[dependency]):
+                    return None
+            waves.append(wave)
+        return cube_task_index_offset(config) + start * 4, waves
+
+    def w13_return_queue(self, home: int, owners: tuple[int, ...]) -> tuple[int, torch.Tensor] | None:
+        """Move full export/merge waves before local-only W13 after GateGrad."""
+        wave_layout = self._w13_cube_waves
+        if wave_layout is None or len(owners) == home:
+            return None
+        offset, waves = wave_layout
+        if not 0 < home <= len(waves):
+            return None
+        order = (*owners, *range(home, len(waves)), *(expert for expert in range(home) if expert not in owners))
+        if order == tuple(range(len(waves))):
+            return None
+        key = home, owners
+        if key not in self._w13_return_queues:
+            queue = np.asarray([waves[expert] for expert in order], dtype="<i4").tobytes()
+            self._w13_return_queues[key] = offset, _tensor_from_bytes(queue, self.bwd_runtime_config.device)
+        return self._w13_return_queues[key]
 
     def record_stream(self, runtime_config: Any, *, stream: Any = None) -> None:
         """Register immutable plan storage once per stream, preserving allocator lifetime."""

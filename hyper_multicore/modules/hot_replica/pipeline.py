@@ -229,14 +229,18 @@ class ReplicaPipeline:
         binding.transfers = ()
         binding.gradient_storage = ()
 
-    def runtime(self, base, binding, gradients=None, *, bf16_partials=False):
+    def runtime(self, base, binding, gradients=None, *, bf16_partials=False, cube_queue=None):
         """Encode the current projection addresses after the ordinary queue table."""
         gradients_address = 0
         if gradients is not None and any(gradient is not None for gradient in gradients):
             gradients_address = self._gradient_table(binding, gradients, bf16_partials=bf16_partials).data_ptr()
         words = (*binding.launch, gradients_address)
         extension = _words_tensor(words, self.pool.device, -base.numel() % 8)
-        return torch.cat((base.view(torch.uint8), extension))
+        ordinary = base.view(torch.uint8)
+        if cube_queue is None:
+            return torch.cat((ordinary, extension))
+        offset, replacement = cube_queue
+        return torch.cat((ordinary[:offset], replacement, ordinary[offset + replacement.numel():], extension))
 
     def _gradient_table(self, binding, gradients, *, bf16_partials=False):
         pool = self.pool
