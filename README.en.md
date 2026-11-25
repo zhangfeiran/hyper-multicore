@@ -71,6 +71,7 @@ For single-NPU usage, start with [MegaGate](docs/mega_gate.md#基本用法) or [
 | Integrate existing models and preserve parameters | [Model integration and examples](examples/README.md) |
 | Understand framework responsibilities and execution | [Architecture](docs/architecture.md) |
 | Capture timelines and inspect tensor values | [Diagnostics](docs/diagnostics.md) |
+| Compare end-to-end MegaMoE training performance | [Qwen3.5 single-node A3 EP16 benchmark (Chinese)](docs/benchmarks/veomni_qwen35_a3_ep16_megamoe_vs_native.md) |
 | Prepare a development environment, run tests and static checks | [Test guide](tests/README.md) |
 
 ## Development and contributing
