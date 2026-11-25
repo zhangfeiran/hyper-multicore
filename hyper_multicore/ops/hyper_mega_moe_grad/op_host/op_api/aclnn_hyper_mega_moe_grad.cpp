@@ -36,6 +36,8 @@
 extern "C" {
 #endif
 
+__attribute__((visibility("default"))) int HmcA3RecomputeBackwardVersion() { return 4; }
+
 aclTensor *CreateContiguousTensorList(const aclTensor *tensorList, aclOpExecutor *executor) {
   op::Shape shape;
   const aclTensor *inputTensor = tensorList;

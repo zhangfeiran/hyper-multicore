@@ -17,7 +17,7 @@ struct ReplicaLaunch {
 constexpr uint64_t kReplicaLaunch = 0x4d4f4f4e45505752ULL;
 static_assert(sizeof(ReplicaLaunch) == 80);
 
-template <bool Producer = false>
+template <bool Producer = false, uint64_t PollCycles = 50>
 __aicore__ inline void WaitReplicaEpoch(uint64_t address, uint64_t epoch) {
   const auto word = reinterpret_cast<const __gm__ volatile int32_t *>(address);
   AscendC::GlobalTensor<int32_t> flag;
@@ -27,7 +27,7 @@ __aicore__ inline void WaitReplicaEpoch(uint64_t address, uint64_t epoch) {
     // A producer can remain busy for many tiles. Keep waiting lanes from
     // continuously invalidating its cache line during that interval.
     const uint64_t now = Producer ? AscendC::GetSystemCycle() : 0;
-    if (!Producer || now - refreshed >= 50) {
+    if (!Producer || now - refreshed >= PollCycles) {
       AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                         AscendC::DcciDst::CACHELINE_OUT>(flag);
       refreshed = now;

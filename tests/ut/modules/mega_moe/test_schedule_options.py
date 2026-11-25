@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from hyper_multicore import MegaMoeExperts
 from hyper_multicore.experimental import MegaMoeSchedulerOptions, MegaMoeTuningOptions
@@ -16,7 +17,7 @@ from hyper_multicore.modules.mega_moe.schedule import (
     describe_schedule_policy, explain_schedule, list_schedule_policies, validate_schedule_options,
 )
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
-from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts
+from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts, build_mega_moe_plan
 from hyper_multicore.modules.mega_moe.backends.bf16 import resources as bf16
 from hyper_multicore.scheduler.config import TaskType
 from hyper_multicore.scheduler.runtime import serialize_runtime_config
@@ -71,6 +72,19 @@ def test_arch22_rejects_ineffective_explicit_options():
         _build_runtime_artifacts(replace(spec, schedule_policy='builder_order'))
     with pytest.raises(ValueError, match='compact lowering is unavailable'):
         _build_runtime_artifacts(replace(spec, lowering='compact', dispatch_mode='pull'))
+
+
+def test_a3_remote_w13_replaces_only_fifo_suffix():
+    spec = MegaMoeSpec(12288, 4096, 1408, 160, 8, None, 98304, 16, None, 0, 24,
+                       expert_weight_layout="EOI", nominal_schedule=True)
+    plan = build_mega_moe_plan(spec, "cpu", weight_grad_dtype=torch.float32, replica_pipeline=True,
+                               reserve_merge_workers=True)
+    offset, queue = plan.w13_return_queue(8, (2, 6))
+    assert plan.w13_return_queue(8, (2, 6))[1] is queue
+    original = plan.bwd_runtime_config[offset:offset + queue.numel()].view(torch.int32).reshape(10, 24)
+    permuted = queue.view(torch.int32).reshape(10, 24)
+    assert torch.equal(permuted, original[[2, 6, 8, 9, 0, 1, 3, 4, 5, 7]])
+    assert plan.w13_return_queue(8, tuple(range(8))) is None
 
 
 @pytest.mark.parametrize("compact_pull", [False, True])
