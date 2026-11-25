@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from hyper_multicore.modules.hot_replica.bounded_placement import _indexed_maps
+from hyper_multicore.modules.mega_moe.count_fence import COUNT_FENCE_BIT, CountFence
 from hyper_multicore.modules.mega_moe import a3_indexed, route
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from tests.common.mark_utils import arg_mark
@@ -39,10 +40,10 @@ def test_placed_route_reuses_count_fence_only_for_same_allocation(all_ready, reb
         forward_event_counters=torch.zeros(12, dtype=torch.int32),
         expert_buffer=object(), routed_buffer=object(), forward_ready_initialized=True,
     )
-    fence = a3_indexed.CountFence(
+    fence = CountFence(
         workspace.forward_event_counters, workspace.expert_buffer, workspace.routed_buffer, 3, "compute")
     mask = 15
-    flags = [mask | a3_indexed.COUNT_FENCE_BIT, mask | (a3_indexed.COUNT_FENCE_BIT if all_ready else 0)]
+    flags = [mask | COUNT_FENCE_BIT, mask | (COUNT_FENCE_BIT if all_ready else 0)]
     wire = [[0, 2, flag, 1, 1, 1, 1] for flag in flags]
     hidden = torch.zeros(2, 4)
     ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)

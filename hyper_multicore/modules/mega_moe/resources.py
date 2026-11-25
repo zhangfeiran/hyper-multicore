@@ -86,6 +86,8 @@ class _MegaMoeExecutionResources:
                         self.spec = replace(self.spec, transport_engine=transport)
                     if self.spec.udma_qp_policy and (transport != "udma" or config["udma_qp_num"] < 2):
                         raise ValueError("udma_qp_policy requires at least two active UDMA queues per peer")
+                    if self.spec.forward_count_fence and transport != "udma":
+                        raise ValueError("forward_count_fence requires an active UDMA transport")
                     if mx_placement and (transport != "udma" or config["udma_qp_num"] not in (8, 16, 32)):
                         raise ValueError("MXFP8 HotReplica requires mte_udma and 8, 16 or 32 UDMA QPs")
                 if transport == "udma":
@@ -163,6 +165,7 @@ class _MegaMoeExecutionResources:
             self.spec.precision, self.spec.transport_engine, self.spec.ready_depth,
             self.spec.math_dependency_poll_interval_us,
             self.spec.udma_qp_policy,
+            self.spec.forward_count_fence,
             self.spec.schedule_policy, self.spec.lowering,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens, self.spec.auto_tokens,
@@ -197,7 +200,7 @@ class _MegaMoeExecutionResources:
                   "apply_probs_before_fc2", "partial_weight_grad_dtype", "expert_weight_layout",
                   "ep_size", "auto_tokens",
                   "precision", "transport_engine", "ready_depth", "math_dependency_poll_interval_us",
-                  "schedule_policy", "lowering", "udma_qp_policy",
+                  "schedule_policy", "lowering", "udma_qp_policy", "forward_count_fence",
                   "batch_experts", "nominal_schedule", "hot_replica", "planner_key", "replica_bank",
                   "indexed_push", "a3_recompute")
         # Both backends exchange BF16 hidden rows. The literal tags identify the route protocol.

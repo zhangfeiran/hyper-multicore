@@ -56,7 +56,7 @@ from hyper_multicore.scheduler.config import (
     TaskType,
 )
 from hyper_multicore.scheduler.graph import ComputeGraph
-from hyper_multicore.scheduler.runtime import cube_task_index_offset
+from hyper_multicore.scheduler.runtime import copy_runtime_config, cube_task_index_offset, serialize_runtime_config
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 
 from ...diagnostics import _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
@@ -106,6 +106,15 @@ class MegaMoePlan:
     def bwd_runtime_config(self) -> Any:
         """Return the original ordinary backward RuntimeConfig."""
         return self.bwd_diagnostics.runtime_config
+
+    @cached_property
+    def fenced_forward_runtime(self) -> torch.Tensor:
+        """Remove the forward ready wait after the count exchange has fenced it."""
+        config = copy_runtime_config(self.fwd_diagnostics._runtime._host_config)
+        if not config.ready_event or config.completion_event:
+            raise RuntimeError("Count fencing requires an ordinary Push ready event")
+        config.ready_event = 0
+        return _tensor_from_bytes(serialize_runtime_config(config), self.fwd_runtime_config.device)
 
     @cached_property
     def _w13_cube_waves(self):

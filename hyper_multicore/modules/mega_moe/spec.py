@@ -71,6 +71,7 @@ class MegaMoeSpec:
     compact_pull: bool = False
     math_dependency_poll_interval_us: int | None = None
     udma_qp_policy: str | None = None
+    forward_count_fence: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -214,6 +215,9 @@ def bind_mega_moe_spec(
     if qp_policy and (architecture != 3510 or transport_engine == "mte"
                       or ep_size <= 1 or 2 * (ep_size - 1) >= core_spec.num_cube_cores):
         raise ValueError("udma_qp_policy requires arch35 and enough AIV peers for two queues per peer")
+    forward_count_fence = specification.get("forward_count_fence", False)
+    if forward_count_fence and (architecture != 3510 or transport_engine == "mte" or ep_size <= 1):
+        raise ValueError("forward_count_fence requires multi-rank arch35 UDMA Push")
 
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
@@ -257,4 +261,5 @@ def bind_mega_moe_spec(
         compact_pull=specification.get("compact_pull", False),
         math_dependency_poll_interval_us=interval,
         udma_qp_policy=qp_policy,
+        forward_count_fence=forward_count_fence,
     )

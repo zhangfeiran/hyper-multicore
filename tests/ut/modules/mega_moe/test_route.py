@@ -25,6 +25,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from hyper_multicore.modules.mega_moe import route as route_module
+from hyper_multicore.modules.mega_moe.count_fence import COUNT_FENCE_BIT
 from hyper_multicore.modules.mega_moe.route import (
     _HOST_DESCRIPTOR_MAX_COUNTS,
     _HOST_ROUTE_CACHE_ENTRIES,
@@ -594,7 +595,16 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         first = spec.rank_id * spec.local_experts
         incoming = counts[:, first:first + spec.local_experts].sum(0)
         capture = bool((payload[:, 2] & route_module._TENSOR_DUMP_MASK).any())
-        return max(1, int(loads[spec.rank_id])), schedule, int(loads.max()), bool((incoming > 0).all()), capture
+        return max(1, int(loads[spec.rank_id])), schedule, int(loads.max()), bool((incoming > 0).all()), capture, False
+
+    def test_forward_count_fence_requires_a_vote_from_each_peer(self) -> None:
+        """Honor fence votes from the current wire, including empty ranks."""
+        spec = replace(self._spec(), forward_count_fence=True)
+        payload = self._payload(spec.num_experts, torch.int32)
+        payload[:, 2] |= COUNT_FENCE_BIT
+        self.assertTrue(_read_dynamic_route(payload, spec)[0].count_fenced)
+        payload[0, 2] &= ~COUNT_FENCE_BIT
+        self.assertFalse(_read_dynamic_route(payload, spec)[0].count_fenced)
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"

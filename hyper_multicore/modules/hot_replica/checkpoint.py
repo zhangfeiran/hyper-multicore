@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 
 from ..mega_moe import a3_indexed
+from ..mega_moe.count_fence import CountFence
 from ..mega_moe.route import _TENSOR_DUMP_MASK
 
 _ACTIVATION_REPLAY_BIT = 1 << 5
@@ -51,7 +52,7 @@ class ReplayRecord:
     guest_snapshot_bytes: int = 0
     guest_weight_snapshot: Any = None
     allow_guest_restore: bool = False
-    replay_count_fence: a3_indexed.CountFence | None = None
+    replay_count_fence: CountFence | None = None
     defer_expert_recompute: bool = False
     reentrant: bool = False
     deferred_output: torch.Tensor | None = None
@@ -254,7 +255,7 @@ def agree_replay(
         if (valid and not deferred and counts is None
                 and record.route.indexed_dispatch_offsets is not None):
             workspace = record.owner.workspace
-            replay_fence = a3_indexed.CountFence.before_gather(workspace, record.stream)
+            replay_fence = CountFence.before_gather(workspace, record.stream)
             if replay_fence is not None:
                 flag += a3_indexed.REPLAY_FENCE_BIT
         gathered = flag.new_empty(spec.ep_size)

@@ -24,9 +24,11 @@ from typing import Any
 import torch
 
 from hyper_multicore._loader import load_torch_npu
+from hyper_multicore.scheduler.config import RuntimeConfigC
 from hyper_multicore.torch import ops as multicore_ops
 
 from ... import a3_indexed, a3_recompute
+from ...count_fence import CountFence
 from ...probability import PROBABILITY_PLANES, probability_stride
 from .plan import MegaMoePlan, record_plan_stream
 from ...route import PreparedTopKRoute, RouteMetadata, _materialize_route_permutation, restore_topk_output
@@ -267,7 +269,7 @@ def _prepare_forward_execution(
     routed_tokens: Any,
     capacity: int,
     *,
-    count_fence: a3_indexed.CountFence | None = None,
+    count_fence: CountFence | None = None,
 ) -> _ForwardExecution:
     """Resolve workspace, event counters, and intermediate tensors for forward."""
     dispatch, source = _dispatch_and_source(plan.spec, workspace, routed_tokens, capacity)
@@ -638,8 +640,13 @@ def _launch_forward_kernel(
     sequence = getattr(spec, "plan_tokens", None)
     if sequence is None:
         sequence = spec.local_num_tokens
+    ordinary_fenced = counts_fenced and dispatch_offsets is None
     if dispatch_offsets is not None:
         sequence = a3_indexed.launch_sequence(sequence, routed_tokens.shape[0], spec.top_k, counts_fenced)
+    elif ordinary_fenced:
+        if runtime_override is not None:
+            raise RuntimeError("Count fencing requires the home-only BF16 forward runtime")
+        runtime_override = plan.fenced_forward_runtime
     kernel_parameters = _forward_kernel_inputs(metadata, routed_tokens, weight1, weight2, execution,
                                                dispatch_offsets)
     if not plan.fwd_diagnostics.is_active:
@@ -666,7 +673,12 @@ def _launch_forward_kernel(
         direction="forward",
         fallback_event_counters=execution.event_counters,
     ) as diagnostic_call:
-        runtime = _diagnostic_runtime(diagnostic_call.runtime_config, plan.fwd_runtime_config, runtime_override)
+        if ordinary_fenced:
+            runtime = diagnostic_call.runtime_config.clone()
+            ready_offset = RuntimeConfigC.ready_event.offset
+            runtime[ready_offset:ready_offset + 4].zero_()
+        else:
+            runtime = _diagnostic_runtime(diagnostic_call.runtime_config, plan.fwd_runtime_config, runtime_override)
         record_plan_stream(plan, runtime, stream=stream)
         multicore_ops.mega_moe_with_diagnostic_buffer(
             *kernel_parameters,
@@ -819,7 +831,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         weight_binding: Any = None,
         checkpoint_replay: bool | None = None,
         guest_weights: Any = None,
-        indexed_dispatch: tuple[torch.Tensor, a3_indexed.CountFence | None] | None = None,
+        prepared_dispatch: tuple[torch.Tensor | None, CountFence | None] | None = None,
         deferred_recompute: Any = None,
     ) -> Any:
         """Launch the BF16 forward op and save owned backward inputs.
@@ -864,9 +876,10 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 permutation_inputs = (unpermute_mapping,)
         ctx.source_rows = routed_tokens.shape[0]
         dispatch_offsets = count_fence = None
-        if indexed_dispatch is not None:
-            dispatch_offsets, count_fence = indexed_dispatch
-            ctx.source_rows *= spec.top_k
+        if prepared_dispatch is not None:
+            dispatch_offsets, count_fence = prepared_dispatch
+            if dispatch_offsets is not None:
+                ctx.source_rows *= spec.top_k
         ctx.token_rows = ctx.source_rows // spec.top_k
         ctx.has_permutation = permutation is not None
         ctx.has_unpermute = topk_weights is not None
@@ -1217,7 +1230,8 @@ def execute_mega_moe_with_permutation(
         weight_binding,
         checkpoint_replay,
         guest_weights,
-        (dispatch_offsets, route.count_fence) if dispatch_offsets is not None else None,
+        (dispatch_offsets, route.count_fence)
+        if dispatch_offsets is not None or route.count_fence is not None else None,
         deferred_recompute,
     )
 

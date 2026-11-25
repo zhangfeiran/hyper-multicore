@@ -424,7 +424,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             def operation(values: Any, first: Any, second: Any) -> Any:
                 prepared = SimpleNamespace(
                     routed_tokens=values.detach().repeat_interleave(2, dim=0),
-                    metadata=route, unpermute_mapping=mapping, indexed_dispatch_offsets=None,
+                    metadata=route, unpermute_mapping=mapping, indexed_dispatch_offsets=None, count_fence=None,
                 )
                 return function_module.execute_mega_moe_with_permutation(
                     values, ids, first, second, prepared, plan, workspace,

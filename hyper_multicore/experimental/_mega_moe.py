@@ -45,6 +45,9 @@ class MegaMoeSchedulerOptions:
         udma_qp_policy: On arch35 BF16 Push with home experts, split each peer's
             traffic between two exclusive UDMA queues. ``"phase"`` separates
             Dispatch and Combine. ``"tile"`` alternates adjacent descriptors.
+        forward_count_fence: On arch35 BF16 UDMA Push with home experts, clear
+            the forward event counters before the count exchange. Use group
+            agreement on that exchange to omit the device entry handshake.
     """
     policy: str | None = None
     queue_ready_lookahead: int | None = None
@@ -53,6 +56,7 @@ class MegaMoeSchedulerOptions:
     lowering: Literal["auto", "dense", "compact"] = "auto"
     math_dependency_poll_interval_us: int | None = None
     udma_qp_policy: Literal["phase", "tile"] | None = None
+    forward_count_fence: bool = False
 
 
 @dataclass(frozen=True)

@@ -31,6 +31,7 @@ from hyper_multicore.torch import ops as multicore_ops
 
 from . import a3_indexed
 from .heap_manager import _HeapCapacityError
+from .count_fence import COUNT_FENCE_BIT, CountFence
 from .route_metadata import RouteMetadata
 from .spec import MegaMoeSpec, _align_capacity
 
@@ -62,7 +63,7 @@ class PreparedTopKRoute:
     checkpoint_record: Any = field(default=None, repr=False, compare=False)
     dump_weights: bool = False
     indexed_dispatch_offsets: torch.Tensor | None = field(default=None, repr=False, compare=False)
-    count_fence: a3_indexed.CountFence | None = field(default=None, repr=False, compare=False)
+    count_fence: CountFence | None = field(default=None, repr=False, compare=False)
 
 
 _record_metadata_stream = RouteMetadata.record_stream
@@ -76,6 +77,7 @@ class _RouteSummary(NamedTuple):
     maximum: int
     all_experts_active: bool = False
     dump_weights: bool = False
+    count_fenced: bool = False
 
 
 @dataclass(frozen=True)
@@ -561,7 +563,7 @@ _TENSOR_DUMP_MASK = 1 << 6
 
 def _validate_dynamic_mask(rows: list[list[int]]) -> None:
     """Require matching autograd participation while allowing rank-local capture."""
-    reporting = _TENSOR_DUMP_MASK | a3_indexed.COUNT_FENCE_BIT
+    reporting = _TENSOR_DUMP_MASK | COUNT_FENCE_BIT
     expected = rows[0][2] & ~reporting
     if expected & _INVALID_WEIGHT_MASK or any((row[2] & ~reporting) != expected for row in rows):
         if any(row[2] & _INVALID_WEIGHT_MASK for row in rows):
@@ -608,7 +610,9 @@ def _summarize_dynamic_rows(
     if plan_tokens * max(spec.hidden_size, spec.top_k) > 2**31 - 1 or maximum > 2**31 - 1:
         raise RuntimeError("MegaMoe dynamic route exceeds native INT32 size limits")
     dump_weights = any(row[2] & _TENSOR_DUMP_MASK for row in rows)
-    return _RouteSummary(max(1, rows[spec.rank_id][6]), plan_tokens, maximum, all_experts_active, dump_weights)
+    count_fenced = spec.forward_count_fence and all(row[2] & COUNT_FENCE_BIT for row in rows)
+    return _RouteSummary(max(1, rows[spec.rank_id][6]), plan_tokens, maximum, all_experts_active,
+                         dump_weights=dump_weights, count_fenced=count_fenced)
 
 
 def _read_dynamic_route(
@@ -630,8 +634,10 @@ def _read_packed_dynamic_route(
     payload: torch.Tensor, spec: MegaMoeSpec, tokens: int, source_rows: list[int] | None = None,
 ) -> tuple[_RouteSummary, RouteMetadata] | None:
     """Submit invocation-owned offsets before reading the one collective summary."""
-    if (spec.architecture != 3510 or spec.precision != "mxfp8"
-            or spec.ep_size * spec.num_experts <= _HOST_ROUTE_MAX_COUNTS):
+    use_packed = spec.forward_count_fence or (
+        spec.precision == "mxfp8" and spec.ep_size * spec.num_experts > _HOST_ROUTE_MAX_COUNTS
+    )
+    if spec.architecture != 3510 or not use_packed:
         return None
     ub = _packed_route_ub(payload, spec, header=3)
     if ub is None:
@@ -692,7 +698,10 @@ def _reuse_cached_route(
     if source_rows is not None:
         source_rows.extend(cached.source_totals)
     cached.wait(device, stream)
-    summary = cached.summary._replace(dump_weights=any(row[2] & _TENSOR_DUMP_MASK for row in raw))
+    summary = cached.summary._replace(
+        dump_weights=any(row[2] & _TENSOR_DUMP_MASK for row in raw),
+        count_fenced=spec.forward_count_fence and all(row[2] & COUNT_FENCE_BIT for row in raw),
+    )
     return summary, raw, cached.metadata
 
 
@@ -905,9 +914,9 @@ def _read_indexed_count_in_parallel(ids, spec, workspace, mask, launch_stream, s
     count_stream.wait_event(source_ready)
     ids.record_stream(count_stream)
     with torch.npu.stream(count_stream):
-        fence = a3_indexed.CountFence.before_gather(workspace, count_stream, launch_stream=launch_stream)
+        fence = CountFence.before_gather(workspace, count_stream, launch_stream=launch_stream)
         payload, inverse, order = a3_indexed.ordered_count(
-            ids, spec.num_experts, mask | (a3_indexed.COUNT_FENCE_BIT if fence is not None else 0))
+            ids, spec.num_experts, mask | (COUNT_FENCE_BIT if fence is not None else 0))
         workspace.wait_for_reuse(stream=count_stream)
         gathered, work = _start_dynamic_gather(payload, spec)
         if work is not None:
@@ -935,11 +944,14 @@ def _resolve_dynamic_permutation(
             work.wait()
             work = None
         packed = _read_packed_dynamic_route(gathered, spec, hidden_states.shape[0])
-        if packed is None:
+        if packed is not None:
+            summary, metadata = packed
+        elif spec.forward_count_fence:
+            # Fence votes belong to this execution. An offset cache key omits them.
+            summary, _ = _read_dynamic_route(gathered, spec)
+        else:
             summary, host_rows, metadata = _read_cached_route(
                 gathered, spec, workspace, hidden_states.device, stream=route_stream)
-        else:
-            summary, metadata = packed
         if prepare_workspace is None:
             raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
         prepare_workspace(summary.plan_tokens, summary.maximum)
@@ -992,12 +1004,17 @@ def _prepare_dynamic_route(
     payload = None
     logical_inverse = logical_order = count_fence = indexed_readback = None
     gathered = work = None
+    ordinary_fence = None
+    if spec.forward_count_fence and within_limit and workspace is not None and route_stream is not None:
+        ordinary_fence = CountFence.before_gather(workspace, route_stream)
+        if ordinary_fence is not None:
+            autograd_mask |= COUNT_FENCE_BIT
     if indexed_placement and within_limit and 0 < tokens <= a3_indexed.MAX_INDEXED_TOKENS:
         source_ready = a3_indexed.take_source_ready(topk_ids)
         if source_ready is None:
-            count_fence = a3_indexed.CountFence.before_gather(workspace, route_stream)
+            count_fence = CountFence.before_gather(workspace, route_stream)
             payload, logical_inverse, logical_order = a3_indexed.ordered_count(
-                topk_ids, spec.num_experts, autograd_mask | (a3_indexed.COUNT_FENCE_BIT if count_fence is not None else 0))
+                topk_ids, spec.num_experts, autograd_mask | (COUNT_FENCE_BIT if count_fence is not None else 0))
         else:
             payload, logical_inverse, logical_order, count_fence, gathered, indexed_readback = (
                 _read_indexed_count_in_parallel(topk_ids, spec, workspace, autograd_mask, route_stream, source_ready))
@@ -1030,8 +1047,11 @@ def _prepare_dynamic_route(
     permuted, summary, host_rows, metadata, work = _resolve_dynamic_permutation(
         hidden_states, topk_ids, spec, workspace, permuted, invalid, route_stream,
         prepare_workspace, gathered, work)
-    return _finalize_dynamic_route(
+    route = _finalize_dynamic_route(
         permuted, counts, summary, host_rows, metadata, work, gathered, spec, workspace, hidden_states.device, tokens)
+    if ordinary_fence is not None and summary.count_fenced and ordinary_fence.matches(workspace):
+        return replace(route, count_fence=ordinary_fence)
+    return route
 
 
 
@@ -1128,7 +1148,7 @@ def _bind_indexed_dispatch(route, ordered, spec, workspace, count_fence, host_ro
     # Capacity agreement is EP-wide. Growth replaces the old symmetric counters
     # everywhere, so this launch returns to the normal device ready handshake.
     if (count_fence is None or not count_fence.matches(workspace) or host_rows is None
-            or not all(row[2] & a3_indexed.COUNT_FENCE_BIT for row in host_rows)):
+            or not all(row[2] & COUNT_FENCE_BIT for row in host_rows)):
         count_fence = None
     return replace(route, indexed_dispatch_offsets=offsets, count_fence=count_fence)
 

@@ -35,6 +35,8 @@ def validate_schedule_options(options):
         raise ValueError("math_dependency_poll_interval_us must fit uint32")
     if options.udma_qp_policy not in (None, "phase", "tile"):
         raise ValueError("udma_qp_policy must be phase, tile or None")
+    if type(options.forward_count_fence) is not bool:
+        raise ValueError("forward_count_fence must be bool")
     if options.lowering not in ('auto', 'dense', 'compact'):
         raise ValueError('MegaMoE lowering must be auto, dense or compact')
     for name, flag in (('batch_experts', options.batch_experts), ('nominal_schedule', options.nominal_schedule)):
