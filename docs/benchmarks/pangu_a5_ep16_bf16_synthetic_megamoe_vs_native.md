@@ -59,9 +59,9 @@ HotReplica 在正式窗口有 72/88 步比 B0 快。每 rank 有 4,302/4,576 次
 | 10 | 7.35× / 9.93× | 2.58× / 3.71× | 2.48× / 3.40× | 1.36× / 1.60× |
 | 99 | 4.51× / 6.89× | 7.75× / 9.61× | 1.60× / 1.92× | 2.07× / 3.15× |
 
-合成组从第 1 到第 10 步的专家和 rank 峰均比都下降，两个采样点的负载都比真实组集中。到第 99 步，合成组两项峰均比进一步下降，真实组的最忙 rank 峰均比则升至最高 3.15×，高于合成组的 1.92×。路由直方图采集于第 1、10、99 步，图中展示合成组的前两个采样点。 [路由采样明细](assets/pangu-a5-ep16-bf16-synthetic/route-skew-comparison.json) · [真实数据报告](pangu_a5_ep16_bf16_real_megamoe_vs_native.md)
+合成组从第 1 到第 10 步的专家和 rank 峰均比都下降，两个采样点的负载都比真实组集中。到第 99 步，合成组两项峰均比进一步下降，真实组的最忙 rank 峰均比则升至最高 3.15×，高于合成组的 1.92×。 [路由采样明细](assets/pangu-a5-ep16-bf16-synthetic/route-skew-comparison.json) · [真实数据报告](pangu_a5_ep16_bf16_real_megamoe_vs_native.md)
 
-![合成数据 Native 的专家和原属 rank 峰均比随训练步的变化](assets/pangu-a5-ep16-bf16-synthetic/route-skew-by-step.png)
+![合成数据 Native 在第 1、10、99 步的专家和原属 rank 峰均比](assets/pangu-a5-ep16-bf16-synthetic/route-skew-by-step.png)
 
 ### 2.3 统计口径
 

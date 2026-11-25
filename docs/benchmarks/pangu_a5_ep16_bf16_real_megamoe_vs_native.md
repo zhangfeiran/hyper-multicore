@@ -59,9 +59,9 @@ HotReplica 在正式窗口有 58/88 步比 B0 快。每 rank 有 3,644/4,576 次
 | 10 | 2.58× / 3.71× | 1.36× / 1.60× |
 | 99 | 7.75× / 9.61× | 2.07× / 3.15× |
 
-第 1 到第 10 步，两项峰均比均略降。第 99 步，专家和 rank 峰均比的中位数分别升至 7.75× 和 2.07×，最忙 rank 的单次峰均比达到 3.15×。路由直方图采集于第 1、10、99 步，图中展示前两个采样点。 [路由采样明细](assets/pangu-a5-ep16-bf16-synthetic/route-skew-comparison.json)
+第 1 到第 10 步，两项峰均比均略降。第 99 步，专家和 rank 峰均比的中位数分别升至 7.75× 和 2.07×，最忙 rank 的单次峰均比达到 3.15×。 [路由采样明细](assets/pangu-a5-ep16-bf16-synthetic/route-skew-comparison.json)
 
-![真实数据 Native 的专家和原属 rank 峰均比随训练步的变化](assets/pangu-a5-ep16-bf16-real/route-skew-by-step.png)
+![真实数据 Native 在第 1、10、99 步的专家和原属 rank 峰均比](assets/pangu-a5-ep16-bf16-real/route-skew-by-step.png)
 
 ### 2.3 统计口径
 
