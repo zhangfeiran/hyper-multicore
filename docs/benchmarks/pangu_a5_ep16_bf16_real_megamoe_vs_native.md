@@ -29,7 +29,7 @@ Native 使用 PanGu 置换、All-to-All 和 GroupedMatmul。两个 MegaMoE 臂�
 | MegaMoE B0（双 QP） | 2.662 / 2.736 | 99,633 | 40.28% | 48.68 | 8.00 |
 | MegaMoE HotReplica | 2.630 / 2.672 | 100,053 | 40.41% | 48.56 | 8.00 |
 
-![第 1–99 步的逐步耗时](assets/pangu-a5-ep16-bf16-real/step-time.png)
+![第 1–98 步的逐步耗时](assets/pangu-a5-ep16-bf16-real/step-time.png)
 
 ![PanGu 日志 MFU](assets/pangu-a5-ep16-bf16-real/trainer-mfu.png)
 
@@ -48,6 +48,20 @@ HotReplica 在正式窗口有 58/88 步比 B0 快。每 rank 有 3,644/4,576 次
 | 99 | 2.07× | 2.09× | 57.79% |
 
 — 表示当步零次普通前向借槽。
+
+#### 路由负载随训练变化
+
+取 Native 每个采样步的七层 × 四微批，共 28 次普通前向。专家峰均比为最忙专家接收行数除以 96 个专家的均值。每个 rank 汇总六个原属专家的接收行数，再以最忙 rank 除以 16 个 rank 的均值，得到 rank 峰均比。
+
+| 采样步 | 专家峰均比 P50 / 最大 | 原属 rank 峰均比 P50 / 最大 |
+| --- | --- | --- |
+| 1 | 2.87× / 4.20× | 1.38× / 1.83× |
+| 10 | 2.58× / 3.71× | 1.36× / 1.60× |
+| 99 | 7.75× / 9.61× | 2.07× / 3.15× |
+
+第 1 到第 10 步，两项峰均比均略降。第 99 步，专家和 rank 峰均比的中位数分别升至 7.75× 和 2.07×，最忙 rank 的单次峰均比达到 3.15×。路由直方图采集于第 1、10、99 步，图中展示前两个采样点。 [路由采样明细](assets/pangu-a5-ep16-bf16-synthetic/route-skew-comparison.json)
+
+![真实数据 Native 的专家和原属 rank 峰均比随训练步的变化](assets/pangu-a5-ep16-bf16-real/route-skew-by-step.png)
 
 ### 2.3 统计口径
 
@@ -92,9 +106,11 @@ Native 与 B0 在第 1、10、99 步的 832 个 Top-K 哈希各自全部一致�
 | HotReplica | 2 | 2 | 6.502 / 7.931 / 10.207 |
 | HotReplica | 2 | 15 | 5.853 / 7.925 / 10.118 |
 
-[节点 0 核内流水](assets/pangu-a5-ep16-bf16-real/moe-pipeline-node0.pdf) · [节点 1 核内流水](assets/pangu-a5-ep16-bf16-real/moe-pipeline-node1.pdf)
+下图各取一次首微批前向。B0 为第 4 层 rank 3，HotReplica 为实际启用副本的第 2 层 rank 2。每条泳道对应一个 AIV 或 AIC 的 block ID，彩色区间为任务执行，灰色区间为等待和调度控制。横轴以各自最早的 worker 进核时刻为零，竖虚线标记最后一条记录结束。两张图各自展示所采层的通算重叠。
 
-![真实数据第 99 步优化 B0 和 HotReplica 的核内流水](assets/pangu-a5-ep16-bf16-real/moe-pipeline-node0.png)
+![真实数据 MegaMoE B0 第 4 层 rank 3 的逐 AIV 和 AIC 前向流水](assets/pangu-a5-ep16-bf16-real/moe-pipeline-b0.png)
+
+![真实数据 HotReplica 第 2 层 rank 2 的逐 AIV 和 AIC 前向流水](assets/pangu-a5-ep16-bf16-real/moe-pipeline-hotreplica.png)
 
 ## 5. MoE 层加速比
 
