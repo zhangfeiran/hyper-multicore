@@ -1,6 +1,7 @@
 // Copyright 2026 Huawei Technologies Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0
-#pragma once
+#ifndef HMC_MOE_A3_INDEXED_TRANSFER_H_
+#define HMC_MOE_A3_INDEXED_TRANSFER_H_
 
 #include "a3_indexed_push.h"
 #include "data_plane/rma.h"
@@ -85,3 +86,5 @@ __aicore__ inline void PutIndexedRows(
 }
 #endif
 }  // namespace hyper_multicore
+
+#endif  // HMC_MOE_A3_INDEXED_TRANSFER_H_

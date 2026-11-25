@@ -1,6 +1,7 @@
 /* Copyright 2026 Huawei Technologies Co., Ltd. All rights reserved.
  * Licensed under the Apache License, Version 2.0. */
-#pragma once
+#ifndef HMC_MOE_TRANSPORT_TASK_H_
+#define HMC_MOE_TRANSPORT_TASK_H_
 #include "data_plane/rma.h"
 #include "runtime/runtime_config.hpp"
 #include "common/mega_moe/task_options.h"
@@ -152,3 +153,5 @@ __aicore__ inline void ExecuteTransfer(const MulticoreRuntime::TaskDesc &task, G
   if (!pull) plane::signal(event, 1, plane::SignalOp::Add, peer);
 }
 }  // namespace MulticoreMoE
+
+#endif  // HMC_MOE_TRANSPORT_TASK_H_

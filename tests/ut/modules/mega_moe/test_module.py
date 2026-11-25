@@ -739,7 +739,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                           torch.nn.Parameter(torch.empty(2, 8, 16, dtype=torch.bfloat16)))
         tokens_per_expert = torch.tensor([256, 0, 0, 0], dtype=torch.int32)
         expected = hidden_states.reshape(128, 16) + 1
-        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=False, dynamic_tokens=False, dispatch_mode="push",
+        resources = SimpleNamespace(a5_indexed_push=False, spec=SimpleNamespace(auto_tokens=False, dynamic_tokens=False, dispatch_mode="push",
                                                          apply_probs_before_fc2=False),
                                     plan=object(), workspace=object(), ensure_capacity=Mock(), placement=None,
                                     plan_for_tokens=Mock())
@@ -818,6 +818,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         )
         workspace = Mock()
         resources = SimpleNamespace(
+            a5_indexed_push=False,
             spec=SimpleNamespace(auto_tokens=True, apply_probs_before_fc2=False,
                                  dispatch_mode=experts._resource_group.specification["dispatch_mode"]),
             workspace=workspace, prepare_auto_workspace=Mock(), plan_for_tokens=Mock(return_value=object()),
@@ -864,6 +865,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             metadata=SimpleNamespace(plan_tokens=128), maximum_received_slots=4,
         )
         resources = SimpleNamespace(
+            a5_indexed_push=False,
             spec=SimpleNamespace(auto_tokens=False, dispatch_mode="push", apply_probs_before_fc2=True),
             workspace=object(), ensure_capacity=Mock(), placement=None, plan_for_tokens=Mock(return_value=object()),
         )
@@ -992,7 +994,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         Expectation: Reserve and attach through the manager while close only removes the workspace.
         """
         root_group = object()
-        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
+        bound_spec = SimpleNamespace(architecture=2201, ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None,
                                      dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0,
                                      partial_weight_grad_dtype=None)
@@ -1073,7 +1075,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         Expectation: Remove new reservations and detach a newly acquired unused Runtime.
         """
         root_group = object()
-        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
+        bound_spec = SimpleNamespace(architecture=2201, ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None,
                                      dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0,
                                      partial_weight_grad_dtype=None)
@@ -1114,7 +1116,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         """
         root_group = object()
         specification = {"name": "new resource"}
-        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
+        bound_spec = SimpleNamespace(architecture=2201, ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None,
                                      dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0,
                                      partial_weight_grad_dtype=None)

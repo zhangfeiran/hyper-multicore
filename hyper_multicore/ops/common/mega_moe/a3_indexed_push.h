@@ -1,6 +1,7 @@
 // Copyright 2026 Huawei Technologies Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0
-#pragma once
+#ifndef HMC_MOE_A3_INDEXED_PUSH_H_
+#define HMC_MOE_A3_INDEXED_PUSH_H_
 #include <stdint.h>
 
 namespace MulticoreMoE {
@@ -17,3 +18,5 @@ constexpr int32_t A3_INDEXED_TILING_SOURCE_ROWS = 8;
 constexpr int32_t A3_INDEXED_TILING_ROUTE_FENCED = 9;
 constexpr int32_t A3_INDEXED_TILING_SOURCE_SLOTS = 10;
 }  // namespace MulticoreMoE
+
+#endif  // HMC_MOE_A3_INDEXED_PUSH_H_

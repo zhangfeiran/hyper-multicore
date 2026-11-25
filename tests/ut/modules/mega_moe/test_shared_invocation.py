@@ -63,7 +63,7 @@ def test_placed_pull_leases_the_common_workspace(fail_publication):
                                 receive_capacity=1, local_receive_capacity=1, physical_inverse=None)
     binding = SimpleNamespace(placement=placement)
     resources = SimpleNamespace(
-        spec=spec, workspace=workspace,
+        a5_indexed_push=False, spec=spec, workspace=workspace,
         prepare_auto_workspace=Mock(side_effect=lambda *args: setattr(workspace, "in_use", True)),
         placement=Mock(uses_placement_wire=Mock(return_value=False), select=Mock(return_value=binding)),
     )

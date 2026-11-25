@@ -339,7 +339,7 @@ def test_configuration_mismatch_fails_before_optional_capability_collective():
     """Reject inconsistent rank settings before optional capability collectives."""
     cls = resource_module._MegaMoeExecutionResources  # pylint: disable=protected-access
     specification = {"hot_replica": True, "ep_group": object()}
-    spec = SimpleNamespace(local_num_tokens=128)
+    spec = SimpleNamespace(architecture=2201, local_num_tokens=128)
     with (
         patch.object(resource_module, "bind_mega_moe_spec", return_value=spec),
         patch.object(resource_module.dist, "is_initialized", return_value=True),
@@ -438,7 +438,7 @@ def test_checkpoint_converges_weight_errors_before_building_routes(monkeypatch, 
         spec = SimpleNamespace(ep_size=2, ep_group=object(), dispatch_mode="push", auto_tokens=True, top_k=2,
                                precision="bf16")
         placement = SimpleNamespace(statistics={"route_replays": 0, "route_replay_misses": 0})
-        resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=placement, ensure_capacity=Mock())
+        resources = SimpleNamespace(a5_indexed_push=False, spec=spec, workspace=Mock(), placement=placement, ensure_capacity=Mock())
         votes = []
         def gather(out, local, **_kwargs):
             votes.append(int(local))
@@ -535,7 +535,7 @@ def test_forward_uses_injected_planner_after_count_exchange():
     spec = SimpleNamespace(architecture=0, auto_tokens=True, dispatch_mode="push", precision="bf16",
                            intermediate_size=4, rank_id=0, ep_size=2, ep_group=None, transport_engine="mte",
                            num_cube_cores=24, apply_probs_before_fc2=True)
-    owner = SimpleNamespace(spec=spec, workspace=Mock(), prepare_auto_workspace=Mock())
+    owner = SimpleNamespace(a5_indexed_push=False, spec=spec, workspace=Mock(), prepare_auto_workspace=Mock())
     # pylint: disable-next=protected-access
     owner.placement = PlacementResources(owner, expert._resource_group.specification, False)
     counts = torch.tensor([[0, 2, 1, 2, 0, 0, 0], [0, 2, 1, 0, 0, 0, 2]])
@@ -901,7 +901,7 @@ def test_a5_bf16_hard_limit_picks_active_quotas_with_either_execution(mode, tran
 def test_a5_mx_hard_limit_spills_a_k64_group_before_optional_admission():
     spec = MegaMoeSpec(1024, 256, 256, 12, 1, 4, 2048, 2, None, 0, 32, auto_tokens=True,
                        architecture=3510, precision="mxfp8")
-    parent = SimpleNamespace(spec=spec, workspace=None, prepare_auto_workspace=Mock(),
+    parent = SimpleNamespace(a5_indexed_push=False, spec=spec, workspace=None, prepare_auto_workspace=Mock(),
                              _route_spec=lambda experts: replace(spec, num_experts=experts))
     resources = mx_adapter.MXPlacementResources(parent, replica_slots_per_rank=2,
                                                receive_capacity_percent=100, rank_nodes=(0, 1))

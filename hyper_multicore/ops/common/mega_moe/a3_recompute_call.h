@@ -1,6 +1,7 @@
 // Copyright 2026 Huawei Technologies Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0
-#pragma once
+#ifndef HMC_MOE_A3_RECOMPUTE_CALL_H_
+#define HMC_MOE_A3_RECOMPUTE_CALL_H_
 
 #include <stdint.h>
 
@@ -29,3 +30,5 @@ struct A3RecomputeCall {
 };
 static_assert(sizeof(A3RecomputeCall) == 38 * sizeof(uint64_t));
 }  // namespace MulticoreMoE
+
+#endif  // HMC_MOE_A3_RECOMPUTE_CALL_H_

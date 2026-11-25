@@ -372,7 +372,7 @@ class TestMegaMoeFunction(unittest.TestCase):
     def test_compound_call_owns_tiling_before_backward_submission(self) -> None:
         """Retain the tensor behind the nested tiling address while preparing B."""
         runtime = torch.zeros(128, dtype=torch.uint8)
-        spec = SimpleNamespace(rank_id=0, ep_size=2, num_experts=24, hidden_size=4096,
+        spec = SimpleNamespace(architecture=2201, rank_id=0, ep_size=2, num_experts=24, hidden_size=4096,
                                plan_tokens=384, num_cube_cores=24)
         plan = SimpleNamespace(spec=spec, up_proj_tiling=None, swiglu_tiling=None, down_proj_tiling=None)
         ctx = SimpleNamespace(plan=plan, workspace=SimpleNamespace(lease_stream=None), token_rows=257, source_rows=771)
