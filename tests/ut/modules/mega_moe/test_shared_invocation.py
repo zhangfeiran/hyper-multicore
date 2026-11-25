@@ -60,7 +60,7 @@ def test_placed_pull_leases_the_common_workspace(fail_publication):
     table = torch.tensor([[0, 1, 0, 0], [0, 0, 0, 0]])
     workspace = Mock(in_use=False, source_buffer=torch.empty(8, 64))
     placement = SimpleNamespace(counts_by_source=table, virtual_ids=virtual_ids, route_metadata=None,
-                                receive_capacity=1, local_receive_capacity=1)
+                                receive_capacity=1, local_receive_capacity=1, physical_inverse=None)
     binding = SimpleNamespace(placement=placement)
     resources = SimpleNamespace(
         spec=spec, workspace=workspace,
