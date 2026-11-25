@@ -323,7 +323,9 @@ class TestMegaMoeFunction(unittest.TestCase):
             routed_buffer=hidden.new_empty((source_slots, 4)), gmm_workspace=torch.empty(16, dtype=torch.uint8),
             recompute_workspace=torch.empty(cap * (4 * 2 + 32) + source_slots * 32, dtype=torch.uint8),
         )
-        route = SimpleNamespace(metadata=metadata, indexed_dispatch_offsets=None, unpermute_mapping=None)
+        slot_to_physical = torch.argsort(torch.argsort(ids.reshape(-1), stable=True)).to(torch.int32)
+        route = SimpleNamespace(metadata=metadata, indexed_dispatch_offsets=None,
+                                unpermute_mapping=slot_to_physical)
         context = SimpleNamespace(
             weight_binding=None, workspace=workspace, deferred_recompute=SimpleNamespace(route=route),
             plan=SimpleNamespace(spec=SimpleNamespace(

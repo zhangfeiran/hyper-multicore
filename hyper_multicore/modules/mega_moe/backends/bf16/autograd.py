@@ -480,19 +480,18 @@ def _launch_deferred_recompute(ctx, saved_tensors):
 
 def _prepare_fused_recompute(ctx, saved_tensors):
     """Bind the frozen physical route without constructing any top-K hidden rows."""
-    tokens, weight1, weight2, probabilities, ids = saved_tensors
+    tokens, weight1, weight2, probabilities, _ids = saved_tensors
     route = ctx.deferred_recompute.route
     workspace, plan = ctx.workspace, ctx.plan
     spec = plan.spec
     metadata = route.metadata.for_kernel(spec.hidden_size)
     offsets, mapping = route.indexed_dispatch_offsets, route.unpermute_mapping
+    slot_to_physical = mapping.to(torch.int64)
     if offsets is None:
-        binding = ctx.weight_binding
-        physical_ids = ids if binding is None else binding.placement.virtual_ids
-        sorted_slots = torch.argsort(physical_ids.reshape(-1), stable=True)
-        mapping = torch.empty_like(sorted_slots, dtype=torch.int32)
-        mapping.scatter_(0, sorted_slots, torch.arange(sorted_slots.numel(), dtype=torch.int32, device=ids.device))
-        source_rows = sorted_slots.div(spec.top_k, rounding_mode="floor").to(torch.int32)
+        slots = torch.arange(mapping.numel(), dtype=torch.int32, device=tokens.device)
+        source_rows = torch.empty_like(slots).scatter_(
+            0, slot_to_physical, slots.div(spec.top_k, rounding_mode="floor"),
+        )
         offsets = a3_indexed.pack_dispatch_offsets(metadata.dispatch_src_off, source_rows)
     capacity = metadata.expert_capacity
     forward = _prepare_forward_execution(workspace, plan, tokens, capacity)
@@ -511,7 +510,7 @@ def _prepare_fused_recompute(ctx, saved_tensors):
     received_p = storage[data_bytes:data_bytes + probability_bytes]
     returned_dp = storage[data_bytes + probability_bytes:].view(torch.float32).view(-1, packet_size)
     source_p = torch.zeros((mapping.numel(), packet_size), dtype=torch.float32, device=tokens.device)
-    source_p[:, 0].scatter_(0, mapping.to(torch.int64), probabilities.reshape(-1).float())
+    source_p[:, 0].scatter_(0, slot_to_physical, probabilities.reshape(-1).float())
     local_dp = source_p.new_empty((capacity, packet_size))
     barrier = torch.zeros(8, dtype=torch.int32, device=tokens.device)
     recompute = _RecomputeExecution(

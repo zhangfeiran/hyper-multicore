@@ -124,7 +124,9 @@ def _record_checkpoint_route(route, record, counts, ids):
         return route
     if counts is not None:
         return replace(route, checkpoint_record=record) if record.guest_snapshot_bytes or record.defer_expert_recompute else route
-    mapping = route.unpermute_mapping if route.indexed_dispatch_offsets is not None else None
+    keep_mapping = (route.indexed_dispatch_offsets is not None
+                    or (record.defer_expert_recompute and record.owner.workspace.a3_fused_recompute))
+    mapping = route.unpermute_mapping if keep_mapping else None
     record.route = replace(route, routed_tokens=None, unpermute_mapping=mapping, count_fence=None)
     record.ids = ids.detach().clone()
     record.weight_binding = route.weight_binding
