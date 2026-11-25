@@ -1,0 +1,92 @@
+{
+  "formal_window": [
+    11,
+    98
+  ],
+  "profile_step": 99,
+  "arms": {
+    "native": {
+      "step_ms": {
+        "n": 88,
+        "mean": 2947.1985399723053,
+        "p50": 2953.53102684021,
+        "p95": 3185.014009475708,
+        "min": 2594.040870666504,
+        "max": 3196.5506076812744
+      },
+      "mfu_pct": 35.97840909090909,
+      "memory_gib": {
+        "allocated_formal": 29.04723024368286,
+        "reserved_formal": 32.111328125,
+        "hbm_formal": 40.693359375,
+        "hbm_profile": 40.6953125
+      },
+      "approx_hbm_interval_sec": 1.1679996434999997,
+      "tokens_per_second": 88946.84102363302,
+      "throughput_gain": 0.0,
+      "p50_step_reduction": 0.0,
+      "memory_savings": {
+        "allocated_formal": 0.0,
+        "reserved_formal": 0.0
+      }
+    },
+    "b0": {
+      "step_ms": {
+        "n": 88,
+        "mean": 2822.804881767793,
+        "p50": 2860.010266304016,
+        "p95": 2979.923963546753,
+        "min": 2490.8528327941895,
+        "max": 3028.1224250793457
+      },
+      "mfu_pct": 37.570454545454545,
+      "memory_gib": {
+        "allocated_formal": 29.050557613372803,
+        "reserved_formal": 32.12890625,
+        "hbm_formal": 49.2138671875,
+        "hbm_profile": 49.2138671875
+      },
+      "approx_hbm_interval_sec": 1.1699608337499998,
+      "tokens_per_second": 92866.49661588768,
+      "throughput_gain": 0.044067395167111334,
+      "p50_step_reduction": 0.0316640521756244,
+      "memory_savings": {
+        "allocated_formal": -0.00011455032586682456,
+        "reserved_formal": -0.0005474119579100822
+      }
+    },
+    "hot": {
+      "step_ms": {
+        "n": 88,
+        "mean": 2708.201226862994,
+        "p50": 2717.978000640869,
+        "p95": 2771.0769176483154,
+        "min": 2534.886121749878,
+        "max": 2816.3092136383057
+      },
+      "mfu_pct": 39.08409090909091,
+      "memory_gib": {
+        "allocated_formal": 28.05534029006958,
+        "reserved_formal": 31.388671875,
+        "hbm_formal": 48.48046875,
+        "hbm_profile": 48.482421875
+      },
+      "approx_hbm_interval_sec": 1.16998858,
+      "tokens_per_second": 96796.35227979375,
+      "throughput_gain": 0.08824946637593478,
+      "p50_step_reduction": 0.07975302241918336,
+      "memory_savings": {
+        "allocated_formal": 0.03414748825592406,
+        "reserved_formal": 0.022504713825193146
+      }
+    }
+  },
+  "hotreplica": {
+    "formal_invocations": 4576,
+    "formal_placements": 4302,
+    "profile_invocations": 52,
+    "profile_placements": 39,
+    "faster_steps_than_b0": 72,
+    "p50_step_reduction_vs_b0": 0.0496614530851649
+  }
+}

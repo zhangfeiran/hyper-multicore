@@ -1,0 +1,89 @@
+{
+  "scope": "Native, EP16/E96, 16 ranks, seven MoE layers, one case per layer and microbatch at each sampled step",
+  "expert_max_ratio": "maximum expert rows divided by mean across 96 experts",
+  "owner_max_ratio": "maximum rank rows divided by mean across 16 ranks, using each rank's six resident experts",
+  "groups": {
+    "synthetic": {
+      "run_id": "20261125-172858-16094f3c",
+      "samples": {
+        "1": {
+          "expert_max_ratio": {
+            "n": 28,
+            "p50": 9.193817138671875,
+            "max": 11.5601806640625
+          },
+          "owner_max_ratio": {
+            "n": 28,
+            "p50": 2.6912384033203125,
+            "max": 3.877716064453125
+          }
+        },
+        "10": {
+          "expert_max_ratio": {
+            "n": 28,
+            "p50": 7.35406494140625,
+            "max": 9.9268798828125
+          },
+          "owner_max_ratio": {
+            "n": 28,
+            "p50": 2.475006103515625,
+            "max": 3.4014892578125
+          }
+        },
+        "99": {
+          "expert_max_ratio": {
+            "n": 28,
+            "p50": 4.50640869140625,
+            "max": 6.88604736328125
+          },
+          "owner_max_ratio": {
+            "n": 28,
+            "p50": 1.5953521728515625,
+            "max": 1.917816162109375
+          }
+        }
+      }
+    },
+    "real": {
+      "run_id": "20261125-181233-b9fe144e",
+      "samples": {
+        "1": {
+          "expert_max_ratio": {
+            "n": 28,
+            "p50": 2.870269775390625,
+            "max": 4.20062255859375
+          },
+          "owner_max_ratio": {
+            "n": 28,
+            "p50": 1.384796142578125,
+            "max": 1.82940673828125
+          }
+        },
+        "10": {
+          "expert_max_ratio": {
+            "n": 28,
+            "p50": 2.57794189453125,
+            "max": 3.70880126953125
+          },
+          "owner_max_ratio": {
+            "n": 28,
+            "p50": 1.3578338623046875,
+            "max": 1.596832275390625
+          }
+        },
+        "99": {
+          "expert_max_ratio": {
+            "n": 28,
+            "p50": 7.7508544921875,
+            "max": 9.61065673828125
+          },
+          "owner_max_ratio": {
+            "n": 28,
+            "p50": 2.071990966796875,
+            "max": 3.145233154296875
+          }
+        }
+      }
+    }
+  }
+}

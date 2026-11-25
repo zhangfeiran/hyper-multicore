@@ -1,0 +1,218 @@
+{
+  "step": 99,
+  "rank": 0,
+  "moe_layer": 6,
+  "microbatch": 1,
+  "phase": "forward",
+  "speedup": 1.2813028976734675,
+  "arms": {
+    "native": {
+      "event_span_ms": 23.804733276367188,
+      "trace_interval_ms": 23.804758,
+      "caller_stream": 61,
+      "intervals_ms": {
+        "All-to-All": [
+          [
+            3.491874,
+            7.339112
+          ],
+          [
+            11.271679,
+            23.621553
+          ]
+        ],
+        "GroupedMatmul / SwiGLU": [
+          [
+            2.555207,
+            2.570105
+          ],
+          [
+            7.590495,
+            9.881863
+          ],
+          [
+            9.881885,
+            9.963234
+          ],
+          [
+            9.963256,
+            11.104385
+          ]
+        ],
+        "Other linked NPU work": [
+          [
+            0.0,
+            23.622308
+          ],
+          [
+            23.773103,
+            23.804737
+          ]
+        ],
+        "Permute / unpermute": [
+          [
+            3.298163,
+            3.485378
+          ],
+          [
+            7.339886,
+            7.588041
+          ],
+          [
+            11.104407,
+            11.270805
+          ],
+          [
+            23.622447,
+            23.77308
+          ]
+        ]
+      },
+      "task_names": {
+        "All-to-All": [
+          "hcom_alltoallv_AicpuKernel_963_16_1",
+          "hcom_alltoallv_AicpuKernel_963_17_1"
+        ],
+        "GroupedMatmul / SwiGLU": [
+          "SwiGlu",
+          "aclnnGroupedMatmulV5_GroupedMatmul_GroupedMatmul"
+        ],
+        "Other linked NPU work": [
+          "EVENT WAIT",
+          "MEMCPY_ASYNC",
+          "aclnnAdd_AddAiCore_Add",
+          "aclnnAdds_AddAiCore_Add",
+          "aclnnCumsum_CumsumAiCore_Cumsum",
+          "aclnnDiv_RealDivAiCore_RealDiv",
+          "aclnnGather_GatherElements_GatherElements",
+          "aclnnHistc_CastAiCore_Cast",
+          "aclnnHistc_HistogramAiCore_HistogramV2",
+          "aclnnInplaceCopy_CastAiCore_Cast",
+          "aclnnInplaceCopy_SliceAiCore_Slice",
+          "aclnnInplaceCopy_TensorMoveAiCore_TensorMove",
+          "aclnnInplaceFillScalar_FillAiCore_Fill",
+          "aclnnLogSumExp_AbsAiCore_Abs",
+          "aclnnLogSumExp_AddAiCore_Add",
+          "aclnnLogSumExp_EqualAiCore_Equal",
+          "aclnnLogSumExp_MaskedFillAiCore_MaskedFill",
+          "aclnnLogSumExp_ReduceLogSumExpAiCore_ReduceLogSumExp",
+          "aclnnLogSumExp_ReduceMaxAiCore_ReduceMax",
+          "aclnnLogSumExp_SubAiCore_Sub",
+          "aclnnLog_LogAiCore_Log",
+          "aclnnMatmul_MatMulV3Common_MatMulV3",
+          "aclnnMean_ReduceMeanAiCore_ReduceMean",
+          "aclnnMul_CastAiCore_Cast",
+          "aclnnMul_MulAiCore_Mul",
+          "aclnnMuls_MulAiCore_Mul",
+          "aclnnPowTensorScalar_SquareAiCore_Square",
+          "aclnnReduceSum_ReduceSumOpAiCore_ReduceSum",
+          "aclnnReduceSum_SliceAiCore_Slice",
+          "aclnnRepeatInterleave_RepeatInterleave_RepeatInterleave",
+          "aclnnSigmoid_SigmoidAiCore_Sigmoid",
+          "aclnnSub_SubAiCore_Sub",
+          "aclnnTopkV2_TopkV2AiCoreForDavid_TopKV2",
+          "hcom_allGather_AicpuKernel_127_5_1",
+          "hcom_allGather_AicpuKernel_909_70_1",
+          "hcom_allGather_AicpuKernel_909_71_1",
+          "hcom_allGather_AicpuKernel_909_72_1",
+          "hcom_allGather_AicpuKernel_963_15_1"
+        ],
+        "Permute / unpermute": [
+          "aclnnMoeTokenPermute_MoeInitRoutingV2_MoeInitRoutingV2",
+          "aclnnMoeTokenUnpermuteWithRoutingMap_MoeTokenUnpermuteWithRoutingMapAICore_MoeTokenUnpermuteWithRoutingMap",
+          "aclnnMoeTokenUnpermute_MoeFinalizeRoutingV2_MoeFinalizeRoutingV2"
+        ]
+      }
+    },
+    "b0": {
+      "event_span_ms": 18.578536987304688,
+      "trace_interval_ms": 18.578556,
+      "caller_stream": 61,
+      "intervals_ms": {
+        "GroupedMatmul / SwiGLU": [
+          [
+            1.881137,
+            1.894741
+          ]
+        ],
+        "MegaMoE fused kernel": [
+          [
+            3.607664,
+            18.400936
+          ]
+        ],
+        "Other linked NPU work": [
+          [
+            0.0,
+            7.250176
+          ],
+          [
+            18.546978,
+            18.578535
+          ]
+        ],
+        "Permute / unpermute": [
+          [
+            2.581336,
+            2.788528
+          ],
+          [
+            18.400958,
+            18.546906
+          ]
+        ]
+      },
+      "task_names": {
+        "GroupedMatmul / SwiGLU": [
+          "SwiGlu"
+        ],
+        "MegaMoE fused kernel": [
+          "aclnnHyperMegaMoe_HyperMegaMoe_HyperMegaMoe"
+        ],
+        "Other linked NPU work": [
+          "EVENT WAIT",
+          "MEMCPY_ASYNC",
+          "aclnnAdd_AddAiCore_Add",
+          "aclnnAdds_AddAiCore_Add",
+          "aclnnCat_ConcatD_ConcatD",
+          "aclnnDiv_RealDivAiCore_RealDiv",
+          "aclnnGather_GatherElements_GatherElements",
+          "aclnnHistc_CastAiCore_Cast",
+          "aclnnHistc_HistogramAiCore_HistogramV2",
+          "aclnnInplaceCopy_CastAiCore_Cast",
+          "aclnnInplaceCopy_TensorMoveAiCore_TensorMove",
+          "aclnnInplaceFillScalar_FillAiCore_Fill",
+          "aclnnInplaceZero_ZerosLikeAiCore_ZerosLike",
+          "aclnnLogSumExp_AbsAiCore_Abs",
+          "aclnnLogSumExp_AddAiCore_Add",
+          "aclnnLogSumExp_EqualAiCore_Equal",
+          "aclnnLogSumExp_MaskedFillAiCore_MaskedFill",
+          "aclnnLogSumExp_ReduceLogSumExpAiCore_ReduceLogSumExp",
+          "aclnnLogSumExp_ReduceMaxAiCore_ReduceMax",
+          "aclnnLogSumExp_SubAiCore_Sub",
+          "aclnnLog_LogAiCore_Log",
+          "aclnnMatmul_MatMulV3Common_MatMulV3",
+          "aclnnMean_ReduceMeanAiCore_ReduceMean",
+          "aclnnMul_CastAiCore_Cast",
+          "aclnnMul_MulAiCore_Mul",
+          "aclnnMuls_MulAiCore_Mul",
+          "aclnnPowTensorScalar_SquareAiCore_Square",
+          "aclnnReduceSum_ReduceSumOpAiCore_ReduceSum",
+          "aclnnSigmoid_SigmoidAiCore_Sigmoid",
+          "aclnnSub_SubAiCore_Sub",
+          "aclnnTopkV2_TopkV2AiCoreForDavid_TopKV2",
+          "hcom_allGather_AicpuKernel_127_5_1",
+          "hcom_allGather_AicpuKernel_909_70_1",
+          "hcom_allGather_AicpuKernel_909_71_1",
+          "hcom_allGather_AicpuKernel_909_72_1",
+          "hcom_allGather_AicpuKernel_963_11_1",
+          "hcom_allReduce_AicpuKernel_963_10_1"
+        ],
+        "Permute / unpermute": [
+          "aclnnMoeTokenPermute_MoeInitRoutingV2_MoeInitRoutingV2",
+          "aclnnMoeTokenUnpermute_MoeFinalizeRoutingV2_MoeFinalizeRoutingV2"
+        ]
+      }
+    }
+  }
+}

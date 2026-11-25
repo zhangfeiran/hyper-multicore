@@ -1,0 +1,69 @@
+{
+  "original_report": {
+    "filename": "megamoe_report_20261125.html",
+    "sha256": "4d2d1421d423a62e2225994bb7acd6e64cf834f98dd38008533999b69fcb9e96",
+    "sections": [
+      "5.1",
+      "5.3",
+      "5.4",
+      "5.5",
+      "Appendix B"
+    ],
+    "figures": [
+      "fig07",
+      "fig08a",
+      "fig08b"
+    ]
+  },
+  "workload": {
+    "platform": "ascend950",
+    "model": "500B",
+    "dtype": "BF16",
+    "hidden": 5120,
+    "expert_intermediate": 1792,
+    "experts": 384,
+    "top_k": 8,
+    "routing": "fixed"
+  },
+  "training": {
+    "median_steps": [
+      26,
+      50
+    ],
+    "scope": "Equal training work per device, different run sizes",
+    "measurements": {
+      "Native": {
+        "mfu_pct": 37.1,
+        "step_s": 50.233
+      },
+      "MegaMoE": {
+        "mfu_pct": 42.6,
+        "step_s": 43.745
+      }
+    }
+  },
+  "cann_core_medians_ms": {
+    "forward": {
+      "native": 8.514,
+      "megamoe": 6.235
+    },
+    "recompute": {
+      "native": 8.466,
+      "megamoe": 6.234
+    },
+    "backward": {
+      "native": 12.876,
+      "megamoe": 10.033
+    }
+  },
+  "figures": {
+    "fix-router-bf16-forward.png": {
+      "source_figure": "fig08a",
+      "sha256": "b33051277507816b2323b4cbb57047074d438fdd86491677af84935b2d98977f"
+    },
+    "fix-router-bf16-backward.png": {
+      "source_figure": "fig08b",
+      "sha256": "4104000cae3fa160df1bcd84719780730ec01f4bf4af582ecee7f25190c613f0"
+    }
+  }
+}

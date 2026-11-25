@@ -1,0 +1,33 @@
+{
+  "rank": 15,
+  "formal_window": [
+    11,
+    98
+  ],
+  "max_absolute_difference": {
+    "native-b0": {
+      "mtp_head_0_loss": 0.0,
+      "mtp_head_1_loss": 0.0,
+      "gradient_norm": 0.0,
+      "lr": 0.0
+    },
+    "native-hot": {
+      "mtp_head_0_loss": 0.010796999999999946,
+      "mtp_head_1_loss": 0.010655999999999999,
+      "gradient_norm": 2.2416700000000027,
+      "lr": 0.0
+    },
+    "b0-hot": {
+      "mtp_head_0_loss": 0.010796999999999946,
+      "mtp_head_1_loss": 0.010655999999999999,
+      "gradient_norm": 2.2416700000000027,
+      "lr": 0.0
+    }
+  },
+  "formal_mfu_step_mean_pct": {
+    "native": 35.97840909090909,
+    "b0": 37.570454545454545,
+    "hot": 39.08409090909091
+  },
+  "source": "PanGu Trainer stdout on rank 15"
+}
