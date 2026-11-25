@@ -49,9 +49,16 @@ class ReplayRecord:
     allow_guest_restore: bool = False
     replay_count_fence: a3_indexed.CountFence | None = None
     defer_expert_recompute: bool = False
+    reentrant: bool = False
     deferred_output: torch.Tensor | None = None
     deferred_probabilities: torch.Tensor | None = None
     deferred_versions: tuple[int, int] | None = None
+
+    def retain_output(self, output: torch.Tensor, probabilities: torch.Tensor) -> None:
+        """Retain the owned output and validate its generation at replay."""
+        self.deferred_output = output.detach()
+        self.deferred_probabilities = probabilities.detach()
+        self.deferred_versions = output._version, probabilities._version
 
 
 @dataclass
@@ -91,8 +98,6 @@ class ReplayCheckpoint:
         """
         if type(guest_snapshot_bytes) is not int or guest_snapshot_bytes < 0:
             raise ValueError("guest_snapshot_bytes must be a nonnegative integer")
-        if defer_expert_recompute and not defer_forward_copies:
-            raise ValueError("Deferred expert recompute requires non-reentrant checkpoint copy deferral")
         self.parameter_version = parameter_version
         self.prepare_replay = prepare_replay
         self.defer_forward_copies = defer_forward_copies
@@ -109,6 +114,9 @@ class ReplayCheckpoint:
             raise RuntimeError("Deferring forward copies requires a grad-enabled non-reentrant checkpoint")
         if self.guest_snapshot_bytes and not torch.is_grad_enabled():
             raise RuntimeError("Guest weight snapshots require a grad-enabled non-reentrant checkpoint")
+        if (self.defer_expert_recompute and not self.defer_forward_copies
+                and replay != torch.is_grad_enabled()):
+            raise RuntimeError("Reentrant expert recompute requires a no-grad forward and grad-enabled replay")
         version = self.parameter_version()
         if not replay:
             if self.started:
@@ -150,6 +158,7 @@ def guest_weight_replay(record: ReplayRecord | None) -> tuple[ReplayRecord, bool
 
 def wrap_checkpoint(
     function: Callable[..., Any], parameter_version: Callable[[], Any], *, prepare_replay: bool = False,
+    defer_expert_recompute: bool = False,
 ) -> Callable[..., Any]:
     """Wrap one checkpoint call with state scoped to its original and replay forwards.
 
@@ -157,8 +166,11 @@ def wrap_checkpoint(
     sharded module. A changed version disables weight and activation reuse.
     When requested, restore the saved borrowed suffix before recompute reads
     any FSDP parameters. Route agreement still happens at the consumer.
+    On a qualified A3 MTE Push executor, deferred expert recompute retains
+    the owned output and runs the expert recompute in the backward launch.
     """
-    tape = ReplayCheckpoint(parameter_version, prepare_replay=prepare_replay)
+    tape = ReplayCheckpoint(parameter_version, prepare_replay=prepare_replay,
+                            defer_expert_recompute=defer_expert_recompute)
 
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -174,7 +186,7 @@ def is_checkpointing() -> bool:
     return _ACTIVE.get() is not None
 
 
-def route_record(owner: Any) -> tuple[ReplayRecord | None, bool]:
+def route_record(owner: Any, *, defer_reentrant: bool = False) -> tuple[ReplayRecord | None, bool]:
     """Get the record corresponding to the current invocation in this checkpoint."""
     scope = _ACTIVE.get()
     if scope is None:
@@ -182,7 +194,8 @@ def route_record(owner: Any) -> tuple[ReplayRecord | None, bool]:
     if not scope.replay:
         record = ReplayRecord(
             owner, guest_snapshot_bytes=scope.guest_snapshot_bytes if scope.same_parameters else 0,
-            defer_expert_recompute=scope.defer_expert_recompute,
+            defer_expert_recompute=scope.defer_expert_recompute and (scope.defer_forward_copies or defer_reentrant),
+            reentrant=not scope.defer_forward_copies,
         )
         scope.records.append(record)
         return record, False
@@ -195,11 +208,12 @@ def route_record(owner: Any) -> tuple[ReplayRecord | None, bool]:
 
 def agree_replay(
     record: ReplayRecord | None, hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
-    counts: torch.Tensor | None, spec: Any, mask: int, *, weight_error: bool,
+    counts: torch.Tensor | None, spec: Any, mask: int, *, weight_error: bool, defer_reentrant: bool = False,
 ) -> bool:
     """Agree across EP on exact routing and independent activation validity."""
     scope = _ACTIVE.get()
-    deferred = scope is not None and scope.defer_expert_recompute
+    deferred = (scope is not None and scope.defer_expert_recompute
+                and (scope.defer_forward_copies or defer_reentrant))
     if record is not None:
         record.replay_count_fence = None
     valid = (

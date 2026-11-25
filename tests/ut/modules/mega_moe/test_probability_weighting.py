@@ -179,6 +179,7 @@ class TestProbabilityWeighting(unittest.TestCase):
         probs = torch.tensor([[0., .25], [.5, .75]])
         rows = torch.arange(8.).reshape(4, 2)
         route = SimpleNamespace(routed_tokens=rows, unpermute_mapping=mapping,
+                                count_fence=None, indexed_dispatch_offsets=None,
                                 metadata=SimpleNamespace(expert_capacity=4, for_kernel=lambda width: None))
         spec.hidden_size = 2
         execution = SimpleNamespace(source=rows, combine=rows)

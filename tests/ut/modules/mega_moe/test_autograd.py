@@ -257,7 +257,8 @@ class TestMegaMoeFunction(unittest.TestCase):
             gmm_workspace=torch.empty(1), swiglu_grad_workspace=torch.empty(1),
             a3_fused_recompute=False,
         )
-        record = SimpleNamespace(route=route, allow_guest_restore=False)
+        from hyper_multicore.modules.hot_replica.checkpoint import ReplayRecord
+        record = ReplayRecord(owner=None, route=route)
         launches = []
         phase = False
 
@@ -348,7 +349,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         spec = SimpleNamespace(rank_id=0, ep_size=2, num_experts=24, hidden_size=4096,
                                plan_tokens=384, num_cube_cores=24)
         plan = SimpleNamespace(spec=spec, up_proj_tiling=None, swiglu_tiling=None, down_proj_tiling=None)
-        ctx = SimpleNamespace(plan=plan, workspace=SimpleNamespace(lease_stream=None), token_rows=257)
+        ctx = SimpleNamespace(plan=plan, workspace=SimpleNamespace(lease_stream=None), token_rows=257, source_rows=771)
         tensor = torch.ones((1, 4), dtype=torch.bfloat16)
         trace = torch.empty_like(runtime)
         forward = SimpleNamespace(source=tensor, gmm_workspace=None, event_counters=runtime)
@@ -360,7 +361,7 @@ class TestMegaMoeFunction(unittest.TestCase):
 
         def watch_tiling(words, **options):
             result = original_tensor(words, **options)
-            if len(words) == 10:
+            if len(words) == 11:
                 tiling_references.append(weakref.ref(result))
             return result
 
@@ -378,6 +379,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertEqual(words[-4:].tolist(), [trace.data_ptr(), 0, 3, 0])
         self.assertTrue(any(t is trace for t in call.operands))
         self.assertEqual(tiling()[6].item(), runtime.numel())
+        self.assertEqual(tiling()[8:].tolist(), [257, 0, 771])
         del call
         self.assertIsNone(tiling())
 

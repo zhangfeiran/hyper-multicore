@@ -30,11 +30,9 @@ namespace {
 constexpr int kBlocks = 32;
 constexpr int kAlignment = 64;
 constexpr int kMaximumExperts = 512;
-constexpr int kOrderedExperts = 128;
-constexpr int kOrderedTopK = 8;
-constexpr int kOrderedStride = 136;
+constexpr int kOrderedMaximumTopK = 8;
 constexpr int kOrderedMaximumRows = 16384;
-using OrderedRouteLaunch = int (*)(void *, void *, void *, void *, void *, void *, int, int, int);
+using OrderedRouteLaunch = int (*)(void *, void *, void *, void *, void *, void *, int, int, int, int, int);
 using PayloadLaunch = int (*)(void *, void *, void *, void *, int64_t, int, int, int, int, int);
 
 struct CounterLibrary {
@@ -49,7 +47,7 @@ struct CounterLibrary {
     payload = reinterpret_cast<PayloadLaunch>(dlsym(handle, "launch_replica_route_payload"));
     TORCH_CHECK(version != nullptr && version() == 2 && payload != nullptr,
                 "queued replica counts require count payload ABI 2");
-    ordered_route = reinterpret_cast<OrderedRouteLaunch>(dlsym(handle, "launch_a3_ordered_replica_route"));
+    ordered_route = reinterpret_cast<OrderedRouteLaunch>(dlsym(handle, "launch_a3_ordered_replica_route_v2"));
     // Device code and queued launches retain these symbols until process exit.
   }
 };
@@ -98,10 +96,11 @@ at::Tensor RoutePayload(const at::Tensor &ids, int64_t experts, int64_t autograd
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> OrderedRoute(
-    const at::Tensor &ids, int64_t mask, const std::string &library_path) {
+    const at::Tensor &ids, int64_t experts, int64_t mask, const std::string &library_path) {
   TORCH_CHECK(ids.device().type() == c10::DeviceType::PrivateUse1 && ids.dim() == 2 &&
                   (ids.scalar_type() == at::kInt || ids.scalar_type() == at::kLong) &&
-                  ids.size(1) == kOrderedTopK && ids.size(0) > 0 &&
+                  experts >= 1 && experts <= kMaximumExperts && ids.size(1) >= 1 &&
+                  ids.size(1) <= kOrderedMaximumTopK && ids.size(1) <= experts && ids.size(0) > 0 &&
                   ids.size(0) <= kOrderedMaximumRows && mask >= INT32_MIN && mask <= INT32_MAX,
               "invalid A3 ordered replica route geometry, dtype or controls");
   auto launch = GetLibrary(library_path).ordered_route;
@@ -109,8 +108,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> OrderedRoute(
   c10::DeviceGuard guard(ids.device());
   auto source = ids.contiguous();
   const auto options = ids.options().dtype(at::kInt);
-  auto partials = at::empty({kBlocks, kOrderedStride}, options);
-  auto payload = at::empty({kOrderedExperts + 3}, options);
+  const int stride = (experts + kAlignment) / kAlignment * kAlignment;
+  auto partials = at::empty({kBlocks, stride}, options);
+  auto payload = at::empty({experts + 3}, options);
   auto inverse = at::empty({ids.numel()}, options);
   auto order = at::empty({ids.numel()}, options);
   const auto stream = c10_npu::getCurrentNPUStream();
@@ -120,7 +120,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> OrderedRoute(
   }
   auto run = [=]() -> int {
     return launch(native_stream, source.data_ptr(), partials.data_ptr(), payload.data_ptr(), inverse.data_ptr(),
-                  order.data_ptr(), source.size(0), mask, source.element_size());
+                  order.data_ptr(), source.size(0), mask, source.element_size(), experts, source.size(1));
   };
   at_npu::native::OpCommand::RunOpApi("HmcA3OrderedReplicaRoute", run);
   return {payload, inverse, order};
@@ -131,7 +131,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> OrderedRoute(
 TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
   m.def("a3_ordered_replica_route_available(str library_path) -> bool",
         [](const std::string &path) { return GetLibrary(path).ordered_route != nullptr; });
-  m.def("a3_ordered_replica_route(Tensor ids, int mask, str library_path) -> (Tensor, Tensor, Tensor)");
+  m.def("a3_ordered_replica_route(Tensor ids, int experts, int mask, str library_path) -> (Tensor, Tensor, Tensor)");
   m.def("replica_count_queue_version() -> int", []() -> int64_t { return 1; });
   m.def("replica_route_payload(Tensor ids, int experts, int autograd_mask, str library_path) -> Tensor");
 }

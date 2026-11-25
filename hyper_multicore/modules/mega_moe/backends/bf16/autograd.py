@@ -418,9 +418,23 @@ def _save_forward_state(
     return output
 
 
-def _save_deferred_recompute_inputs(ctx, tokens, owner_weights, probabilities, ids):
-    """Save the same five replay inputs in both passes of the checkpoint."""
+def _save_deferred_recompute_inputs(ctx, tokens, owner_weights, probabilities, ids, *,
+                                    plan, workspace, route, weight_binding, record):
+    """Bind a backward context for either kind of checkpoint replay."""
+    ctx.plan = plan
+    ctx.workspace = workspace
+    ctx.weight_binding = weight_binding
+    ctx.all_experts_active = route.all_experts_active
+    ctx.token_rows = tokens.shape[0]
+    ctx.source_rows = ids.numel()
+    ctx.has_permutation = ctx.has_unpermute = True
+    ctx.topk_dtype = probabilities.dtype
+    ctx.defer_forward_copies = False
+    ctx.deferred_recompute = record
     ctx.save_for_backward(tokens, *owner_weights, probabilities, ids)
+    workspace.track_graph(ctx)
+    if weight_binding is not None:
+        weight_binding.track_graph(ctx)
 
 
 def _launch_deferred_recompute(ctx, saved_tensors):
@@ -518,7 +532,7 @@ def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime, *, trace=No
     forward = recompute.forward
     fwd_tiling = torch.tensor((
         spec.rank_id, spec.ep_size, spec.num_experts, spec.hidden_size, spec.plan_tokens, spec.num_cube_cores,
-        fwd_runtime.numel(), forward.event_counters.numel(), ctx.token_rows, 0,
+        fwd_runtime.numel(), forward.event_counters.numel(), ctx.token_rows, 0, ctx.source_rows,
     ), dtype=torch.int64, device=grad_output.device)
     inputs = (
         *_forward_kernel_inputs(recompute.metadata, forward.source, saved.weight1, saved.weight2, forward,
@@ -534,7 +548,7 @@ def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime, *, trace=No
     for value in operands:
         value.record_stream(workspace.lease_stream)
     relaxed_barrier = pg_ready is not None and os.environ.get("HMC_A3_RECOMPUTE_RELAX_AIV_BARRIER") == "1"
-    descriptor = torch.tensor((a3_recompute.CALL_MAGIC, *arguments, a3_recompute.gradient_rows_per_batch(),
+    descriptor = torch.tensor((a3_recompute.CALL_MAGIC, *arguments, a3_recompute.gradient_rows_per_batch(spec.hidden_size),
                                int(relaxed_barrier)),
                               dtype=torch.int64, device=grad_output.device).view(torch.uint8)
     # Stream recording protects queued consumers. It cannot hold the synthetic
@@ -552,7 +566,7 @@ def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
     if keep_graph is not None and not keep_graph():
         workspace.release_graph(ctx)
         record = getattr(ctx, "deferred_recompute", None)
-        if record is not None:
+        if record is not None and not record.reentrant:
             record.deferred_output = record.deferred_probabilities = record.deferred_versions = None
             record.guest_weight_snapshot = None
 
@@ -630,9 +644,11 @@ def _launch_forward_kernel(
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
-    sequence = getattr(spec, "plan_tokens", spec.local_num_tokens)
+    sequence = getattr(spec, "plan_tokens", None)
+    if sequence is None:
+        sequence = spec.local_num_tokens
     if dispatch_offsets is not None:
-        sequence = a3_indexed.launch_sequence(sequence, routed_tokens.shape[0], counts_fenced)
+        sequence = a3_indexed.launch_sequence(sequence, routed_tokens.shape[0], spec.top_k, counts_fenced)
     kernel_parameters = _forward_kernel_inputs(metadata, routed_tokens, weight1, weight2, execution,
                                                dispatch_offsets)
     runtime_override = weight_binding.runtime(plan.fwd_runtime_config) if weight_binding is not None else None
@@ -844,7 +860,13 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         tokens = routed_tokens
         owner_weights = weight1, weight2
         if deferred_recompute is not None and checkpoint_replay:
-            _save_deferred_recompute_inputs(ctx, tokens, owner_weights, topk_weights, permutation[1])
+            if deferred_recompute.reentrant:
+                _save_deferred_recompute_inputs(
+                    ctx, tokens, owner_weights, topk_weights, permutation[1], plan=plan, workspace=workspace,
+                    route=route, weight_binding=weight_binding, record=deferred_recompute,
+                )
+            else:
+                ctx.save_for_backward(tokens, *owner_weights, topk_weights, permutation[1])
             return deferred_recompute.deferred_output.detach()
         metadata = route.for_kernel(spec.hidden_size)
         permutation_inputs = ()
@@ -919,17 +941,11 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                     )
                 else:
                     output = tokens.new_empty(tokens.shape)
-                deferred_recompute.deferred_output = output.detach()
-                deferred_recompute.deferred_probabilities = topk_weights.detach()
-                deferred_recompute.deferred_versions = output._version, topk_weights._version
-                ctx.plan = plan
-                ctx.workspace = workspace
-                ctx.all_experts_active = metadata.all_experts_active
-                ctx.topk_dtype = topk_weights.dtype
-                _save_deferred_recompute_inputs(ctx, tokens, owner_weights, topk_weights, permutation[1])
-                workspace.track_graph(ctx)
-                if weight_binding is not None:
-                    weight_binding.track_graph(ctx)
+                deferred_recompute.retain_output(output, topk_weights)
+                _save_deferred_recompute_inputs(
+                    ctx, tokens, owner_weights, topk_weights, permutation[1], plan=plan, workspace=workspace,
+                    route=route, weight_binding=weight_binding, record=deferred_recompute,
+                )
                 return output
             return _save_forward_state(
                 ctx, plan, workspace, execution, owner_weights, metadata, permutation_inputs, topk_weights,
@@ -1251,18 +1267,19 @@ def _execute_mega_moe_without_autograd(
             if route.checkpoint_record is not None and not weight_binding.fused:
                 weight_binding.save_snapshot((weight1, weight2))
         execution = _prepare_forward_execution(
-            workspace, plan, route.routed_tokens, route.metadata.expert_capacity)
+            workspace, plan, route.routed_tokens, route.metadata.expert_capacity, count_fence=route.count_fence)
         if plan.spec.apply_probs_before_fc2:
             _stage_probabilities(workspace, route.unpermute_mapping, topk_weights.float().contiguous(), plan.spec)
         _launch_forward_kernel(
             plan, route.metadata.for_kernel(plan.spec.hidden_size), execution.source, weight1,
             weight2, execution, stream=workspace.lease_stream,
-            weight_binding=weight_binding)
+            weight_binding=weight_binding,
+            dispatch_offsets=route.indexed_dispatch_offsets, counts_fenced=route.count_fence is not None)
         if acquired and route.checkpoint_record is not None and weight_binding.fused:
             # This stream has consumed the guest operands, including both
             # projection-ready events, so their prefix can now be captured.
             weight_binding.save_snapshot((weight1, weight2))
-        rows = route.routed_tokens.shape[0]
+        rows = route.unpermute_mapping.numel()
         if not rows:
             return route.routed_tokens.new_empty((0, plan.spec.hidden_size))
         if plan.spec.apply_probs_before_fc2:

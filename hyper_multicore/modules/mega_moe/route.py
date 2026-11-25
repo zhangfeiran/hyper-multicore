@@ -879,7 +879,7 @@ def _read_indexed_count_in_parallel(ids, spec, workspace, mask, launch_stream, s
     with torch.npu.stream(count_stream):
         fence = a3_indexed.CountFence.before_gather(workspace, count_stream, launch_stream=launch_stream)
         payload, inverse, order = a3_indexed.ordered_count(
-            ids, mask | (a3_indexed.COUNT_FENCE_BIT if fence is not None else 0))
+            ids, spec.num_experts, mask | (a3_indexed.COUNT_FENCE_BIT if fence is not None else 0))
         workspace.wait_for_reuse(stream=count_stream)
         gathered, work = _start_dynamic_gather(payload, spec)
         if work is not None:
@@ -964,7 +964,7 @@ def _prepare_dynamic_route(
         if source_ready is None:
             count_fence = a3_indexed.CountFence.before_gather(workspace, route_stream)
             payload, logical_inverse, logical_order = a3_indexed.ordered_count(
-                topk_ids, autograd_mask | (a3_indexed.COUNT_FENCE_BIT if count_fence is not None else 0))
+                topk_ids, spec.num_experts, autograd_mask | (a3_indexed.COUNT_FENCE_BIT if count_fence is not None else 0))
         else:
             payload, logical_inverse, logical_order, count_fence, gathered, indexed_readback = (
                 _read_indexed_count_in_parallel(topk_ids, spec, workspace, autograd_mask, route_stream, source_ready))
@@ -992,7 +992,8 @@ def _prepare_dynamic_route(
                                      counts, gathered, work, route_stream, prepare_workspace,
                                      select_placement, autograd_mask, reuse_placement_geometry,
                                      logical_inverse=logical_inverse, logical_order=logical_order,
-                                     count_fence=count_fence, indexed_readback=indexed_readback)
+                                     count_fence=count_fence, indexed_readback=indexed_readback,
+                                     indexed_placement=indexed_placement)
     permuted, summary, host_rows, metadata, work = _resolve_dynamic_permutation(
         hidden_states, topk_ids, spec, workspace, permuted, invalid, route_stream,
         prepare_workspace, gathered, work)
@@ -1004,21 +1005,26 @@ def _prepare_dynamic_route(
 def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gathered,
                           work, stream, prepare_workspace, select_placement, autograd_mask=0,
                           reuse_placement_geometry=False, *, logical_inverse=None, logical_order=None,
-                          count_fence=None, indexed_readback=None):
+                          count_fence=None, indexed_readback=None, indexed_placement=False):
     """Select a per-call route between count validation and capacity commitment."""
     if work is not None:
         work.wait()
     inverse = None if permuted is None else permuted[1]
     snapshot = None
-    if logical_order is not None:
+    if indexed_placement:
         if indexed_readback is None:
             source_rows = []
             summary, host_rows = _read_dynamic_route(gathered, spec, source_rows)
         else:
             summary, host_rows, source_rows = indexed_readback
         metadata = None
-        selected = select_placement(hidden, ids, gathered, summary, source_rows, logical_inverse,
-                                    autograd_mask, host_rows=host_rows, indexed=True)
+        # Every rank makes the same choice from the existing count exchange.
+        indexed = all(0 < size <= a3_indexed.MAX_INDEXED_TOKENS * spec.top_k for size in source_rows)
+        if not indexed:
+            logical_order = count_fence = None
+        selected = select_placement(hidden, ids, gathered, summary, source_rows,
+                                    logical_inverse if indexed else inverse,
+                                    autograd_mask, host_rows=host_rows, indexed=indexed)
     elif reuse_placement_geometry:
         from ..hot_replica.bounded_placement import read_placement_wire  # pylint: disable=import-outside-toplevel
 
@@ -1045,6 +1051,11 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
         if snapshot is not None:
             metadata = snapshot.ordinary_metadata(spec, hidden)
         prepare_workspace(summary.plan_tokens, summary.maximum)
+        if logical_order is not None:
+            route = _finalize_dynamic_route(
+                (hidden, logical_inverse), counts, summary, host_rows, metadata, None, gathered, spec,
+                workspace, hidden.device, hidden.shape[0])
+            return _bind_indexed_dispatch(route, logical_order, spec, workspace, count_fence, host_rows)
         permuted = _materialize_route_permutation(hidden, ids, spec, workspace, permuted)
         return _finalize_dynamic_route(
             permuted, counts, summary, host_rows, metadata, None, gathered, spec,
@@ -1073,13 +1084,19 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
     if not indexed:
         return replace(route, weight_binding=binding)
     ordered = logical_order.index_select(0, placement.physical_to_logical)
+    return _bind_indexed_dispatch(replace(route, weight_binding=binding), ordered, spec, workspace,
+                                  count_fence, host_rows)
+
+
+def _bind_indexed_dispatch(route, ordered, spec, workspace, count_fence, host_rows):
+    """Bind the same hidden-row launch format for the home and replica routes."""
     offsets = a3_indexed.pack_dispatch_offsets(route.metadata.for_kernel(spec.hidden_size).dispatch_src_off, ordered)
     # Capacity agreement is EP-wide. Growth replaces the old symmetric counters
     # everywhere, so this launch returns to the normal device ready handshake.
-    if (count_fence is None or not count_fence.matches(workspace)
+    if (count_fence is None or not count_fence.matches(workspace) or host_rows is None
             or not all(row[2] & a3_indexed.COUNT_FENCE_BIT for row in host_rows)):
         count_fence = None
-    return replace(route, weight_binding=binding, indexed_dispatch_offsets=offsets, count_fence=count_fence)
+    return replace(route, indexed_dispatch_offsets=offsets, count_fence=count_fence)
 
 
 class _EmptyTopKOutput(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
