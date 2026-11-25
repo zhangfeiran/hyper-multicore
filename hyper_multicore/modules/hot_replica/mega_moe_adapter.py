@@ -24,6 +24,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from hyper_multicore import _collective
+from hyper_multicore.modules.mega_moe import a3_indexed
 
 from hyper_multicore.modules.mega_moe.heap_manager import _HeapCapacityError, _WorkspaceLayout
 from hyper_multicore.modules.mega_moe.spec import _COMMUNICATION_SPLIT, _align_capacity, _resolve_receive_capacity
@@ -130,6 +131,9 @@ class PlacementResources:
         self.receive_capacity_percent = specification.get("receive_capacity_percent")
         self.rank_nodes = rank_nodes
         self.independent_dw = independent_dw
+        self.indexed_push = a3_indexed.qualify(
+            parent.spec, specification.get("indexed_push", False), rank_nodes,
+        )
         built_in = _uses_builtin_planner(specification)
         spec = parent.spec
         can_split_weights = supports_bounded_placement(spec)
@@ -183,6 +187,7 @@ class PlacementResources:
         planner: BasePlanner,
         host_rows: list[list[int]] | None = None,
         snapshot: PlacementWire | None = None,
+        indexed: bool = False,
     ) -> ExpertWeightBinding | None:
         """Choose a virtual route only after the existing count exchange validates it."""
         self.statistics["invocations"] += 1
@@ -205,7 +210,7 @@ class PlacementResources:
                 return None
             placement = self.bounded.select(
                 hidden, ids, gathered[:, 3:], source_rows, inverse, prices, snapshot,
-                host_rows=host_rows, limit=limit, resident=resident,
+                host_rows=host_rows, limit=limit, resident=resident, indexed=indexed,
             )
         mandatory = limit is not None and summary.maximum > limit
         return self.bind(hidden, placement, tokens=summary.plan_tokens,

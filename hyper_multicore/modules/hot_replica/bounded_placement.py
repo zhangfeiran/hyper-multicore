@@ -16,7 +16,7 @@ from ._planner.capacity import ExpertReplicaConfig
 from ._planner.receive import ReplicaCost, select_replica_plan
 from .placement import _LoweredPlacement, remap_expert_ids
 from .planner import replica_slot_budget
-from .render import render_plan
+from .render import _render_slots, render_plan
 
 
 _PINNED_WIRE_MAX_BYTES = 32 * 1024
@@ -105,9 +105,25 @@ def _placement_metadata(counts, spec, capacity, plan_tokens, tokens, device):
     return replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens)
 
 
+def _indexed_maps(slots: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Lower contiguous logical runs into both physical row maps."""
+    lengths = counts[slots]
+    active = lengths != 0
+    slots, lengths = slots[active], lengths[active]
+    starts = lengths.cumsum(dtype=np.int32) - lengths
+    offsets = counts.cumsum(dtype=np.int32) - counts
+    logical_starts = np.zeros_like(offsets)
+    logical_starts[slots] = starts
+    positions = np.arange(int(lengths.sum()), dtype=np.int32)
+    maps = np.empty((2, positions.size), dtype=np.int32)
+    np.add(positions, np.repeat(offsets[slots] - starts, lengths), out=maps[0])
+    np.add(positions, np.repeat(logical_starts - offsets, counts), out=maps[1])
+    return maps
+
+
 @dataclass(frozen=True)
 class _Geometry:
-    sorted_ids: torch.Tensor
+    row_order: torch.Tensor
     counts: torch.Tensor
     copies: torch.Tensor
     owners: tuple[tuple[int, ...], ...]
@@ -118,31 +134,42 @@ class _Geometry:
     owner_rows: tuple[int, ...]
     published_slots: int
 
-    def lower(self, hidden, ids, inverse):
-        """Remap this call's original Top-K order against the cached geometry."""
-        remapped = remap_expert_ids(hidden, ids, self.sorted_ids, inverse)
+    def lower(self, hidden, ids, inverse, *, indexed=False):
+        """Bind this call's Top-K order to the cached physical slot geometry."""
+        if indexed:
+            logical_to_physical, physical_to_logical = self.row_order.unbind(0)
+            return _LoweredPlacement(
+                None, self.counts, self.copies, self.width, self.peak, self.local,
+                self.published_slots, self.owners, self.owner_rows, self.metadata,
+                logical_to_physical.index_select(0, inverse.reshape(-1)), physical_to_logical,
+            )
+        remapped = remap_expert_ids(hidden, ids, self.row_order, inverse)
         return _LoweredPlacement(
             remapped, self.counts, self.copies, self.width, self.peak, self.local,
             self.published_slots, self.owners, self.owner_rows, self.metadata,
         )
 
 
-def render_geometry(plan, spec, device, maximum, *, borrowed=None, prepare_metadata=True):
+def render_geometry(plan, spec, device, maximum, *, borrowed=None, prepare_metadata=True, indexed=False):
     """Pack count rows and only active guest columns in the common route format."""
     config = plan.config
     rank = spec.rank_id
     if borrowed is None:
         borrowed = plan.compact_borrowed_width
-    sorted_ids, table, owners = render_plan(plan, rank, borrowed)
-    items = (sorted_ids, table, np.asarray(owners, dtype=np.int32))
-    ids, counts, copies = (_upload_route_tensor(torch.from_numpy(item), device) for item in items)
+    if indexed:
+        slots, table, owners = _render_slots(plan, borrowed)
+        row_order = _indexed_maps(slots, table[rank])
+    else:
+        row_order, table, owners = render_plan(plan, rank, borrowed)
+    items = (row_order, table, np.asarray(owners, dtype=np.int32))
+    order, counts, copies = (_upload_route_tensor(torch.from_numpy(item), device) for item in items)
     receive = plan.destination_loads
     metadata = None
-    if prepare_metadata:
+    if prepare_metadata and not indexed:
         metadata = _placement_metadata(table, spec, max(1, receive[rank]),
                                        max(128, ((maximum + 127) // 128) * 128), len(items[0]) // spec.top_k, device)
     published = max((slot + 1 for slot, expert in enumerate(owners[rank]) if expert >= 0), default=0)
-    return _Geometry(ids, counts, copies, owners, borrowed, max(receive), receive[rank], metadata,
+    return _Geometry(order, counts, copies, owners, borrowed, max(receive), receive[rank], metadata,
                      plan.destination_counts[rank][:config.home_experts], published)
 
 
@@ -164,6 +191,7 @@ class BoundedPlacement:
         self, hidden: torch.Tensor, ids: torch.Tensor, counts: torch.Tensor, source_rows: list[int],
         inverse: torch.Tensor | None, prices: ReplicaCost, snapshot: PlacementWire | None = None,
         *, host_rows: list[list[int]] | None = None, limit: int | None = None, resident: int | None = None,
+        indexed: bool = False,
     ) -> _LoweredPlacement | None:
         """Choose and materialize one plan for the agreed counts and receive budget."""
         spec = self.spec
@@ -175,7 +203,7 @@ class BoundedPlacement:
             wire = counts.cpu().numpy()
 
         stream = torch.npu.current_stream(hidden.device) if hidden.device.type == "npu" else None
-        key = (prices, hidden.device, stream, torch.is_inference_mode_enabled(), limit, resident)
+        key = (prices, hidden.device, stream, torch.is_inference_mode_enabled(), limit, resident, indexed)
         if self.key != key or not np.array_equal(self.snapshot, wire):
             plan = select_replica_plan(
                 wire, self.config, nodes=self.nodes, prices=prices, cross_node_cost=self.cross_node_cost,
@@ -183,7 +211,7 @@ class BoundedPlacement:
             )
             maximum = max(source_rows) // spec.top_k
             geometry = None if plan is None else render_geometry(
-                plan, spec, hidden.device, maximum, prepare_metadata=not spec.batch_experts,
+                plan, spec, hidden.device, maximum, prepare_metadata=not spec.batch_experts, indexed=indexed,
             )
             self.key, self.snapshot, self.geometry = key, wire.copy(), geometry
-        return None if self.geometry is None else self.geometry.lower(hidden, ids, inverse)
+        return None if self.geometry is None else self.geometry.lower(hidden, ids, inverse, indexed=indexed)

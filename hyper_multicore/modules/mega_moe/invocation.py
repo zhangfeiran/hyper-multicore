@@ -67,7 +67,9 @@ def prepare_expert_invocation(
                 placement.statistics["route_replays"] += 1
                 route = record.route
                 resources.workspace.wait_for_reuse()
-                if not record.allow_activation:
+                if route.indexed_dispatch_offsets is not None:
+                    route = replace(route, routed_tokens=hidden, count_fence=record.replay_count_fence)
+                elif not record.allow_activation:
                     with torch.inference_mode(False), torch.no_grad():
                         if pull:
                             prepare_workspace(route.metadata.plan_tokens, route.maximum_received_slots)
@@ -86,6 +88,8 @@ def prepare_expert_invocation(
         options = {"autograd_mask": mask}
         if planner is not None:
             options["select_placement"] = partial(placement.select, planner=planner)
+            if record is not None and not replay and counts is None and mask & 1 and placement.indexed_push:
+                options["indexed_placement"] = True
             if placement.uses_placement_wire():
                 options["reuse_placement_geometry"] = resources.spec.ep_size * resources.spec.num_experts <= 16384
         if resources.spec.auto_tokens:
@@ -111,9 +115,12 @@ def prepare_expert_invocation(
 
 def _record_checkpoint_route(route, record, counts, ids):
     """Keep the route descriptors and placement with the checkpoint invocation."""
-    if record is None or counts is not None:
+    if record is None:
         return route
-    record.route = replace(route, routed_tokens=None, unpermute_mapping=None)
+    if counts is not None:
+        return replace(route, checkpoint_record=record) if record.guest_snapshot_bytes else route
+    mapping = route.unpermute_mapping if route.indexed_dispatch_offsets is not None else None
+    record.route = replace(route, routed_tokens=None, unpermute_mapping=mapping, count_fence=None)
     record.ids = ids.detach().clone()
     record.weight_binding = route.weight_binding
     return replace(route, checkpoint_record=record)
