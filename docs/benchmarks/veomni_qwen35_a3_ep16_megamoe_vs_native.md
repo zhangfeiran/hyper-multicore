@@ -83,3 +83,15 @@ HotReplica 相对 B0 的吞吐提升为 22.30%，正式窗口中 28/28 步更快
 | Native EP16 | 2.942 | 2.898 | 0.597 | [step_trace_time](assets/qwen35-a3-ep16/native-step-trace.csv) |
 | MegaMoE B0 | 4.521 | 0.653 | 0.455 | [step_trace_time](assets/qwen35-a3-ep16/mega-b0-step-trace.csv) |
 | MegaMoE HotReplica | 3.418 | 0.795 | 0.418 | [step_trace_time](assets/qwen35-a3-ep16/mega-hot-step-trace.csv) |
+
+## 5. MoE 层路由专家加速比
+
+用第 20、21 步 rank 0 的 Level0 时间线，按层号对齐 40 个语言 MoE 层。每个方案的前向、重算和反向各有 80 个样本。每个阶段按 `mlp.experts` 首尾关联的 NPU 事件间隔计时，包含期间的通信和等待。完整 MoE 层还包含 Router、共享专家和外层 FSDP 的开销。[逐层 profiler CSV](assets/qwen35-a3-ep16/moe-routed-expert-spans-rank0.csv)
+
+| 方案 | 前向（ms/层） | 重算（ms/层） | 反向（ms/层） | 合计（ms/层） | 相对 Native 加速比 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Native EP16 | 25.06 | 25.54 | 31.25 | 81.85 | 1.00× |
+| MegaMoE B0 | 18.97 | 18.20 | 22.48 | 59.65 | 1.37× |
+| MegaMoE HotReplica | 12.80 | 13.40 | 9.35 | 35.55 | 2.30× |
+
+开启副本后，相对 B0 的路由专家合计加速为 **1.68×**。收益最大的是反向，从 22.48 ms/层降到 9.35 ms/层，加速 **2.41×**。
