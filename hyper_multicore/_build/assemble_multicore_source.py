@@ -24,40 +24,14 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tarfile
-import tempfile
 from typing import Any
 
-from prepare_dependencies import dependency_revisions, load_dependency_locks, verify_git_dependency
+from prepare_dependencies import dependency_revisions, load_dependency_locks, verify_source_archive
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_LOCK_PATH = Path(__file__).with_name("dependencies.lock.json")
 _MULTICORE_OPS = _REPO_ROOT / "hyper_multicore" / "ops"
 _SHMEM_CCSRC = _REPO_ROOT / "hyper_multicore" / "shmem" / "ccsrc"
-_OPS_NN_PATHS = (
-    "activation/swi_glu/op_kernel",
-    "activation/swi_glu_grad/op_kernel",
-    "norm/rms_norm/op_kernel",
-    "norm/rms_norm_grad/op_kernel",
-    "index/linear_index/op_host/op_api",
-)
-_OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel",)
-_ARCH35_OPS_NN_PATHS = (
-    "common/inc/op_kernel",
-    "quant/dynamic_mx_quant_with_dual_axis/op_kernel/arch35",
-    "quant/swiglu_mx_quant_with_dual_axis/op_kernel/arch35",
-    "quant/swiglu_backward_mx_quant_with_dual_axis/op_kernel/arch35",
-)
-_OPS_TRANSFORMER_MHC_PATHS = (
-    "common/include",
-    "mhc/mhc_post/op_kernel/arch22",
-    "mhc/mhc_post_backward/op_kernel/arch22",
-    "mhc/mhc_pre_sinkhorn/op_kernel",
-    "mhc/mhc_pre_sinkhorn/op_host/op_tiling",
-    "mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22",
-    "mhc/mhc_pre_sinkhorn_backward/op_host/op_tiling",
-)
 _HYPER_OPERATORS = (
     "hyper_mega_moe",
     "hyper_mega_moe_grad",
@@ -71,10 +45,7 @@ _HYPER_OPERATORS = (
 def _parse_args() -> argparse.Namespace:
     """Parse the isolated source assembly contract."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ops-nn-source", required=True)
-    parser.add_argument("--ops-transformer-source", required=True)
     parser.add_argument("--architecture", choices=("arch22", "arch35"), required=True)
-    parser.add_argument("--ops-tensor-source", help="Locked Blaze source for the arch35 task adapters")
     parser.add_argument("--work-dir", required=True)
     return parser.parse_args()
 
@@ -82,54 +53,16 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     """Verify, export, adapt, and compose the selected kernel sources."""
     args = _parse_args()
-    if (args.architecture == "arch35") != bool(args.ops_tensor_source):
-        raise ValueError("--ops-tensor-source is required for arch35 and only used on that architecture")
-    lock = load_dependency_locks(_LOCK_PATH)
+    lock = load_dependency_locks()
     transformer_revisions = dependency_revisions(lock["ops_transformer"])
-    ops_nn_source = Path(args.ops_nn_source).resolve()
-    ops_transformer_source = Path(args.ops_transformer_source).resolve()
-    ops_tensor_source = Path(args.ops_tensor_source).resolve() if args.ops_tensor_source else None
     work_dir = Path(args.work_dir).resolve()
-    _validate_new_work_dir(
-        work_dir,
-        (ops_nn_source, ops_transformer_source, *((ops_tensor_source,) if ops_tensor_source else ())),
-    )
-
-    verify_git_dependency(lock["ops_nn"], ops_nn_source, dependency_name="ops_nn")
-    verify_git_dependency(
-        transformer_revisions["gmm"],
-        ops_transformer_source,
-        dependency_name="ops_transformer.gmm",
-    )
-    verify_git_dependency(
-        transformer_revisions["mhc"],
-        ops_transformer_source,
-        dependency_name="ops_transformer.mhc",
-    )
-    if ops_tensor_source is not None:
-        verify_git_dependency(lock["ops_tensor"], ops_tensor_source, dependency_name="ops_tensor")
-
+    _validate_new_work_dir(work_dir)
     ops_nn_copy = work_dir / "adapter-inputs" / "ops-nn"
     transformer_copy = work_dir / "adapter-inputs" / "ops-transformer"
     transformer_mhc_copy = work_dir / "adapter-inputs" / "ops-transformer-mhc"
-    _export_git_tree(
-        ops_nn_source,
-        ops_nn_copy,
-        lock["ops_nn"]["commit"],
-        _OPS_NN_PATHS + (_ARCH35_OPS_NN_PATHS if ops_tensor_source else ()),
-    )
-    _export_git_tree(
-        ops_transformer_source,
-        transformer_copy,
-        transformer_revisions["gmm"]["commit"],
-        _OPS_TRANSFORMER_PATHS,
-    )
-    _export_git_tree(
-        ops_transformer_source,
-        transformer_mhc_copy,
-        transformer_revisions["mhc"]["commit"],
-        _OPS_TRANSFORMER_MHC_PATHS,
-    )
+    verify_source_archive("ops_nn", lock["ops_nn"], export_dir=ops_nn_copy)
+    verify_source_archive("ops_transformer.gmm", transformer_revisions["gmm"], export_dir=transformer_copy)
+    verify_source_archive("ops_transformer.mhc", transformer_revisions["mhc"], export_dir=transformer_mhc_copy)
     _apply_locked_adapters(ops_nn_copy, lock["ops_nn"], architecture=args.architecture)
     _apply_locked_adapters(transformer_copy, transformer_revisions["gmm"])
     _apply_locked_adapters(transformer_mhc_copy, transformer_revisions["mhc"])
@@ -141,9 +74,9 @@ def main() -> int:
         transformer_copy,
         transformer_mhc_copy,
     )
-    if ops_tensor_source is not None:
+    if args.architecture == "arch35":
         tensor_copy = work_dir / "adapter-inputs" / "ops-tensor"
-        _export_git_tree(ops_tensor_source, tensor_copy, lock["ops_tensor"]["commit"], ("include/blaze",))
+        verify_source_archive("ops_tensor", lock["ops_tensor"], export_dir=tensor_copy)
         _apply_locked_adapters(tensor_copy, lock["ops_tensor"], architecture="arch35")
         _compose_arch35_sources(source_root, ops_nn_copy, tensor_copy, lock)
     _require_assembled_files(source_root)
@@ -178,44 +111,13 @@ def _compose_arch35_sources(source_root: Path, ops_nn: Path, ops_tensor: Path, l
     (target / "sources.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _validate_new_work_dir(work_dir: Path, inputs: tuple[Path, ...]) -> None:
-    """Reject broad, existing, or source-overlapping output paths."""
-    protected = {Path("/").resolve(), _REPO_ROOT.resolve(), _REPO_ROOT.parent.resolve(), *inputs}
-    if work_dir in protected or any(work_dir == path.parent for path in inputs):
+def _validate_new_work_dir(work_dir: Path) -> None:
+    """Reject broad or existing output paths."""
+    if work_dir in {Path("/"), _REPO_ROOT, _REPO_ROOT.parent}:
         raise ValueError(f"Refusing unsafe multicore work directory: {work_dir}")
     if work_dir.exists():
         raise ValueError(f"Multicore work directory must not already exist: {work_dir}")
     work_dir.mkdir(parents=True)
-
-
-def _export_git_tree(
-    source_root: Path,
-    destination_root: Path,
-    commit: str,
-    relative_paths: tuple[str, ...],
-) -> None:
-    """Export selected committed files from one verified dependency revision."""
-    if destination_root.exists():
-        raise ValueError(f"Git export destination already exists: {destination_root}")
-    destination_root.mkdir(parents=True)
-    command = ["git", "archive", "--format=tar", commit, *relative_paths]
-    with tempfile.TemporaryFile() as archive_file:
-        result = subprocess.run(
-            command,
-            cwd=source_root,
-            check=False,
-            stdout=archive_file,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise ValueError(
-                f"Failed to export locked dependency {source_root} at {commit}: {result.stderr.strip()}"
-            )
-        archive_file.seek(0)
-        with tarfile.open(fileobj=archive_file, mode="r:") as source:
-            _validate_tar_members(source.getmembers())
-            source.extractall(destination_root)
 
 
 def _apply_locked_adapters(
@@ -388,6 +290,7 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_gate_grad" / "op_kernel" / "hyper_mega_gate_route_grad.cpp",
         source_root / "common" / "mega_moe" / "transport_task.h",
         source_root / "common" / "mega_moe" / "mxfp8_worker.h",
+        source_root / "common" / "mega_moe" / "op_host" / "mxfp8_op_api.inc",
         source_root / "common" / "mega_moe" / "op_host" / "mxfp8_schema.h",
         source_root / "hyper_mega_moe_mxfp8" / "op_host" / "hyper_mega_moe_mxfp8_def.cpp",
         source_root / "hyper_mega_moe_mxfp8_grad" / "op_host" / "hyper_mega_moe_mxfp8_grad_def.cpp",
@@ -413,28 +316,6 @@ def _require_assembled_files(source_root: Path) -> None:
     missing = [str(path) for path in required_paths if not path.is_file()]
     if missing:
         raise ValueError(f"Incomplete Multicore operator source closure: {missing}")
-
-
-def _validate_archive_names(names: Any) -> None:
-    """Reject absolute or parent-traversing archive members."""
-    for name in names:
-        member = Path(name)
-        if member.is_absolute() or ".." in member.parts:
-            raise ValueError(f"Unsafe path in Git archive: {name}")
-
-
-def _validate_tar_members(members: list[tarfile.TarInfo]) -> None:
-    """Allow only safe regular files and directories before archive extraction."""
-    _validate_archive_names(member.name for member in members)
-    for member in members:
-        if member.issym() or member.islnk():
-            raise ValueError(
-                f"Archive links are not allowed in native build inputs: {member.name} -> {member.linkname}"
-            )
-        if not member.isfile() and not member.isdir():
-            raise ValueError(
-                f"Archive special files are not allowed in native build inputs: {member.name}"
-            )
 
 
 def _sha256(path: Path) -> str:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Check standalone import, path and locked-patch boundaries without importing Torch."""
+"""Check standalone imports, paths, and locked build inputs without importing Torch."""
 
 import ast
 import hashlib
@@ -25,7 +25,7 @@ ROOT = Path(__file__).absolute().parents[1]
 
 
 def main() -> None:
-    """Reject old executable imports/paths and changed dependency patches; print counts."""
+    """Reject old executable imports/paths and invalid locked sources or patches."""
     failures = []
     checked = 0
     files = [path for directory in ("hyper_multicore", "tests", "scripts", "examples")
@@ -70,9 +70,15 @@ def main() -> None:
                 failures.append(f"Old executable identity/path: {path}")
     dependency_helpers = runpy.run_path(str(ROOT / "hyper_multicore/_build/prepare_dependencies.py"))
     dependencies = dependency_helpers["load_dependency_locks"]()
+    archives = 0
     patches = 0
-    for dependency in dependencies.values():
-        for revision in dependency_helpers["dependency_revisions"](dependency).values():
+    for name, dependency in dependencies.items():
+        for archive_name, revision in dependency_helpers["named_revisions"](name, dependency).items():
+            archives += 1
+            try:
+                dependency_helpers["verify_source_archive"](archive_name, revision)
+            except (OSError, ValueError) as error:
+                failures.append(str(error))
             for patch in revision.get("patches", []):
                 patches += 1
                 path = ROOT / patch["path"]
@@ -80,7 +86,8 @@ def main() -> None:
                     failures.append(f"Locked patch missing or changed: {path}")
     if failures:
         raise SystemExit("\n".join(failures))
-    print(json.dumps({"python_files_parsed": checked, "locked_patches_verified": patches,
+    print(json.dumps({"python_files_parsed": checked, "locked_archives_verified": archives,
+                      "locked_patches_verified": patches,
                       "downstream_imports": 0, "stale_paths": 0}, indent=2))
 
 

@@ -47,6 +47,9 @@ bash build.sh --jobs 24
 payload 位于 `build/native/payload/hyper_multicore/`。
 生成的 wheel 可安装到运行环境，本地 payload 可直接用于源码验证。
 
+Git checkout 和源码包随附构建所需的全部第三方 Git 源码。目标机备齐上述工具链、框架和 Python 依赖后，
+可在离线环境直接运行 `bash build.sh --jobs 24`。构建从随附归档解包所需源码。
+
 ## 安装与验证
 
 ### 安装已有 wheel
@@ -114,6 +117,8 @@ bash build.sh --all --jobs 24
 
 该环境无需预装 Torch/TorchNpu；构建器按[框架矩阵](../hyper_multicore/_build/frameworks.lock.json)创建或复用 venv，
 安装各目标的框架及补充依赖。公共 CANN 编译仍使用启动命令的 Python，框架 venv 不会补装调用者环境的依赖。
+首次创建框架 venv 时，pip 从配置的索引下载安装包。`--all` 离线执行时，使用已为当前解释器及平台准备好的
+[矩阵框架环境](#框架环境存储位置)。
 
 全量构建使用当前 Python ABI、CPU 架构和已激活的 CANN，输出位置与默认构建相同。
 成功后，一个 wheel 包含全部矩阵目标；安装时切换到配套的运行环境，再按[安装已有 wheel](#安装已有-wheel)操作。
@@ -237,8 +242,8 @@ vendor 输入摘要相同且文件完整时复用，输入失配、文件缺失�
 安装中断且有有效归属标记的未完成环境，可在下次准备时重建。
 标记损坏、目录无归属或路径为软链时，构建器拒绝替换；确认归属并移走冲突目录后重试。
 
-native 源码校验失败时，检查锁定提交、tree、archive 和补丁。
-使用 `--verify-only` 可校验已有源码，不获取提交或修改缓存；`--source-dir` 指向 Git 仓库目录，例如：
+native 源码校验失败时，检查随附归档的 SHA256、锁定提交和补丁。
+使用 `--verify-only` 校验随附归档。核对上游提交、目录树和原始 Git 归档时，用 `--source-dir` 指定本地上游 Git 仓库。
 
 ```bash
 python hyper_multicore/_build/prepare_dependencies.py \
@@ -247,7 +252,8 @@ python hyper_multicore/_build/prepare_dependencies.py \
   --verify-only
 ```
 
-校验失败不会自动删除源码或重新 clone。工作区归属错误也应先检查并移走冲突目录，避免清理未知数据。
+随附归档缺失或损坏时，从同一版本的源码恢复对应文件。
+工作区归属错误时，先检查并移走冲突目录，避免清理未知数据。
 
 ### 框架环境存储位置
 
@@ -331,7 +337,7 @@ JSON 输出包含框架适配库 ID、共享库路径和当前环境元数据。
 python setup.py sdist
 ```
 
-源码包内容由 [MANIFEST.in](../MANIFEST.in) 管理，不携带预构建 native 库；解包后按本文准备环境并构建。
+源码包内容由 [MANIFEST.in](../MANIFEST.in) 管理，包含锁定的第三方构建源码归档。解包后按本文准备环境并编译 native 库。
 
 ### Python 环境分工
 
@@ -388,10 +394,10 @@ flowchart TD
 
 ### native 源码与 vendor 摘要
 
-锁定的第三方 Git 仓库位于 `build/native/deps/`，只 fetch 缺失提交，已缓存提交不访问远端。
-ops-transformer 的 GMM 和 MHC 共用仓库，按各自锁定提交导出片段，工作目录 HEAD 不决定版本。
-提交、tree、archive 和补丁按锁校验，补丁只应用于隔离源码副本。
-面向 `ascend950` 的 JSON 头文件同样从锁定提交导出，其记录参与 SDK 工具链身份。
+[源码归档目录](../hyper_multicore/_build/dependency_sources/)收录构建使用的算子目录、SHMEM SDK 源码、JSON 头文件和上游许可。
+构建核对每个归档的 SHA256 和 Git 提交号，再解包到隔离目录并应用锁定补丁。
+ops-transformer 的 GMM 和 MHC 分别从各自锁定提交归档。面向 `ascend950` 的 JSON 头文件记录也参与 SDK 工具链身份。
+随附归档进入源码包。运行时 wheel 由编译结果和运行所需的包内容组成。
 
 默认和全量构建共用 vendor 缓存，每个 CPU/设备架构组合保留一份。
 摘要覆盖锁定源码及补丁、vendor 构建脚本、SDK 头文件和链接库、CANN 实际路径及版本、
@@ -401,6 +407,31 @@ ops-transformer 的 GMM 和 MHC 共用仓库，按各自锁定提交导出片段
 
 新快照在制品提交成功并复核输入后原子发布。
 `build_info.json` 的 `vendor_sources` 区分原始 vendor 来源和本次组包身份；激活脚本与最终制品每次重新生成。
+
+### 更新锁定的源码归档
+
+升级依赖时，在联网环境准备好对应上游仓库，并按新提交更新依赖锁中的版本、tree、archive 和补丁记录。
+从本地上游 Git 仓库按依赖锁中的 `commit` 和 `archive_paths` 生成源码归档。以下命令以 SHMEM 为例。
+
+```bash
+set -o pipefail
+mapfile -t selection < <(python - <<'PY'
+import json
+
+with open("hyper_multicore/_build/dependencies.lock.json", encoding="utf-8") as source:
+    revision = json.load(source)["components"]["multicore"]["shmem"]
+print(revision["commit"], *revision["archive_paths"], sep="\n")
+PY
+)
+archive=$(mktemp)
+git -C /path/to/shmem archive --format=tar "${selection[0]}" -- "${selection[@]:1}" |
+  gzip -9n > "$archive" &&
+  mv "$archive" hyper_multicore/_build/dependency_sources/shmem.tar.gz
+sha256sum hyper_multicore/_build/dependency_sources/shmem.tar.gz
+```
+
+ops-transformer 使用 `revisions.gmm`、`revisions.mhc` 生成 `ops_transformer.gmm.tar.gz` 和 `ops_transformer.mhc.tar.gz`。
+将每个压缩归档的 SHA256 写入对应的 `archive_sha256`，并随锁一起提交。在解包后的源码目录执行离线构建可验证依赖覆盖。
 
 ### 并行预算
 
@@ -420,7 +451,7 @@ ops-transformer 的 GMM 和 MHC 共用仓库，按各自锁定提交导出片段
 | SHMEM SDK/ops 工作区 | `build/native/sdk/<CPU架构>/<设备架构>/` |
 | 框架适配库工作区 | `build/native/variants/<框架组合>/` |
 | 临时组装及打包资源 | `build/native/staging/<运行标识>/` |
-| 依赖源码仓库 | `build/native/deps/<依赖>/` |
+| 第三方源码归档 | `hyper_multicore/_build/dependency_sources/` |
 | 框架安装环境 | 默认 `build/native/envs/<安装身份>/`，可指定外部根目录 |
 | vendor 缓存 | `build/native/vendor-cache/<CPU架构>-<设备架构>/` |
 
@@ -438,13 +469,13 @@ SDK/ops、vendor 和 binding 的子工作区按 `arch22/arch35` 隔离。
 | [build_workspace.py](../hyper_multicore/_build/build_workspace.py) | 工作区归属、构建锁、日志和正式输出生命周期 |
 | [build_publication.py](../hyper_multicore/_build/build_publication.py) | 源码复核、制品校验及原子发布操作 |
 | [vendor_cache.py](../hyper_multicore/_build/vendor_cache.py) | vendor 输入摘要与共享快照 |
-| [prepare_dependencies.py](../hyper_multicore/_build/prepare_dependencies.py) | 锁定 native 源码获取与校验 |
+| [prepare_dependencies.py](../hyper_multicore/_build/prepare_dependencies.py) | 校验与解包随附的锁定 native 源码 |
 | [torch_compat.cmake](../hyper_multicore/cmake/torch_compat.cmake) | 从选定框架环境确定头文件、C++ 标准及 ABI |
 
 ## ascend950 MegaMoE 源码构建
 
 `ascend950` 使用 `arch35`。构建器按[依赖锁](../hyper_multicore/_build/dependencies.lock.json)
-获取 ops-nn、ops-transformer、ops-tensor 和 SHMEM，在隔离目录应用适配补丁。
+读取随附源码，在隔离目录应用适配补丁。
 在已准备好的 Python、Torch、TorchNpu 和 CANN 环境中执行：
 
 ```bash

@@ -434,14 +434,8 @@ function prepare_common() {
     if [[ ",${SOC_LIST}," == *",ascend950,"* ]]; then
         DEPENDENCY_ARGS+=(--dependency ops_tensor)
     fi
-    PREPARED_DEPENDENCIES=$("${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/prepare_dependencies.py" \
-        "${DEPENDENCY_ARGS[@]}")
-    OPS_NN_SOURCE_DIR=$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["ops_nn"]["source_dir"])' \
-        "${PREPARED_DEPENDENCIES}")
-    OPS_TRANSFORMER_SOURCE_DIR=$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["ops_transformer"]["source_dir"])' \
-        "${PREPARED_DEPENDENCIES}")
-    OPS_TENSOR_SOURCE_DIR=$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1]).get("ops_tensor",{}).get("source_dir",""))' \
-        "${PREPARED_DEPENDENCIES}")
+    "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/prepare_dependencies.py" \
+        --verify-only "${DEPENDENCY_ARGS[@]}" >/dev/null
 
     CURRENT_REASON_CODE="SHMEM_SDK_HANDOFF_FAILED"
     # SHMEM publishes this before the vendor work root is fingerprinted.
@@ -511,12 +505,10 @@ print(hashlib.sha256(encoded).hexdigest())
 case "${PHASE}" in
     prepare)
         prepare_common >&2
-        "${PYTHON_BIN}" - "${OPS_NN_SOURCE_DIR}" "${OPS_TRANSFORMER_SOURCE_DIR}" "${OPS_TENSOR_SOURCE_DIR}" \
-            "${COMMON_HOST_INPUT_IDENTITY}" "${PENDING_ARCHES[@]}" <<'PYCONTEXT'
+        "${PYTHON_BIN}" - "${COMMON_HOST_INPUT_IDENTITY}" "${PENDING_ARCHES[@]}" <<'PYCONTEXT'
 import json
 import sys
-print(json.dumps({"ops_nn_source": sys.argv[1], "ops_transformer_source": sys.argv[2],
-                  "ops_tensor_source": sys.argv[3], "host_input_identity": sys.argv[4], "pending": sys.argv[5:]}))
+print(json.dumps({"host_input_identity": sys.argv[1], "pending": sys.argv[2:]}))
 PYCONTEXT
         exit 0
         ;;
@@ -529,15 +521,8 @@ PYCONTEXT
             VENDOR_STARTED=${EPOCHREALTIME}
             rm -rf "${ASSEMBLY_ROOT}" "${VENDOR_BUILD_ROOT}"
             CURRENT_REASON_CODE="MULTICORE_SOURCE_ASSEMBLY_FAILED"
-            ASSEMBLY_ARGS=(--architecture "${device_arch}"
-                           --ops-nn-source "${HP_OPS_NN_SOURCE}"
-                           --ops-transformer-source "${HP_OPS_TRANSFORMER_SOURCE}"
-                           --work-dir "${ASSEMBLY_ROOT}")
-            if [[ "${device_arch}" == "arch35" ]]; then
-                ASSEMBLY_ARGS+=(--ops-tensor-source "${HP_OPS_TENSOR_SOURCE}")
-            fi
             "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/assemble_multicore_source.py" \
-                "${ASSEMBLY_ARGS[@]}"
+                --architecture "${device_arch}" --work-dir "${ASSEMBLY_ROOT}"
 
             echo "INFO: building isolated ${cann_soc} vendor input from ${SOURCE_ROOT}"
             CURRENT_REASON_CODE="CANN_VENDOR_BUILD_FAILED"

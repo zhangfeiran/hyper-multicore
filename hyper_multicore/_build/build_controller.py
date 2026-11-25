@@ -399,10 +399,7 @@ def build_common(args: argparse.Namespace, run: BuildContext, python: Path) -> t
             raise ValueError(f"SHMEM SDK backend {name} does not match {socs}")
         sdk.update(**ARCHITECTURES[name], shmem_root=f"shmem/lib/{name}",
                    kernel_root=f"lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/{name}")
-    env.update(HP_OPS_NN_SOURCE=prepared["ops_nn_source"],
-               HP_OPS_TRANSFORMER_SOURCE=prepared["ops_transformer_source"],
-               HP_OPS_TENSOR_SOURCE=prepared.get("ops_tensor_source", ""),
-               HP_VENDOR_HOST_IDENTITY=prepared["host_input_identity"])
+    env["HP_VENDOR_HOST_IDENTITY"] = prepared["host_input_identity"]
     build_vendors(command, prepared["pending"], args.jobs, run, env)
     run.commands(command + ["--phase", "merge"], label="common-merge", env=env)
     run.vendor_requests = [json.loads(p.read_text())

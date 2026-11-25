@@ -69,7 +69,21 @@
             ]
           }
         ],
-        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix",
+        "archive_paths": [
+          "LICENSE",
+          "Third_Party_Open_Source_Software_Notice",
+          "activation/swi_glu/op_kernel",
+          "activation/swi_glu_grad/op_kernel",
+          "norm/rms_norm/op_kernel",
+          "norm/rms_norm_grad/op_kernel",
+          "index/linear_index/op_host/op_api",
+          "common/inc/op_kernel",
+          "quant/dynamic_mx_quant_with_dual_axis/op_kernel/arch35",
+          "quant/swiglu_mx_quant_with_dual_axis/op_kernel/arch35",
+          "quant/swiglu_backward_mx_quant_with_dual_axis/op_kernel/arch35"
+        ],
+        "archive_sha256": "d28506d7e3b165babeec31de90049847d6b0e92175eb68d7571a808b931a3df4"
       },
       "ops_transformer": {
         "repository": "https://gitcode.com/cann/ops-transformer.git",
@@ -88,7 +102,13 @@
                 "purpose": "expose the selected grouped-matmul path as an inline building block"
               }
             ],
-            "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+            "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix",
+            "archive_paths": [
+              "LICENSE",
+              "Third_Party_Open_Source_Software_Notice",
+              "gmm/grouped_matmul/op_kernel"
+            ],
+            "archive_sha256": "b5f5f817088ec7fd8b7df589b18b341e54342cf47ca5a1c6d9f7f4a3e6d0b115"
           },
           "mhc": {
             "version": "58b4a6bde",
@@ -119,7 +139,19 @@
                 "purpose": "expose task-local Prepare, PhiRms, and PreviousX worker primitives"
               }
             ],
-            "upgrade_policy": "a version change must pass HyperMegaMhc accuracy and performance validation"
+            "upgrade_policy": "a version change must pass HyperMegaMhc accuracy and performance validation",
+            "archive_paths": [
+              "LICENSE",
+              "Third_Party_Open_Source_Software_Notice",
+              "common/include",
+              "mhc/mhc_post/op_kernel/arch22",
+              "mhc/mhc_post_backward/op_kernel/arch22",
+              "mhc/mhc_pre_sinkhorn/op_kernel",
+              "mhc/mhc_pre_sinkhorn/op_host/op_tiling",
+              "mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22",
+              "mhc/mhc_pre_sinkhorn_backward/op_host/op_tiling"
+            ],
+            "archive_sha256": "dd6b55cd36098b08ec37dcc9c2bec6a4ef965e7a43b4b5329d7e0fa973b074af"
           }
         }
       },
@@ -152,7 +184,23 @@
           ],
           "reason": "avoid collision with framework-provided libshmem.so in one process",
           "isolated_source_adapted": true
-        }
+        },
+        "archive_paths": [
+          "LICENSE",
+          "Third_Party_Open_Source_Software_Notice",
+          "CMakeLists.txt",
+          "include",
+          "src/CMakeLists.txt",
+          "src/device",
+          "src/device_simt",
+          "src/host",
+          "src/host_device",
+          "tools/CMakeLists.txt",
+          "tools/rootinfo",
+          ":(exclude)src/host/python_wrapper",
+          ":(exclude)src/host/bootstrap/shmemi_bootstrap_mpi.cpp"
+        ],
+        "archive_sha256": "67a3e5eaf850f5d3b69998b48a9f07f8ada4279271ef9b4460a7a6384dc2ee78"
       },
       "nlohmann_json": {
         "version": "v3.11.3",
@@ -161,7 +209,12 @@
         "tree": "5af76d5aa32f4b473b5dd7f82fb9f2a4257322c6",
         "git_archive_tar_sha256": "0a59c5f4e31190d4ab72e4adaac69a978199c2da1989bfc6273de21f4dc016e4",
         "resolution": "SHMEM Ascend950 topology-reader header dependency; copied only to the isolated SDK source",
-        "packaging_policy": "build-only header dependency; not a Python runtime requirement"
+        "packaging_policy": "build-only header dependency; not a Python runtime requirement",
+        "archive_paths": [
+          "LICENSE.MIT",
+          "single_include/nlohmann/json.hpp"
+        ],
+        "archive_sha256": "d2ddfd22e3e8d4029de3e89fb077f98b1739740df98fec085e2bb26f43a8c548"
       },
       "ops_tensor": {
         "version": "c350b98e15",
@@ -182,7 +235,14 @@
             ]
           }
         ],
-        "upgrade_policy": "preserve task-local numerical and resource contracts; verify BF16 and MX independently"
+        "upgrade_policy": "preserve task-local numerical and resource contracts; verify BF16 and MX independently",
+        "archive_paths": [
+          "LICENSE",
+          "Third_Party_Open_Source_Software_Notice",
+          "include/blaze",
+          ":(exclude)include/blaze/README.md"
+        ],
+        "archive_sha256": "97c17b73adb0060e1c5d4c560b95866fb2799fe5ef74cb6c14579be20397060b"
       }
     }
   }

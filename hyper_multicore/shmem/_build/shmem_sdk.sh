@@ -26,9 +26,6 @@ function hp_prepare_shmem_sdk() {
     local native_jobs=$3
     local native_root="${project_root}/build/native"
     local python_bin="${PYTHON_BIN:-python}"
-    local locked_source_dir
-    local locked_commit
-    local prepared_dependency
     local wrapper="${project_root}/hyper_multicore/shmem/cmake/shmem_wrapper"
 
     if [[ -z "${ASCEND_HOME_PATH:-}" || ! -d "${ASCEND_HOME_PATH}" ]]; then
@@ -61,7 +58,7 @@ PYWORKSPACE
         echo "ERROR: SDK workspace must be owned by this checkout and contain no symlinked ancestors." >&2
         return 4
     fi
-    for required_tool in awk bisheng cmake gcc g++ git make readlink sha256sum tar; do
+    for required_tool in awk bisheng cmake gcc g++ git make readlink sha256sum; do
         if ! command -v "${required_tool}" >/dev/null 2>&1; then
             echo "HP_NATIVE_REASON_CODE=BUILD_TOOL_NOT_FOUND"
             echo "ERROR: Required SHMEM SDK build tool not found on PATH: ${required_tool}." >&2
@@ -135,19 +132,8 @@ print(hashlib.sha256(encoded).hexdigest())
     build_dir="${sdk_work_root}/shmem"
     install_root="${sdk_work_root}/shmem-install"
 
-    if ! prepared_dependency=$("${python_bin}" "${project_root}/hyper_multicore/_build/prepare_dependencies.py" \
-        --dependency shmem); then
-        echo "HP_NATIVE_REASON_CODE=SHMEM_SOURCE_NOT_PREPARED"
-        return 6
-    fi
-    locked_source_dir=$("${python_bin}" -c 'import json,sys; print(json.loads(sys.argv[1])["shmem"]["source_dir"])' \
-        "${prepared_dependency}") || return 6
-    locked_commit=$("${python_bin}" -c 'import json,sys; print(json.loads(sys.argv[1])["shmem"]["commit"])' \
-        "${prepared_dependency}") || return 6
-
-    mkdir -p "${source_dir}" "${build_dir}"
-    if ! (set -o pipefail; git -C "${locked_source_dir}" archive --format=tar "${locked_commit}" \
-        | tar -xf - -C "${source_dir}"); then
+    local source_preparer="${project_root}/hyper_multicore/_build/prepare_dependencies.py"
+    if ! "${python_bin}" "${source_preparer}" --dependency shmem --export-dir "${source_dir}" >/dev/null; then
         echo "HP_NATIVE_REASON_CODE=SHMEM_SOURCE_NOT_PREPARED"
         return 6
     fi
@@ -189,34 +175,20 @@ PY
     fi
 
     if [[ "${soc_type}" == Ascend950 ]]; then
-        if ! prepared_dependency=$("${python_bin}" "${project_root}/hyper_multicore/_build/prepare_dependencies.py" \
-            --dependency nlohmann_json); then
+        local json_root="${source_dir}/3rdparty/json"
+        if ! "${python_bin}" "${source_preparer}" --dependency nlohmann_json --export-dir "${json_root}" >/dev/null; then
             echo "HP_NATIVE_REASON_CODE=SHMEM_SOURCE_NOT_PREPARED"
             return 6
         fi
-        if ! "${python_bin}" - "${prepared_dependency}" "${source_dir}" <<'PY'
-import json
-from pathlib import Path
-import subprocess
-import sys
-
-dependency = json.loads(sys.argv[1])["nlohmann_json"]
-header = subprocess.check_output([
-    "git", "-C", dependency["source_dir"], "show",
-    dependency["commit"] + ":single_include/nlohmann/json.hpp",
-])
-target = Path(sys.argv[2]) / "3rdparty/json/single_include/nlohmann/json.hpp"
-target.parent.mkdir(parents=True, exist_ok=True)
-target.write_bytes(header)
-PY
-        then
+        if [[ ! -f "${json_root}/single_include/nlohmann/json.hpp" ]]; then
             echo "HP_NATIVE_REASON_CODE=SHMEM_SOURCE_NOT_PREPARED"
+            echo "ERROR: Locked JSON archive lacks single_include/nlohmann/json.hpp." >&2
             return 6
         fi
     fi
 
     echo "INFO: preparing pinned CANN SHMEM SDK"
-    echo "  locked source: ${locked_source_dir}"
+    echo "  source lock: ${shmem_lock_digest}"
     echo "  isolated source: ${source_dir}"
     echo "  CANN toolchain: ${cann_root} (${bisheng_path})"
     echo "  host toolchain: ${host_arch} (${gcc_path}, ${gxx_path})"

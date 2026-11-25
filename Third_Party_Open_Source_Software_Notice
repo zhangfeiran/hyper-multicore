@@ -24,6 +24,14 @@ hyper_multicore/_build/dependencies.lock.json):
   These four repositories use CANN Open Software License Agreement Version 2.0;
   their license texts are reproduced below.
 
+Bundled build sources:
+- The source distribution includes build inputs exported from the locked CANN
+  revisions above, along with their original licenses and notices.
+- nlohmann/json v3.11.3 supplies the SHMEM Ascend950 topology reader header.
+  Source: https://gitcode.com/GitHub_Trending/js/json.git
+  Copyright (c) 2013-2022 Niels Lohmann. The archive contains LICENSE.MIT, and
+  the selected header carries its copyright notice.
+
 Framework headers incorporated by compiling the Torch/SHMEM adapters:
 - PyTorch and torch-npu headers come from the selected framework installation.
 - pybind11 headers are supplied by Torch's include/pybind11 tree, not selected

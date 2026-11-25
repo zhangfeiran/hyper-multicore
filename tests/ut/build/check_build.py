@@ -18,6 +18,7 @@ from collections.abc import Iterator
 from collections import namedtuple
 from contextlib import contextmanager, ExitStack, nullcontext, redirect_stderr, redirect_stdout
 import fcntl
+import gzip
 import hashlib
 from itertools import combinations
 import importlib.util
@@ -66,6 +67,19 @@ def git(directory: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(directory), *args], text=True).strip()
 
 
+def archive_source(build: Path, name: str, upstream: Path, commit: str, *paths: str) -> tuple[Path, dict]:
+    """Write a small source fixture with the same Git archive identity as build inputs."""
+    directory = build / "dependency_sources"
+    directory.mkdir(exist_ok=True, parents=True)
+    path = directory / f"{name}.tar.gz"
+    source = subprocess.check_output(["git", "archive", "--format=tar", commit, "--", *paths], cwd=upstream)
+    data = gzip.compress(source, mtime=0)
+    path.write_bytes(data)
+    return path, {"repository": f"https://example.invalid/{name}.git", "version": commit[:8],
+                  "commit": commit, "tree": git(upstream, "rev-parse", f"{commit}^{{tree}}"),
+                  "archive_sha256": hashlib.sha256(data).hexdigest()}
+
+
 class _HandoffCommands:
     """Record commands and publish the controlled SDK handoff."""
 
@@ -90,8 +104,7 @@ class _HandoffCommands:
             raise RuntimeError("vendor failed")
         if kwargs.get("label") == "common-prepare":
             write(Path(kwargs["env"]["HP_SHMEM_HANDOFF"]), json.dumps({"architectures": self.handoff}))
-            return json.dumps({"ops_nn_source": "nn", "ops_transformer_source": "transformer",
-                               "host_input_identity": "f" * 64, "pending": list(self.handoff)})
+            return json.dumps({"host_input_identity": "f" * 64, "pending": list(self.handoff)})
         return None
 
 
@@ -105,6 +118,41 @@ class BuildChecks(unittest.TestCase):
         self.root = Path(self.resources.enter_context(
             tempfile.TemporaryDirectory(prefix="hyper-multicore-build-check-")))
         self.resources.enter_context(patch.dict(os.environ, HYPER_MULTICORE_VENV_PATH=str(self.root / "envs")))
+
+    def test_source_archive_exports_only_locked_build_inputs(self):
+        """Reject a damaged archive and unpack the selected inputs without a Git executable."""
+        upstream = self.root / "upstream"
+        upstream.mkdir()
+        git(upstream, "init", "-q")
+        git(upstream, "config", "user.name", "Bundle Test")
+        git(upstream, "config", "user.email", "bundle-test@example.invalid")
+        write(upstream / "include/input.h", "locked input\n")
+        write(upstream / "docs/unused.txt")
+        git(upstream, "add", ".")
+        git(upstream, "commit", "--no-gpg-sign", "-qm", "input")
+        commit = git(upstream, "rev-parse", "HEAD")
+
+        build = self.root / "project/hyper_multicore/_build"
+        relative = "hyper_multicore/_build/prepare_dependencies.py"
+        helper = write(build / "prepare_dependencies.py", (ROOT / relative).read_text())
+        archive, operators = archive_source(build, "operators", upstream, commit, "include")
+        write(build / "dependencies.lock.json",
+              json.dumps({"schema_version": 2, "components": {"multicore": {"operators": operators}}}))
+
+        environment = {**os.environ, "PATH": str(self.root / "no-tools")}
+        output = self.root / "export"
+        command = [sys.executable, str(helper), "--dependency", "operators", "--export-dir", str(output)]
+        data = archive.read_bytes()
+        archive.write_bytes(data + b"corruption")
+        failed = subprocess.run(command, env=environment, capture_output=True, text=True, check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Source archive SHA256 mismatch", failed.stderr)
+        self.assertFalse(output.exists())
+        archive.write_bytes(data)
+        prepared = json.loads(subprocess.check_output(command, env=environment, text=True))["operators"]
+        self.assertEqual(prepared["commit"], commit)
+        self.assertEqual((output / "include/input.h").read_text(), "locked input\n")
+        self.assertFalse((output / "docs").exists())
 
     def test_soc_arguments_group_all_supported_subsets(self):
         """Every nonempty subset selects only its required SHMEM backends."""
@@ -370,7 +418,7 @@ while not Path(sys.argv[1]).exists():
         self.assertIn("HP-NATIVE-PAYLOAD-MISSING", result.stderr)
 
     def _sdk_fixture(self, directory):
-        """Use real locked Git objects and recording tools in an isolated SDK project."""
+        """Use locked source archives and recording tools in an isolated SDK project."""
         project, shmem, source = (directory / name for name in ("project", "shmem", "custom-json"))
         for repository in (shmem, source):
             repository.mkdir(parents=True)
@@ -388,15 +436,14 @@ while not Path(sys.argv[1]).exists():
         pinned = git(source, "rev-parse", "HEAD")
         header.write_text("current B\n")
         git(source, "commit", "-qam", "B")
-        dependencies = {"shmem": {"source_dir": str(shmem), "commit": git(shmem, "rev-parse", "HEAD")},
-                        "nlohmann_json": {"source_dir": str(source), "commit": pinned}}
-        lock = write(project / "hyper_multicore/_build/dependencies.lock.json",
-                     json.dumps({"components": {"multicore": dependencies}}))
-        write(project / "hyper_multicore/_build/prepare_dependencies.py",
-              "import json, os, sys\n"
-              "name = sys.argv[sys.argv.index('--dependency') + 1]\n"
-              "if name == 'nlohmann_json' and os.environ.get('FAIL_JSON'): raise SystemExit(7)\n"
-              f"print(json.dumps({dependencies!r}))\n")
+        build = project / "hyper_multicore/_build"
+        _, shmem_lock = archive_source(build, "shmem", shmem, git(shmem, "rev-parse", "HEAD"))
+        json_archive, json_lock = archive_source(build, "nlohmann_json", source, pinned, "single_include")
+        dependencies = {"shmem": shmem_lock, "nlohmann_json": json_lock}
+        lock = write(build / "dependencies.lock.json",
+                     json.dumps({"schema_version": 2, "components": {"multicore": dependencies}}))
+        relative = "hyper_multicore/_build/prepare_dependencies.py"
+        write(project / relative, (ROOT / relative).read_text())
         for name in ("hyper_multicore/cmake/hardening.cmake",
                      "hyper_multicore/shmem/cmake/shmem_wrapper/CMakeLists.txt"):
             write(project / name)
@@ -414,7 +461,7 @@ while not Path(sys.argv[1]).exists():
         env = {key: value for key, value in os.environ.items() if not key.startswith("HP_")}
         env.update(PATH=str(tools) + os.pathsep + os.environ["PATH"], PYTHON_BIN=sys.executable,
                    ASCEND_HOME_PATH=str(cann), TOOL_CALLS=str(directory / "calls"))
-        return SimpleNamespace(project=project, source=source, lock=lock, env=env)
+        return SimpleNamespace(project=project, source=source, lock=lock, json_archive=json_archive, env=env)
 
     def _prepare_sdk(self, fixture, soc):
         """Execute SDK preparation without invoking the compiler or CMake."""
@@ -426,7 +473,7 @@ while not Path(sys.argv[1]).exists():
         return result
 
     def test_sdk_exports_locked_json_without_changing_source(self):
-        """The 950 SDK must use the returned locked object rather than source HEAD."""
+        """The 950 SDK installs the header from the locked archive."""
         fixture = self._sdk_fixture(self.root)
         head = git(fixture.source, "rev-parse", "HEAD")
         result = self._prepare_sdk(fixture, "ascend950")
@@ -573,13 +620,17 @@ time.sleep(30)
             with self.subTest(failure=failure):
                 fixture = self._sdk_fixture(self.root / failure)
                 if failure == "prepare":
-                    fixture.env["FAIL_JSON"] = "1"
+                    fixture.json_archive.unlink()
                 else:
-                    helper = fixture.project / "hyper_multicore/_build/prepare_dependencies.py"
-                    pinned = git(fixture.source, "rev-parse", "HEAD~")
-                    git(fixture.source, "rm", "single_include/nlohmann/json.hpp")
+                    write(fixture.source / "LICENSE.MIT")
+                    git(fixture.source, "add", "LICENSE.MIT")
                     git(fixture.source, "commit", "-qm", "no header")
-                    helper.write_text(helper.read_text().replace(pinned, git(fixture.source, "rev-parse", "HEAD")))
+                    commit = git(fixture.source, "rev-parse", "HEAD")
+                    _, revision = archive_source(fixture.lock.parent, "nlohmann_json",
+                                                 fixture.source, commit, "LICENSE.MIT")
+                    record = json.loads(fixture.lock.read_text())
+                    record["components"]["multicore"]["nlohmann_json"] = revision
+                    fixture.lock.write_text(json.dumps(record))
                 result = self._prepare_sdk(fixture, "ascend950")
                 self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
                 calls = Path(fixture.env["TOOL_CALLS"]).read_text(encoding="utf-8").splitlines()
@@ -596,7 +647,7 @@ time.sleep(30)
                 record["components"]["multicore"]["nlohmann_json"]["version"] = "new identity"
                 fixture.lock.write_text(json.dumps(record))
                 if soc == "ascend910b":
-                    fixture.env["FAIL_JSON"] = "1"
+                    fixture.json_archive.unlink()
                 second = self._prepare_sdk(fixture, soc)
                 self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
                 first_key = next(line for line in first.stdout.splitlines() if line.startswith("KEY="))
