@@ -20,12 +20,11 @@ __aicore__ inline void PutIndexedRows(
 #if !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
   const int64_t row_bytes = hidden * sizeof(T);
   constexpr int64_t kPackets = 4;
-  __gm__ aclshmem_device_host_state_t *state = aclshmemi_get_state();
-  if (hidden <= 0 || hidden > MulticoreMoE::A3_INDEXED_MAX_HIDDEN ||
-      row_bytes % 32 != 0 || state->mte_config.aclshmem_ub != 0 || state->mte_config.ub_size != 2 * row_bytes) {
+  if (hidden <= 0 || hidden > MulticoreMoE::A3_INDEXED_MAX_HIDDEN || row_bytes % 32 != 0) {
     AscendC::Trap();
   }
-  // Each AIV task owns two packets followed by its local index words.
+  // The direct copies own this AIV's UB until both packets drain. SHMEM's
+  // separate MTE staging configuration applies only to its own operations.
   const int64_t group_bytes = kPackets * row_bytes;
   const int64_t bank_bytes = 2 * group_bytes;
   constexpr int64_t kGroupIndexRows = 128;
