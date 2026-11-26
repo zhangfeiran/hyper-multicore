@@ -438,6 +438,11 @@ class ExpertWeightBinding:
     def fused_gradients(self) -> bool:
         return self.mode in (ReplicaExecutionMode.FP32_BAND, ReplicaExecutionMode.BF16_BAND)
 
+    @property
+    def uses_fp32_bands(self) -> bool:
+        """Whether this binding writes and merges FP32 replica partials."""
+        return self.mode is ReplicaExecutionMode.FP32_BAND
+
     def for_tensor_dump(self) -> ExpertWeightBinding:
         """Use materialized bank operands without changing a saved binding."""
         return ExpertWeightBinding(self.pool, self.placement, self.layout,
@@ -455,7 +460,7 @@ class ExpertWeightBinding:
             self.staged_generation = self.pool.stage_snapshot(self.layout, self.snapshot)
 
     def acquire(
-        self, weights: tuple[torch.Tensor, ...], *, backward: bool = False,
+        self, weights: tuple[torch.Tensor, ...], *, backward: bool = False, replay_snapshot=None,
     ) -> tuple[torch.Tensor, ...]:
         """Lease reusable banks and publish this graph's saved owner weights."""
         if self.pool.requires_mte_edges:
@@ -467,7 +472,7 @@ class ExpertWeightBinding:
         try:
             if self.fused:
                 with _ordered_transfers(self.pool):
-                    result = self.pool.pipeline.begin(weights, self, backward)
+                    result = self.pool.pipeline.begin(weights, self, backward, replay_snapshot=replay_snapshot)
                 stats = self.pool.statistics
                 stats["fused_prefetches"] = stats.get("fused_prefetches", 0) + 1
                 return result
@@ -490,26 +495,33 @@ class ExpertWeightBinding:
                 self.pool.release()
             raise
 
-    def runtime(self, ordinary, gradients=None):
+    def runtime(self, ordinary, gradients=None, *, cube_queue=None):
         """Select split weights and optional in-kernel dW for this launch."""
         if not self.fused:
             return None
         return self.pool.pipeline.runtime(
             ordinary, self, gradients if self.fused_gradients else None,
-            bf16_partials=self.mode is ReplicaExecutionMode.BF16_BAND,
+            bf16_partials=self.mode is ReplicaExecutionMode.BF16_BAND, cube_queue=cube_queue,
         )
 
-    def save_snapshot(self, weights: tuple[torch.Tensor, ...]) -> None:
-        """Retain borrowed weights for the reentrant checkpoint path."""
+    def capture_snapshot(self, weights: tuple[torch.Tensor, ...], *, maximum_bytes: int | None = None):
+        """Copy the live guest weights while their bank is leased."""
         if self.fused and self.pool.pipeline.device_prefetch:
-            return
+            return None
         start = 0 if self.fused else self.pool.local_experts
         used = self.placement.published_slots
         stop = start + (self.placement.borrowed_capacity if used is None else used)
-        tails = tuple(weight[start:stop].detach().clone() for weight in weights)
+        views = tuple(weight[start:stop].detach() for weight in weights)
+        if maximum_bytes is not None and sum(view.nbytes for view in views) > maximum_bytes:
+            return None
+        tails = tuple(view.clone() for view in views)
         ready = torch.npu.Event()
         ready.record(torch.npu.current_stream(tails[0].device))
-        self.snapshot = tails, ready
+        return tails, ready
+
+    def save_snapshot(self, weights: tuple[torch.Tensor, ...]) -> None:
+        """Retain borrowed weights for the reentrant checkpoint path."""
+        self.snapshot = self.capture_snapshot(weights)
         self.generation = None
 
     def gradients(

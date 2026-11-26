@@ -168,6 +168,12 @@ def runtime_config_task_capacity(cfg: RuntimeConfigC) -> int:
     return capacity
 
 
+def cube_task_index_offset(cfg: RuntimeConfigC) -> int:
+    """Locate the Cube index array in the serialized, capacity-trimmed image."""
+    capacity = runtime_config_task_capacity(cfg)
+    return _runtime_config_type(capacity, cfg.event_capacity, 0).cube_task_indices.offset
+
+
 def copy_runtime_config(cfg: RuntimeConfigC) -> RuntimeConfigC:
     """Copy wire storage and retain the graph-owned host validation contract."""
     result = type(cfg).from_buffer_copy(bytes(cfg))

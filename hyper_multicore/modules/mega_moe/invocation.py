@@ -71,13 +71,20 @@ def prepare_expert_invocation(
             dump = _get_active_session("tensor_dump")
             if dump is not None and dump.is_capture_enabled():
                 mask |= _TENSOR_DUMP_MASK
-            record, replay = route_record(resources)
+            defer_reentrant = resources.workspace.a3_fused_recompute and counts is None
+            record, replay = route_record(resources, defer_reentrant=defer_reentrant)
             if replay and agree_replay(
-                    record, hidden, ids, probs, counts, resources.spec, mask, weight_error=weight_error):
+                    record, hidden, ids, probs, counts, resources.spec, mask, weight_error=weight_error,
+                    defer_reentrant=defer_reentrant):
                 placement.statistics["route_replays"] += 1
                 route = record.route
+                if record.defer_expert_recompute:
+                    yield replace(route, checkpoint_record=record)
+                    return
                 resources.workspace.wait_for_reuse()
-                if not record.allow_activation:
+                if route.indexed_dispatch_offsets is not None:
+                    route = replace(route, routed_tokens=hidden, count_fence=record.replay_count_fence)
+                elif not record.allow_activation:
                     with torch.inference_mode(False), torch.no_grad():
                         if pull:
                             prepare_workspace(route.metadata.plan_tokens, route.maximum_received_slots)
@@ -96,6 +103,8 @@ def prepare_expert_invocation(
         options = {"autograd_mask": mask}
         if planner is not None:
             options["select_placement"] = partial(placement.select, planner=planner)
+            if counts is None and placement.indexed_push:
+                options["indexed_placement"] = True
             if placement.uses_placement_wire():
                 options["reuse_placement_geometry"] = resources.spec.ep_size * resources.spec.num_experts <= 16384
         if resources.spec.auto_tokens:
@@ -121,9 +130,14 @@ def prepare_expert_invocation(
 
 def _record_checkpoint_route(route, record, counts, ids):
     """Keep the route descriptors and placement with the checkpoint invocation."""
-    if record is None or counts is not None:
+    if record is None:
         return route
-    record.route = replace(route, routed_tokens=None, unpermute_mapping=None)
+    if counts is not None:
+        return replace(route, checkpoint_record=record) if record.guest_snapshot_bytes or record.defer_expert_recompute else route
+    keep_mapping = (route.indexed_dispatch_offsets is not None
+                    or (record.defer_expert_recompute and record.owner.workspace.a3_fused_recompute))
+    mapping = route.unpermute_mapping if keep_mapping else None
+    record.route = replace(route, routed_tokens=None, unpermute_mapping=mapping, count_fence=None)
     record.ids = ids.detach().clone()
     record.weight_binding = route.weight_binding
     return replace(route, checkpoint_record=record)

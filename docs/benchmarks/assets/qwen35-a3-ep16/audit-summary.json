@@ -1,0 +1,331 @@
+{
+  "run_id": "20261125-110012-0f7ce4",
+  "date": "2026-11-25",
+  "steps": 50,
+  "stable_steps": [
+    23,
+    50
+  ],
+  "source_revisions": {
+    "veomni": "c8bed6880b0eba04218de23a57f6794ef94969b2",
+    "hyper_parallel_master": "11483b9fc3f2ee42c245960b30f9327115abb7d2",
+    "hot_replica_a3_perf": "b0d5c3258f72b9ece4f65d734b64cc470530e753"
+  },
+  "megamoe_build": {
+    "build_commit": "b0d5c3258f72b9ece4f65d734b64cc470530e753",
+    "build_fingerprint": "0fc93a3d868274fd77361ddcf5d6e4d91d9afd695caae299745a7b8554096a16",
+    "source_sha256": "3a528a94bc66c72071d4d2ef146eea00ce64abae0de6b4bf97ff70c9f77e4748",
+    "artifact_version": "0.1.0.dev0+pt.2.12.0.post3",
+    "soc_list": [
+      "ascend910_93"
+    ],
+    "torch_version": "2.12.0+cpu",
+    "pta_version": "2.12.0.post3",
+    "cann_version": "9.2.0",
+    "op_plugin_version": "V2R12",
+    "payload_sha256": {
+      "adapters/manifest.json": "cb9144953b249f5dac75363dd3e89b54e1a370ede6c4d1e616b55c5077cee8a3",
+      "adapters/pt2.12.0-pta2.12.0.post3-0fc93a3d8682/libhyper_multicore_torch.so": "64ec64459e94f0d45acd6e9be690a5a98967e537067e05cee83652dc11714dc2",
+      "adapters/pt2.12.0-pta2.12.0.post3-0fc93a3d8682/shmem/arch22/hot_replica/_hot_replica_shared_bridge.so": "b4144eab96aba8c948f4882bc38b80997c28a6ff01868feb840ab3246f13ac39",
+      "adapters/pt2.12.0-pta2.12.0.post3-0fc93a3d8682/shmem/arch22/hot_replica/_replica_host.so": "3fc261eef2907d7b7725de56578a5b06e20ba9f9be8c8cc1353c2944fe8f6174",
+      "adapters/pt2.12.0-pta2.12.0.post3-0fc93a3d8682/shmem/arch22/hyper_multicore_shmem_torch.so": "91e728fb01ce95f90c43163a0de31fccd236e8572e5e5fd9c5ac68da9e2d2d9f",
+      "lib/set_env.bash": "31d06558cf3180d21b555ad350f4f9ce8f458c1fdd7f4b43902a82f428b8a1c6",
+      "lib/vendors/hyper_multicore_nn/framework/tensorflow/npu_supported_ops.json": "0758e7d0710ebba7dfe83896fa900dd467d4e23e94ffceedbbc8318d76fe3b5b",
+      "lib/vendors/hyper_multicore_nn/op_api/include/aclnn_hyper_mega_gate_route.h": "e7c760a16ff91fe27272ddd1e28fc7ea53359ca3bf530785b8bee8c6762c408e",
+      "lib/vendors/hyper_multicore_nn/op_api/include/aclnn_hyper_mega_gate_route_grad.h": "a7154ee5bdd7c618068eadd9a130e1a62b34f5c5aea94c87175bec4da8253054",
+      "lib/vendors/hyper_multicore_nn/op_api/include/aclnn_hyper_mega_mhc.h": "c91b400732c32187f05d87bb4cf8cc27bf7db672108036d8a7bffd5871589ce1",
+      "lib/vendors/hyper_multicore_nn/op_api/include/aclnn_hyper_mega_mhc_grad.h": "c60d877aacce6c7d56e76917190556a1789d485f76fd3ebc91c273b4d455cf81",
+      "lib/vendors/hyper_multicore_nn/op_api/include/aclnn_hyper_mega_moe.h": "2cac52e5c3a309d32ad4317866e98b87d60b62ec48942a1330dac735616b1fab",
+      "lib/vendors/hyper_multicore_nn/op_api/include/aclnn_hyper_mega_moe_grad.h": "799408c01c84e4f6e8641a1545464af05288d6c9095232461fcfff0476605202",
+      "lib/vendors/hyper_multicore_nn/op_api/include/aclnn_hyper_mega_moe_mxfp8.h": "91295cf5f5110efe1c70c0de6792c092a4c00a61fefa3d39d32f0a4b8b8a5e25",
+      "lib/vendors/hyper_multicore_nn/op_api/include/aclnn_hyper_mega_moe_mxfp8_grad.h": "53bd73a5a6376b473de1796ded10751d680b8a51d61b443bc64043c4ccdc7722",
+      "lib/vendors/hyper_multicore_nn/op_api/lib/libcust_opapi.so": "8e8da7605a49582cc6e66e4d9cd10812d0c3b807fc00083e45257352ec78e2d2",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/config/ascend910_93/aic-ascend910_93-ops-info.json": "db080441cde7f7ad520cfcb232642dfb92ba785b94a97cdb23abd5e48ca144ce",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_gate_route/HyperMegaGateRoute_51b3ed5fb437e5de2c66aff4a6043505.json": "896671859568a8f259793616862903da97ce898b767639f3bb426f7cd5601355",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_gate_route/HyperMegaGateRoute_51b3ed5fb437e5de2c66aff4a6043505.o": "6490df35a728f0ef5a2e0748c51215769ab1e23444022c232410537cdbc4f1d8",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_gate_route_grad/HyperMegaGateRouteGrad_303d12d6648a9fd322199a0a8d3ab5c0.json": "70b4bbf8e7a649f2f9613590f46b79f8b298062c880858f34038c22edcdacf79",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_gate_route_grad/HyperMegaGateRouteGrad_303d12d6648a9fd322199a0a8d3ab5c0.o": "607cae8792c67ed94ccea89e942583383755645524f9dd4feafe5023b349db74",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_mhc/HyperMegaMhc_433fc592441f7ac1b484cebbff756b75.json": "b175c4fc88171f6ddd0b168879dd397328c76e1a087e0ba77ee057161c1e8679",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_mhc/HyperMegaMhc_433fc592441f7ac1b484cebbff756b75.o": "ce77a5090e186f134ee60a7b61c131b4ea808c26b41ec3ea61574978811b72df",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_mhc_grad/HyperMegaMhcGrad_bf9c317a8a7bc83c9f4bed060af1a9cc.json": "e079c1979612abdbc44ddf7090794847547929b1d4e8705b0098b81d10e15e62",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_mhc_grad/HyperMegaMhcGrad_bf9c317a8a7bc83c9f4bed060af1a9cc.o": "31b1531fa36710410a9ca6936769eed5584ba46bf7c5d181ca71bebe76da7d89",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_moe/HyperMegaMoe_8fa11c3f49d35b114d045c751d29ca02.json": "38aa3dd6b8b15fd5c0435eb570a32b500cacecd4341039e45335b9750de601cd",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_moe/HyperMegaMoe_8fa11c3f49d35b114d045c751d29ca02.o": "4336effdb1b5ce46801c8e03e2890ade05642381250906ee495c1fe754aa73ac",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_moe/HyperMegaMoe_e6c0ec2992b0e7c6cc20aea213fa5428.json": "c2f9e52724e6411f79a289acd604383c4b7c754ff9cb01d02b3a573e0c219fbc",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_moe/HyperMegaMoe_e6c0ec2992b0e7c6cc20aea213fa5428.o": "3cad0d56ad222918c5a882b311e24e2d7ff281cce4db1de1e9d2df0f1a5ad6de",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_moe_grad/HyperMegaMoeGrad_33fe31e677f6832eb668ca0702fc8322.json": "c6f19f2eb4217019fda02308bbc7adcb6b3ddb4861db887f98017e9ca78519ac",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_moe_grad/HyperMegaMoeGrad_33fe31e677f6832eb668ca0702fc8322.o": "14175c5bab695aa8921706745687310806cbc72b0e4b266e7eea79d8d162e1a1",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_moe_grad/HyperMegaMoeGrad_4a749b390f901cd7613a0b8a93a36252.json": "b879f458f73441f752d906d052df672006a479c6473cc01041ca0708f532c762",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_moe_grad/HyperMegaMoeGrad_4a749b390f901cd7613a0b8a93a36252.o": "77f02840a2eda7e33c93b148f041ccb52969ffa6ee9e19650b80393964de5de6",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_moe_grad/HyperMegaMoeGrad_9ae186170dd467d23b745fc44c511eee.json": "cec850bdbec513e96dc36d0230cd63ef555c66e4aa74eb8f704427cd7385eddd",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_moe_grad/HyperMegaMoeGrad_9ae186170dd467d23b745fc44c511eee.o": "0259d644ea5ae6ed2c3f44dae636c5643b47f740e84404f5bd9a699470958121",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_moe_grad/HyperMegaMoeGrad_a3e209fcfebb8705529dbb31c9eba29b.json": "76635ce152a702ab6564be81cd9414e02150b63a05ddff24a32a7128676b58d3",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/arch22/hyper_mega_moe_grad/HyperMegaMoeGrad_a3e209fcfebb8705529dbb31c9eba29b.o": "479adb553b4f745ccbe2ee5c8cd2bfaac37998d3605dd5cbdd04479abff2c5a3",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/config/ascend910_93/binary_info_config.json": "1b0ff6cd20030d6901c357b611f44bc4c0150e138629ed81eeecd9ba89ca8fbb",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/config/ascend910_93/hyper_mega_gate_route.json": "21e384cdfeb5a3f2c0c11f467d9f254ac1e448e62279544e17e0291459e9fb9d",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/config/ascend910_93/hyper_mega_gate_route_grad.json": "da80c14fe4638e53fc15aaaa67e600c37991e9e0e7c4719e9d5dd35843a5315a",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/config/ascend910_93/hyper_mega_mhc.json": "c9955b75e2c94aa99a3fec6255de5b2b09e28c1cd82c133846fa6482bb9dccb9",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/config/ascend910_93/hyper_mega_mhc_grad.json": "8a880e05492f7c4b077df851470b6387dfd6e37bb60ca6edbb9ab70d35fd8d45",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/config/ascend910_93/hyper_mega_moe.json": "04e789f262badb96bbf6221e180de623e7c228291377ff8fad8afd0e6ed7d55c",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/config/ascend910_93/hyper_mega_moe_grad.json": "1ea7917abcd26e3432584c1173930b3e12a25f9cd4bd209649acccfb16811ec0",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so": "e0bcd6c040e07604d80a86f7f943f1543b04efdbcaa4872a8322b01bd61d8470",
+      "lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/op_tiling/liboptiling.so": "e0bcd6c040e07604d80a86f7f943f1543b04efdbcaa4872a8322b01bd61d8470",
+      "lib/vendors/hyper_multicore_nn/op_proto/inc/op_proto.h": "eae24a56f38d594ae01ed748bb96946b8ccd24dedf21ef8ed1007bb86c6d9201",
+      "lib/vendors/hyper_multicore_nn/op_proto/lib/linux/aarch64/libcust_opsproto_rt2.0.so": "31086e13224a74c065a468f92f942f223ac58aac8d19517854b8325cd8a090c1",
+      "lib/vendors/hyper_multicore_nn/version.info": "fd75e9505016e9725e823b2f2dc3a751d7f5e6f9f3d5734d702c4b8c00acfc87",
+      "shmem/lib/arch22/hot_replica/libhmc_hot_replica_kernels.so": "1969984946aa9e61b3f171706e30b7c8d2b2f6b4180a4d522e64e305e46ea99e",
+      "shmem/lib/arch22/libhyper_multicore_shmem_ops.so": "0e784188aa20306eda2ea465f4c832dcd016bfe352e6641ba8c13f39463442a7",
+      "shmem/lib/arch22/shmem/aclshmem_bootstrap_config_store.so": "ff7da47eafd5349e441566e818cc1d0b8684fed70561d71158a2c4adc78a1a3e",
+      "shmem/lib/arch22/shmem/aclshmem_bootstrap_uid.so": "9389d20c02a7b947dc37cbba00b2514d10a2119a99dab7a73dd60ed1920f26d4",
+      "shmem/lib/arch22/shmem/libhyper_multicore_shmem.so": "1a7f21e6bce1f37223070b7028689b1a34b4b95b16b02afaa865de8c85184b7d",
+      "shmem/lib/arch22/shmem/libhyper_multicore_shmem_utils.so": "aca28bc7003fc35f3197fbbf727b49ad7e619a78e6128494b038eac124e63c13"
+    }
+  },
+  "archive_sha256": {
+    "original_report": "9580b60ee70aa1cd1bdf340cb792fd20930331f81f706a0bfaddad1fafcd01d3",
+    "original_audit": "7ecfc68225312957886c1ffd207e22e42e72e7148c40480ff9001ccffc0ebd42",
+    "hyper_parallel_master_source_tar": "2b5b49a1aec47df7397b8203b4c3669d700b52310d648268500866ce4e17b7ea",
+    "megamoe_runtime_member_manifest": "8d02515c49e2b5fc0c51f96dc86713d79ca914f2e0f0a0f2ba9e09f476e8eade",
+    "launch_source_manifest": "138a543eb07771c94da0e97df8fad30ad197fae51b5d6deb9aa8ce6f367d34bf"
+  },
+  "mfu": {
+    "peak_tflops_per_logical_npu": 354.0,
+    "formula": "VeOmni Qwen3.5 full tuning",
+    "observed_workload_tflop_per_rank": [
+      180.244372783104
+    ]
+  },
+  "cases": {
+    "native": {
+      "mean_s": 6.470966251982775,
+      "p50_s": 6.475831987336278,
+      "p95_s": 6.53706330943387,
+      "min_s": 6.302633577957749,
+      "max_s": 6.591565974056721,
+      "stdev_s": 0.059927966663909794,
+      "allocated_peak_gib": 33.23749542236328,
+      "reserved_peak_gib": 34.302734375,
+      "heap_peak_gib": 0.0,
+      "hbm_sampled_peak_gib": 39.91796875,
+      "stable_hbm_sampled_peak_gib": 39.91796875,
+      "hbm_samples": 134,
+      "stable_hbm_samples": 46,
+      "stable_placements": 0,
+      "stable_planner_calls": 0,
+      "stable_steps_with_placement": 0,
+      "steady_expert_calls_per_rank_step": [
+        80
+      ],
+      "stable_protocol_bindings_rank0": {},
+      "stable_receive_capacity_rows": 0,
+      "stable_steps_with_heap_growth": [],
+      "train_tokens_per_second": 20255.39848238864,
+      "rank_terminals": 16,
+      "rank_steps": 800,
+      "steady_mean_mfu_pct": 7.869106762221969
+    },
+    "mega-b0": {
+      "mean_s": 5.57520731164342,
+      "p50_s": 5.578514070250094,
+      "p95_s": 5.6382585695246235,
+      "min_s": 5.481620280072093,
+      "max_s": 5.650561225600541,
+      "stdev_s": 0.0470063560649427,
+      "allocated_peak_gib": 31.528077602386475,
+      "reserved_peak_gib": 34.205078125,
+      "heap_peak_gib": 1.833984375,
+      "hbm_sampled_peak_gib": 41.708984375,
+      "stable_hbm_sampled_peak_gib": 41.708984375,
+      "hbm_samples": 118,
+      "stable_hbm_samples": 39,
+      "stable_placements": 0,
+      "stable_planner_calls": 0,
+      "stable_steps_with_placement": 0,
+      "steady_expert_calls_per_rank_step": [
+        80
+      ],
+      "stable_protocol_bindings_rank0": {},
+      "stable_receive_capacity_rows": 415104,
+      "stable_steps_with_heap_growth": [],
+      "train_tokens_per_second": 23509.798411669024,
+      "rank_terminals": 16,
+      "rank_steps": 800,
+      "steady_mean_mfu_pct": 9.13329061307475
+    },
+    "mega-hot": {
+      "mean_s": 4.558600513813352,
+      "p50_s": 4.560770838521421,
+      "p95_s": 4.620219625718891,
+      "min_s": 4.474919098895043,
+      "max_s": 4.673274790868163,
+      "stdev_s": 0.04511791695374802,
+      "allocated_peak_gib": 29.8188796043396,
+      "reserved_peak_gib": 34.416015625,
+      "heap_peak_gib": 0.751953125,
+      "hbm_sampled_peak_gib": 40.6083984375,
+      "stable_hbm_sampled_peak_gib": 40.6083984375,
+      "hbm_samples": 107,
+      "stable_hbm_samples": 33,
+      "stable_placements": 2240,
+      "stable_planner_calls": 2240,
+      "stable_steps_with_placement": 28,
+      "steady_expert_calls_per_rank_step": [
+        80
+      ],
+      "stable_protocol_bindings_rank0": {
+        "fp32_band_bindings": 2240
+      },
+      "stable_receive_capacity_rows": 81920,
+      "stable_steps_with_heap_growth": [],
+      "train_tokens_per_second": 28752.683987734625,
+      "rank_terminals": 16,
+      "rank_steps": 800,
+      "steady_mean_mfu_pct": 11.170378951973019
+    }
+  },
+  "comparisons": [
+    {
+      "baseline": "native",
+      "candidate": "mega-b0",
+      "speedup_pct": 16.06682747865942,
+      "step_time_reduction_pct": 13.842738556469591,
+      "stable_faster_steps": 28,
+      "max_loss_abs_diff": 0.00415637344121933,
+      "max_grad_norm_abs_diff": 4.807239532470703,
+      "max_grad_norm_rel_diff": 1.9688556102598027,
+      "matching_input_rank_steps": 800,
+      "matching_initial_route_ranks": 16,
+      "matching_initial_expert_weight_sample_ranks": 16
+    },
+    {
+      "baseline": "native",
+      "candidate": "mega-hot",
+      "speedup_pct": 41.95072001537801,
+      "step_time_reduction_pct": 29.553016716529047,
+      "stable_faster_steps": 28,
+      "max_loss_abs_diff": 0.019646093249320984,
+      "max_grad_norm_abs_diff": 5.633411407470703,
+      "max_grad_norm_rel_diff": 0.7779021544535282,
+      "matching_input_rank_steps": 800,
+      "matching_initial_route_ranks": 16,
+      "matching_initial_expert_weight_sample_ranks": 16
+    },
+    {
+      "baseline": "mega-b0",
+      "candidate": "mega-hot",
+      "speedup_pct": 22.300852964623076,
+      "step_time_reduction_pct": 18.23442144845373,
+      "stable_faster_steps": 28,
+      "max_loss_abs_diff": 0.023802466690540314,
+      "max_grad_norm_abs_diff": 3.0216751098632812,
+      "max_grad_norm_rel_diff": 1.1149158096296374,
+      "matching_input_rank_steps": 800,
+      "matching_initial_route_ranks": 16,
+      "matching_initial_expert_weight_sample_ranks": 16
+    }
+  ],
+  "completion": {
+    "exit_code": 0,
+    "remaining_owned_pids": [],
+    "device_inventory_at": "2026-11-25T11:25:49+0800",
+    "devices": [
+      {
+        "logical_id": 0,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 1,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 2,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 3,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 4,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 5,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 6,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 7,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 8,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 9,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 10,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 11,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 12,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 13,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 14,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      },
+      {
+        "logical_id": 15,
+        "healthy": true,
+        "idle": true,
+        "lock_free": true
+      }
+    ],
+    "node_lock_free": true
+  }
+}

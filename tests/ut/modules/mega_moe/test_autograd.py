@@ -14,14 +14,16 @@
 # ============================================================================
 """CPU storage-lifetime tests for the MegaMoe autograd bridge."""
 
+import os
 import unittest
+import weakref
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
 
 import torch
-from torch.utils.checkpoint import DefaultDeviceType, checkpoint
+from torch.utils.checkpoint import DefaultDeviceType, checkpoint, set_checkpoint_early_stop
 
 from hyper_multicore.diagnostics import MegaKernelDiagnostics
 from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as function_module
@@ -185,6 +187,8 @@ class TestMegaMoeFunction(unittest.TestCase):
         context = Mock()
         context.weight_binding = None
         context.has_unpermute = False
+        context.defer_forward_copies = False
+        context.deferred_recompute = None
         context.needs_input_grad = (False,) * 9
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
@@ -250,6 +254,161 @@ class TestMegaMoeFunction(unittest.TestCase):
             with self.subTest(permuted=permuted):
                 self._check_deferred_backward(permuted=permuted, replay=True)
 
+    def test_checkpoint_can_defer_expert_recompute_until_its_original_backward(self) -> None:
+        """Downstream replay gets token output while only the original node launches R and B."""
+        self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
+        DefaultDeviceType.set_device_type("cpu")
+        spec = SimpleNamespace(
+            apply_probs_before_fc2=False, dispatch_mode="push", expert_weight_layout="EOI",
+            hidden_size=2, intermediate_size=1, top_k=1, auto_tokens=True, architecture=2201,
+        )
+        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False, weight_grad_dtype=None, event_counter_bytes=8)
+        metadata = function_module.RouteMetadata(
+            *(torch.zeros(1, dtype=torch.int64) for _ in range(6)),
+            group_list=torch.tensor([2]), expert_capacity=2, all_experts_active=True,
+        )
+        tokens = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        w1 = torch.tensor([2.0], requires_grad=True)
+        w2 = torch.tensor([3.0], requires_grad=True)
+        probs = torch.tensor([[0.25], [0.5]], requires_grad=True)
+        ids = torch.zeros((2, 1), dtype=torch.int32)
+        route = function_module.PreparedTopKRoute(
+            tokens.detach(), torch.arange(2, dtype=torch.int32), None, None, metadata,
+            indexed_dispatch_offsets=torch.zeros(2, dtype=torch.int64),
+        )
+        workspace = Mock(
+            expert_buffer=torch.empty_like(tokens), routed_buffer=torch.empty_like(tokens),
+            gmm_workspace=torch.empty(1), swiglu_grad_workspace=torch.empty(1),
+            a3_fused_recompute=False,
+        )
+        from hyper_multicore.modules.hot_replica.checkpoint import ReplayRecord
+        record = ReplayRecord(owner=None, route=route)
+        launches = []
+        phase = False
+
+        def execute(x, first, second, p):
+            nonlocal phase
+            output = function_module.execute_mega_moe_with_permutation(
+                x, ids, first, second, route, plan, workspace, topk_weights=p,
+                checkpoint_replay=phase, deferred_recompute=record,
+            )
+            phase = True
+            return output.square().sum()
+
+        def forward_kernel(_plan, _metadata, x, first, second, execution, **_options):
+            launches.append("F or R")
+            execution.dispatch.copy_(x)
+            execution.combine.copy_(x + first + second)
+
+        def backward_kernel(_plan, saved, source, execution, **_options):
+            launches.append("B")
+            self.assertTrue(torch.equal(saved.dispatch, tokens))
+            execution.grad_x.copy_(source)
+            execution.intermediates.grad_weight1.fill_(source.sum())
+            execution.intermediates.grad_weight2.fill_(source.sum())
+
+        def unpermute_grad(y, g, _mapping, p, dx, dp):
+            dx.copy_(g * p)
+            dp.copy_((y * g).sum(-1, keepdim=True))
+
+        vendor = SimpleNamespace(npu_moe_token_unpermute=lambda value, _mapping, probs: value * probs)
+        with (
+            patch.object(function_module, "_launch_forward_kernel", side_effect=forward_kernel),
+            patch.object(function_module, "_launch_backward_kernel", side_effect=backward_kernel),
+            patch.object(function_module, "load_torch_npu", return_value=vendor),
+            patch.object(function_module.multicore_ops, "mega_moe_unpermute_grad_out", side_effect=unpermute_grad),
+            patch.object(function_module.multicore_ops, "moe_token_permute_grad",
+                         side_effect=lambda gradient, *_args: gradient.clone()),
+            set_checkpoint_early_stop(False),
+        ):
+            inputs = tokens, w1, w2, probs
+            loss = checkpoint(execute, *inputs, use_reentrant=False)
+            expected = ((tokens + w1 + w2) * probs).square().sum()
+            reference = torch.autograd.grad(expected, inputs)
+            for retain in (True, False):
+                actual = torch.autograd.grad(loss, inputs, retain_graph=retain)
+                for result, wanted in zip(actual, reference):
+                    torch.testing.assert_close(result, wanted, atol=0, rtol=0)
+                self.assertEqual(record.deferred_output is not None, retain)
+        self.assertEqual(launches, ["F or R", "F or R", "B", "F or R", "B"])
+
+    def test_compound_recompute_binds_disjoint_owner_buffers_in_physical_route_order(self) -> None:
+        """Allocate both expert operands and restore the source-slot probability order."""
+        hidden = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+        ids = torch.tensor([[1, 0], [0, 1], [1, 0]], dtype=torch.int32)
+        probs = torch.arange(6, dtype=torch.float32).reshape_as(ids) / 5
+        cap, source_slots = 8, ids.numel()
+        metadata = function_module.RouteMetadata(
+            *(torch.zeros(2, dtype=torch.int64) for _ in range(6)),
+            group_list=torch.tensor([3, 6]), expert_capacity=6,
+        )
+        workspace = Mock(
+            expert_capacity=cap, expert_buffer=hidden.new_empty((cap, 4)),
+            routed_buffer=hidden.new_empty((source_slots, 4)), gmm_workspace=torch.empty(16, dtype=torch.uint8),
+            recompute_workspace=torch.empty(cap * (4 * 2 + 32) + source_slots * 32, dtype=torch.uint8),
+        )
+        slot_to_physical = torch.argsort(torch.argsort(ids.reshape(-1), stable=True)).to(torch.int32)
+        route = SimpleNamespace(metadata=metadata, indexed_dispatch_offsets=None,
+                                unpermute_mapping=slot_to_physical)
+        context = SimpleNamespace(
+            weight_binding=None, workspace=workspace, deferred_recompute=SimpleNamespace(route=route),
+            plan=SimpleNamespace(spec=SimpleNamespace(
+                hidden_size=4, intermediate_size=2, top_k=2, dispatch_mode="push", apply_probs_before_fc2=False,
+            ), event_counter_bytes=64),
+        )
+        weight = hidden.new_empty(0)
+        saved, (inverse,), launch = function_module._prepare_fused_recompute(
+            context, (hidden, weight, weight, probs, ids),
+        )
+        self.assertIs(launch.forward.source, hidden)
+        self.assertEqual(saved.dispatch.data_ptr(), workspace.expert_buffer.data_ptr())
+        self.assertEqual(launch.received_g.shape, (cap, 4))
+        self.assertEqual(launch.received_p.data_ptr(), launch.received_g.data_ptr() + cap * 4 * 2)
+        self.assertEqual(launch.returned_dp.data_ptr(), launch.received_p.data_ptr() + cap * 32)
+        torch.testing.assert_close(launch.source_p[inverse, 0], probs.flatten(), atol=0, rtol=0)
+        source_rows = launch.dispatch_offsets[2:].view(torch.int32)
+        torch.testing.assert_close(source_rows, torch.argsort(inverse).div(2, rounding_mode="floor").int())
+
+    def test_compound_call_owns_tiling_before_backward_submission(self) -> None:
+        """Retain the tensor behind the nested tiling address while preparing B."""
+        runtime = torch.zeros(128, dtype=torch.uint8)
+        spec = SimpleNamespace(rank_id=0, ep_size=2, num_experts=24, hidden_size=4096,
+                               plan_tokens=384, num_cube_cores=24)
+        plan = SimpleNamespace(spec=spec, up_proj_tiling=None, swiglu_tiling=None, down_proj_tiling=None)
+        ctx = SimpleNamespace(plan=plan, workspace=SimpleNamespace(lease_stream=None), token_rows=257, source_rows=771)
+        tensor = torch.ones((1, 4), dtype=torch.bfloat16)
+        trace = torch.empty_like(runtime)
+        forward = SimpleNamespace(source=tensor, gmm_workspace=None, event_counters=runtime)
+        saved = SimpleNamespace(weight1=tensor, weight2=tensor)
+        recompute = SimpleNamespace(forward=forward, metadata=None, dispatch_offsets=None, barrier=None,
+                                    received_g=None, source_p=None, received_p=None, local_dp=None, returned_dp=None)
+        original_tensor = torch.tensor
+        tiling_references = []
+
+        def watch_tiling(words, **options):
+            result = original_tensor(words, **options)
+            if len(words) == 11:
+                tiling_references.append(weakref.ref(result))
+            return result
+
+        with patch.dict(os.environ, {"HMC_A3_RECOMPUTE_GRADIENT_ROWS": "3"}), \
+                patch.object(function_module, "_forward_kernel_inputs", return_value=(None,) * 16), \
+                patch.object(torch, "tensor", new=watch_tiling), \
+                patch.object(torch.Tensor, "record_stream", new=lambda *_: None):
+            call = function_module._recompute_call(ctx, recompute, saved, tensor, runtime, trace=trace)
+
+        tiling, = tiling_references
+        self.assertIsNotNone(tiling())
+        words = call.descriptor.view(torch.int64)
+        self.assertEqual(words.numel(), 38)
+        self.assertEqual(words[24].item(), tiling().data_ptr())
+        self.assertEqual(words[-4:].tolist(), [trace.data_ptr(), 0, 3, 0])
+        self.assertTrue(any(t is trace for t in call.operands))
+        self.assertEqual(tiling()[6].item(), runtime.numel())
+        self.assertEqual(tiling()[8:].tolist(), [257, 0, 771])
+        del call
+        self.assertIsNone(tiling())
+
     def _check_deferred_forward(
         self, source: Any, weight1: Any, weight2: Any, route: Any, plan: Any, workspace: Any,
         down_pointers: list[int],
@@ -265,7 +424,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             def operation(values: Any, first: Any, second: Any) -> Any:
                 prepared = SimpleNamespace(
                     routed_tokens=values.detach().repeat_interleave(2, dim=0),
-                    metadata=route, unpermute_mapping=mapping,
+                    metadata=route, unpermute_mapping=mapping, indexed_dispatch_offsets=None,
                 )
                 return function_module.execute_mega_moe_with_permutation(
                     values, ids, first, second, prepared, plan, workspace,

@@ -146,7 +146,7 @@ class ReplicaPipeline:
                       for slot, source in enumerate(row[:slots]) if source >= 0 and source // home == pool.rank)
         return slots, received, owned
 
-    def begin(self, weights, binding, backward):
+    def begin(self, weights, binding, backward, *, replay_snapshot=None):
         """Publish projection epochs directly to their current guest consumers."""
         pool = self.pool
         self.epoch += 1
@@ -171,7 +171,7 @@ class ReplicaPipeline:
             self.resident = binding.token
         elif not backward or self.resident is not binding.token:
             self.resident = None
-            snapshot = binding.snapshot
+            snapshot = binding.snapshot if replay_snapshot is None else replay_snapshot
             if snapshot is None:
                 self._publish_weights(weights, binding, ready, rank_lines, backward)
             else:
@@ -251,7 +251,7 @@ class ReplicaPipeline:
         binding.gradient_outputs = ()
         binding.prefetch_table = None
 
-    def runtime(self, base, binding, gradients=None, *, bf16_partials=False):
+    def runtime(self, base, binding, gradients=None, *, bf16_partials=False, cube_queue=None):
         """Encode the current projection addresses after the ordinary queue table."""
         gradients_address = 0
         if gradients is not None:
@@ -262,7 +262,11 @@ class ReplicaPipeline:
             table.record_stream(torch.npu.current_stream(self.pool.device))
             words = (*words, table.data_ptr())
         extension = _words_tensor(words, self.pool.device, -base.numel() % 8)
-        return torch.cat((base.view(torch.uint8), extension))
+        ordinary = base.view(torch.uint8)
+        if cube_queue is None:
+            return torch.cat((ordinary, extension))
+        offset, replacement = cube_queue
+        return torch.cat((ordinary[:offset], replacement, ordinary[offset + replacement.numel():], extension))
 
     def _gradient_table(self, binding, gradients, *, bf16_partials=False):
         pool = self.pool

@@ -24,6 +24,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from hyper_multicore import _collective
+from hyper_multicore.modules.mega_moe import a3_indexed
 
 from hyper_multicore.modules.mega_moe.heap_manager import _HeapCapacityError, _WorkspaceLayout
 from hyper_multicore.modules.mega_moe.spec import _COMMUNICATION_SPLIT, _align_capacity, _resolve_receive_capacity
@@ -138,6 +139,9 @@ class PlacementResources:
         self.cross_node_cost = specification.get("cross_node_cost")
         self.receive_capacity_percent = specification.get("receive_capacity_percent")
         self.rank_nodes = rank_nodes
+        self.indexed_push = a3_indexed.qualify(
+            parent.spec, specification.get("indexed_push", False), rank_nodes,
+        )
         built_in = _uses_builtin_planner(specification)
         spec = parent.spec
         can_split_weights = supports_bounded_placement(spec)
@@ -191,6 +195,7 @@ class PlacementResources:
         planner: BasePlanner,
         host_rows: list[list[int]] | None = None,
         snapshot: PlacementWire | None = None,
+        indexed: bool = False,
     ) -> ExpertWeightBinding | None:
         """Choose a virtual route only after the existing count exchange validates it."""
         self.statistics["invocations"] += 1
@@ -217,7 +222,7 @@ class PlacementResources:
             try:
                 placement = self.bounded.select(
                     hidden, ids, gathered[:, 3:], source_rows, inverse, prices, snapshot,
-                    host_rows=host_rows, limit=limit, resident=resident, peer_edges=peer_edges,
+                    host_rows=host_rows, limit=limit, resident=resident, peer_edges=peer_edges, indexed=indexed,
                 )
             except ReplicaCapacityError as error:
                 if not peer_edges:

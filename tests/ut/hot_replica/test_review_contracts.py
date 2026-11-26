@@ -163,6 +163,6 @@ def test_successful_fused_weight_acquire_records_prefetch_and_returns_operands()
     with patch.object(shmem_transfer, "_ordered_transfers", return_value=nullcontext()):
         assert binding.acquire(weights) is pool.pipeline.begin.return_value
         binding.release()
-    pool.pipeline.begin.assert_called_once_with(weights, binding, False)
+    pool.pipeline.begin.assert_called_once_with(weights, binding, False, replay_snapshot=None)
     assert pool.statistics["fused_prefetches"] == 1
     pool.release.assert_called_once_with()

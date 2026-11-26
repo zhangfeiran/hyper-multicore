@@ -65,6 +65,7 @@ source "$(command -v hyper_multicore_set_env.bash)"
 | 接入已有模型与保留参数 | [模型接入与示例](examples/README.md) |
 | 理解框架的职责与执行方式 | [系统架构](docs/architecture.md) |
 | 采集时间线与检查张量值 | [诊断指南](docs/diagnostics.md) |
+| 查看 MegaMoE 整网训练性能 | [Qwen3.5 A3 单机 EP16 性能报告](docs/benchmarks/veomni_qwen35_a3_ep16_megamoe_vs_native.md) |
 | 准备开发环境、运行测试与静态检查 | [测试指南](tests/README.md) |
 
 ## 开发与贡献

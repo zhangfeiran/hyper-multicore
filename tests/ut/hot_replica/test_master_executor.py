@@ -398,7 +398,7 @@ def test_weight_only_pipeline_drains_projection_copies_before_ordered_gradient_r
     ordinary = object()
     assert not binding.owns_returns
     assert binding.runtime(ordinary, gradients) == pool.pipeline.runtime.return_value
-    pool.pipeline.runtime.assert_called_once_with(ordinary, binding, None, bf16_partials=False)
+    pool.pipeline.runtime.assert_called_once_with(ordinary, binding, None, bf16_partials=False, cube_queue=None)
     pool.reset_mock()
     assert binding.gradients(gradients, weights) == pool.return_generated_gradients.return_value
     assert [call[0] for call in pool.method_calls] == ["pipeline.complete", "return_generated_gradients"]

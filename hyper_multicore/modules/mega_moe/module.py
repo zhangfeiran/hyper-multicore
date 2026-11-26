@@ -30,6 +30,7 @@ from hyper_multicore.modules.mega_moe.numerics import (
 )
 from hyper_multicore.experimental import MegaMoeTuningOptions
 
+from . import a3_indexed, a3_recompute
 from ..module import MulticoreModule
 from .backends import get_backend
 from .invocation import prepare_expert_invocation
@@ -181,6 +182,7 @@ class MegaMoeExperts(MulticoreModule):
         replica_slots_per_rank = None
         cross_node_cost = None
         receive_capacity_percent = None
+        indexed_push = False
         if planner is not None:
             from ..hot_replica.planner import HotReplicaPlanner, replica_slot_budget  # pylint: disable=import-outside-toplevel
 
@@ -198,6 +200,7 @@ class MegaMoeExperts(MulticoreModule):
                 cross_node_cost = planner.cross_node_cost
                 if planner.receive_capacity_percent != "auto":
                     receive_capacity_percent = planner.receive_capacity_percent
+                indexed_push = (type(planner) is HotReplicaPlanner and a3_indexed.requested())
             settings = planner.configuration_key()
             if not isinstance(settings, str):
                 raise TypeError("Planner configuration_key() must return a string")
@@ -225,6 +228,7 @@ class MegaMoeExperts(MulticoreModule):
             "replica_slots_per_rank": replica_slots_per_rank,
             "cross_node_cost": cross_node_cost,
             "receive_capacity_percent": receive_capacity_percent,
+            "indexed_push": indexed_push,
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
             "schedule_policy": scheduler.policy or "auto",
@@ -233,6 +237,7 @@ class MegaMoeExperts(MulticoreModule):
             "lowering": scheduler.lowering,
         }
         specification["auto_tokens"] = True
+        specification["a3_recompute"] = a3_recompute.requested(specification)
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())

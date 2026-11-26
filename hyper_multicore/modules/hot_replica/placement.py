@@ -31,7 +31,7 @@ from ._planner.plan import ExpertExecutionPlan, physical_replica_slots
 class _LoweredPlacement:
     """Per-invocation route and weight-copy metadata owned by MegaMoE."""
 
-    virtual_ids: torch.Tensor
+    virtual_ids: torch.Tensor | None
     counts_by_source: torch.Tensor
     copies: torch.Tensor
     borrowed_capacity: int
@@ -41,6 +41,8 @@ class _LoweredPlacement:
     copies_by_rank: tuple[tuple[int, ...], ...]
     owner_rows: tuple[int, ...]
     route_metadata: RouteMetadata | None
+    physical_inverse: torch.Tensor | None = None
+    physical_to_logical: torch.Tensor | None = None
 
 
 def validate_quotas(result, request: PlacementRequest, *, slots: int) -> ExpertExecutionPlan | None:
