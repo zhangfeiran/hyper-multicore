@@ -232,20 +232,34 @@ class TestMegaMoeFunction(unittest.TestCase):
 
     def test_checkpoint_can_defer_expert_recompute_until_its_original_backward(self) -> None:
         """Downstream replay gets token output while only the original node launches R and B."""
+        self._check_deferred_expert_recompute()
+
+    def test_deferred_recompute_preserves_partial_weight_grads_with_compound_enabled(self) -> None:
+        """Frozen projections keep the split backward even with the compound workspace."""
+        for frozen in ("weight1", "weight2"):
+            with self.subTest(frozen=frozen):
+                self._check_deferred_expert_recompute(frozen=frozen)
+
+    def _check_deferred_expert_recompute(self, *, frozen: str | None = None) -> None:
         self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
         DefaultDeviceType.set_device_type("cpu")
         spec = SimpleNamespace(
             apply_probs_before_fc2=False, dispatch_mode="push", expert_weight_layout="EOI",
             hidden_size=2, intermediate_size=1, top_k=1, auto_tokens=True, architecture=2201,
+            dynamic_tokens=True, plan_tokens=2,
         )
-        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False, weight_grad_dtype=None, event_counter_bytes=8)
+        outputs = function_module.BackwardOutputs(weight1=frozen != "weight1", weight2=frozen != "weight2")
+        plan = SimpleNamespace(
+            spec=spec, reuse_backward_dispatch=False, weight_grad_dtype=None, event_counter_bytes=8,
+            backward_outputs=outputs,
+        )
         metadata = function_module.RouteMetadata(
             *(torch.zeros(1, dtype=torch.int64) for _ in range(6)),
             group_list=torch.tensor([2]), expert_capacity=2, all_experts_active=True,
         )
         tokens = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
-        w1 = torch.tensor([2.0], requires_grad=True)
-        w2 = torch.tensor([3.0], requires_grad=True)
+        w1 = torch.tensor([2.0], requires_grad=outputs.weight1)
+        w2 = torch.tensor([3.0], requires_grad=outputs.weight2)
         probs = torch.tensor([[0.25], [0.5]], requires_grad=True)
         ids = torch.zeros((2, 1), dtype=torch.int32)
         route = function_module.PreparedTopKRoute(
@@ -255,7 +269,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         workspace = Mock(
             expert_buffer=torch.empty_like(tokens), routed_buffer=torch.empty_like(tokens),
             gmm_workspace=torch.empty(1), swiglu_grad_workspace=torch.empty(1),
-            a3_fused_recompute=False,
+            a3_fused_recompute=frozen is not None,
         )
         from hyper_multicore.modules.hot_replica.checkpoint import ReplayRecord
         record = ReplayRecord(owner=None, route=route)
@@ -276,12 +290,15 @@ class TestMegaMoeFunction(unittest.TestCase):
             execution.dispatch.copy_(x)
             execution.combine.copy_(x + first + second)
 
-        def backward_kernel(_plan, saved, source, execution, **_options):
+        def backward_kernel(_plan, saved, source, execution, **options):
             launches.append("B")
+            self.assertIsNone(options["recompute_call"])
             self.assertTrue(torch.equal(saved.dispatch, tokens))
             execution.grad_x.copy_(source)
-            execution.intermediates.grad_weight1.fill_(source.sum())
-            execution.intermediates.grad_weight2.fill_(source.sum())
+            if outputs.weight1:
+                execution.intermediates.grad_weight1.fill_(source.sum())
+            if outputs.weight2:
+                execution.intermediates.grad_weight2.fill_(source.sum())
 
         def unpermute_grad(y, g, _mapping, p, dx, dp):
             dx.copy_(g * p)
@@ -298,11 +315,12 @@ class TestMegaMoeFunction(unittest.TestCase):
             set_checkpoint_early_stop(False),
         ):
             inputs = tokens, w1, w2, probs
+            grad_inputs = tuple(value for value in inputs if value.requires_grad)
             loss = checkpoint(execute, *inputs, use_reentrant=False)
             expected = ((tokens + w1 + w2) * probs).square().sum()
-            reference = torch.autograd.grad(expected, inputs)
+            reference = torch.autograd.grad(expected, grad_inputs)
             for retain in (True, False):
-                actual = torch.autograd.grad(loss, inputs, retain_graph=retain)
+                actual = torch.autograd.grad(loss, grad_inputs, retain_graph=retain)
                 for result, wanted in zip(actual, reference):
                     torch.testing.assert_close(result, wanted, atol=0, rtol=0)
                 self.assertEqual(record.deferred_output is not None, retain)

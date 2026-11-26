@@ -158,7 +158,6 @@ def guest_weight_replay(record: ReplayRecord | None) -> tuple[ReplayRecord, bool
 
 def wrap_checkpoint(
     function: Callable[..., Any], parameter_version: Callable[[], Any], *, prepare_replay: bool = False,
-    defer_expert_recompute: bool = False,
 ) -> Callable[..., Any]:
     """Wrap one checkpoint call with state scoped to its original and replay forwards.
 
@@ -166,11 +165,10 @@ def wrap_checkpoint(
     sharded module. A changed version disables weight and activation reuse.
     When requested, restore the saved borrowed suffix before recompute reads
     any FSDP parameters. Route agreement still happens at the consumer.
-    On a qualified A3 MTE Push executor, deferred expert recompute retains
-    the owned output and runs the expert recompute in the backward launch.
+    For non-reentrant copy and expert recompute deferral, use ReplayCheckpoint
+    directly as the checkpoint's original and recompute contexts.
     """
-    tape = ReplayCheckpoint(parameter_version, prepare_replay=prepare_replay,
-                            defer_expert_recompute=defer_expert_recompute)
+    tape = ReplayCheckpoint(parameter_version, prepare_replay=prepare_replay)
 
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
