@@ -85,8 +85,9 @@ def forward(
     # F and a replay fallback must save the same ordered tensor tuple.
     checkpoint_replay = forward_copy_phase()
     if checkpoint_replay is not None:
-        if (not pull and not before_fc2 and resources.spec.architecture == 2201
-                and resources.spec.transport_engine == "mte"):
+        a3_replay = resources.spec.architecture == 2201 and resources.spec.transport_engine == "mte"
+        a5_replay = resources.spec.architecture == 3510 and resources.workspace.a3_fused_recompute
+        if not pull and not before_fc2 and (a3_replay or a5_replay):
             options["checkpoint_replay"] = checkpoint_replay
         else:
             checkpoint_replay = None
@@ -95,7 +96,7 @@ def forward(
             checkpoint_replay = True
             options["checkpoint_replay"] = True
         elif checkpoint_replay is None:
-            raise RuntimeError("Deferred expert recompute requires A3 BF16 MTE Push")
+            raise RuntimeError("Deferred expert recompute requires compatible BF16 Push and checkpoint resources")
         options["deferred_recompute"] = record
     if binding is not None and binding.fused and resources.spec.architecture == 2201:
         replay_weights = guest_weight_replay(record)

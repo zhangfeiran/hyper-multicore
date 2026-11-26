@@ -119,7 +119,7 @@ def _spec_workspace_bytes(
         compute_stages=6 if specification.get("precision") == 'mxfp8' else 3,
         dtype=dtype,
         apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
-        a3_fused_recompute=specification.get("a3_recompute", False),
+        a3_fused_recompute=specification.get("a3_recompute", False) or specification.get("a5_recompute", False),
     )
     return sum(spec.dtype.itemsize * math.prod(spec.shape) + spec.alignment_bytes - 1 for _, spec in allocations)
 
@@ -170,6 +170,7 @@ class MegaMoeWorkspace:
     gmm_workspace: Any | None = None
     probability_workspace: Any | None = None
     a3_fused_recompute: bool = False
+    compound_recompute_calls: int = 0
     recompute_workspace: Any | None = None
     probability_views: ProbabilityWorkspace | None = field(default=None, init=False, repr=False)
     swiglu_grad_workspace: Any | None = None

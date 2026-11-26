@@ -11,7 +11,7 @@
 using namespace AscendC;
 namespace shmem_data_plane = hyper_multicore::shmem::data_plane;
 namespace hyper_multicore {
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
 template <typename T>
 __aicore__ inline void PutIndexedRows(
     GM_ADDR target, int64_t target_offset, GM_ADDR source, __gm__ const int32_t *rows,
@@ -27,14 +27,28 @@ __aicore__ inline void PutIndexedRows(
   // separate MTE staging configuration applies only to its own operations.
   const int64_t group_bytes = kPackets * row_bytes;
   const int64_t bank_bytes = 2 * group_bytes;
+#if __NPU_ARCH__ == 3510
+  auto state = aclshmemi_get_state();
+  if (peer != shmem_data_plane::my_pe() && (state->topo_list[peer] & ACLSHMEM_TRANSPORT_MTE) == 0) {
+    AscendC::Trap();
+  }
+#endif
   constexpr int64_t kGroupIndexRows = 128;
   static_assert(2 * kPackets * MulticoreMoE::A3_INDEXED_MAX_HIDDEN * sizeof(T) +
                     kGroupIndexRows * sizeof(int32_t) <= 192 * 1024);
   auto target_row = reinterpret_cast<__gm__ T *>(target) + target_offset;
-  auto receive = reinterpret_cast<__gm__ T *>(shmem_data_plane::remote_ptr(target_row, peer));
+  auto receive = peer == shmem_data_plane::my_pe() ? target_row :
+      reinterpret_cast<__gm__ T *>(shmem_data_plane::remote_ptr(target_row, peer));
   if (receive == nullptr) AscendC::Trap();
   auto input = reinterpret_cast<__gm__ T *>(source);
-  auto ids = reinterpret_cast<__ubuf__ int32_t *>(bank_bytes);
+  uint64_t bank_address = 0;
+#if __NPU_ARCH__ == 3510
+  AscendC::TPipe pipe;
+  AscendC::TBuf<AscendC::TPosition::VECCALC> scratch;
+  pipe.InitBuffer(scratch, bank_bytes + kGroupIndexRows * sizeof(int32_t));
+  bank_address = scratch.Get<uint8_t>().GetPhyAddr();
+#endif
+  auto ids = reinterpret_cast<__ubuf__ int32_t *>(bank_address + bank_bytes);
   SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
   SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
   for (int64_t offset = 0; offset < count; offset += kGroupIndexRows) {
@@ -47,7 +61,7 @@ __aicore__ inline void PutIndexedRows(
       const int64_t base = offset + local;
       const bool odd = (base / kPackets) % 2 != 0;
       const TEventID event = odd ? EVENT_ID1 : EVENT_ID0;
-      auto packet = reinterpret_cast<__ubuf__ T *>(odd * group_bytes);
+      auto packet = reinterpret_cast<__ubuf__ T *>(bank_address + odd * group_bytes);
       WaitFlag<HardEvent::MTE3_MTE2>(event);
       for (int64_t i = 0; i < n; ++i) {
         const int64_t source_row = ids[local + i];
@@ -64,6 +78,9 @@ __aicore__ inline void PutIndexedRows(
   WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
   shmem_data_plane::fence();
   if (publish) shmem_data_plane::signal(signal, 1, shmem_data_plane::SignalOp::Add, peer);
+#if __NPU_ARCH__ == 3510
+  pipe.Destroy();
+#endif
 #endif
 }
 #endif

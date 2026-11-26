@@ -131,9 +131,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
                             (sourceStorage == expectedElements || sourceOrigin == expectedElements);
     const bool indexFits = indexStorage >= expectedWords &&
                            (indexStorage == expectedWords || indexOrigin == expectedWords);
-    if (!sourceFits || !indexFits) {
+    const bool ascend950 = ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
+    if (!sourceFits || !indexFits || (ascend950 && hiddenSize != 4096 && hiddenSize != 5120)) {
       OP_LOGE(context->GetNodeName(),
-              "Invalid A3 indexed dispatch: dtype=%d ep=%ld experts=%ld hidden=%ld tokens=%ld plan=%ld "
+              "Invalid indexed dispatch: dtype=%d ep=%ld experts=%ld hidden=%ld tokens=%ld plan=%ld "
               "source=%ld/%ld (expected %ld) offsets=%ld/%ld (expected %ld).",
               static_cast<int>(input0DType), ep, expertNum, hiddenSize, sourceRows, seqSize,
               sourceStorage, sourceOrigin, expectedElements, indexStorage, indexOrigin, expectedWords);

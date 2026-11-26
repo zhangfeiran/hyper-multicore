@@ -30,20 +30,20 @@ def _byte_aliases(buffers: Sequence[torch.Tensor]) -> list[torch.Tensor]:
 
 
 def serialize_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
-                         events: torch.Tensor, spec: MegaMoeSpec) -> bytes:
+                         events: torch.Tensor, spec: MegaMoeSpec, *, indexed_source_rows: int = 0) -> bytes:
     """Serialize exact current byte bounds without reading device tensor contents."""
     return serialize_mx_launch_metadata(
         [tensor.numel() * tensor.element_size() for tensor in buffers],
         rank=spec.rank_id, ep=spec.ep_size, experts=spec.num_experts, hidden=spec.hidden_size,
         local_tokens=spec.local_num_tokens, cube_count=spec.num_cube_cores,
-        runtime_bytes=runtime.numel(), event_bytes=events.numel(),
+        runtime_bytes=runtime.numel(), event_bytes=events.numel(), indexed_source_rows=indexed_source_rows,
     )
 
 
 def prepare_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
-                         events: torch.Tensor, spec: MegaMoeSpec) -> torch.Tensor:
+                         events: torch.Tensor, spec: MegaMoeSpec, *, indexed_source_rows: int = 0) -> torch.Tensor:
     """Upload the bounds of the current native operands."""
-    metadata = serialize_mxfp8_launch(buffers, runtime, events, spec)
+    metadata = serialize_mxfp8_launch(buffers, runtime, events, spec, indexed_source_rows=indexed_source_rows)
     return _upload_route_tensor(torch.frombuffer(bytearray(metadata), dtype=torch.uint8), runtime.device)
 
 

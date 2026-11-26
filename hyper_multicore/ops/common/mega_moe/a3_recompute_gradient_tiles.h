@@ -17,12 +17,13 @@ __aicore__ inline void RecomputeTileSync() {
 }
 
 // Preserve the vendor unpermute-grad FP32 tree independently for each row.
+template <uint32_t extent = kRecomputeHidden>
 __aicore__ inline void ReduceRecomputeProducts(const AscendC::LocalTensor<float> &products, uint32_t rows) {
-  AscendC::BlockReduceSum(products, products, 64 * rows, 64, 1, 1, 8);
+  AscendC::BlockReduceSum(products, products, extent / 64 * rows, 64, 1, 1, 8);
   AscendC::PipeBarrier<PIPE_V>();
-  AscendC::BlockReduceSum(products, products, 8 * rows, 64, 1, 1, 8);
+  AscendC::BlockReduceSum(products, products, extent / 512 * rows, 64, 1, 1, 8);
   AscendC::PipeBarrier<PIPE_V>();
-  AscendC::BlockReduceSum(products, products, rows, 64, 1, 1, 8);
+  AscendC::BlockReduceSum(products, products, extent / 4096 * rows, 64, 1, 1, 8);
   AscendC::PipeBarrier<PIPE_V>();
 }
 
@@ -48,6 +49,7 @@ __aicore__ inline void ReduceRecomputeRow(const AscendC::LocalTensor<float> &out
 }
 
 // Split the two consumers of G. Scaling can publish dV before V is available.
+template <int32_t hidden = kRecomputeHidden>
 __aicore__ inline void ScaleRecomputedGradientRows(GM_ADDR raw_g, GM_ADDR raw_p, GM_ADDR scaled_g,
                                                    uint32_t hidden, int64_t first, int64_t end, int64_t stride,
                                                    int64_t probability_stride = 1) {
@@ -80,6 +82,7 @@ __aicore__ inline void ScaleRecomputedGradientRows(GM_ADDR raw_g, GM_ADDR raw_p,
   pipe.Destroy();
 }
 
+template <int32_t hidden = kRecomputeHidden>
 __aicore__ inline void RecomputedProbabilityGradientRows(GM_ADDR raw_g, GM_ADDR raw_v, GM_ADDR packets,
                                                         uint32_t hidden, int64_t first, int64_t end, int64_t stride) {
   AscendC::TPipe pipe;
@@ -99,6 +102,7 @@ __aicore__ inline void RecomputedProbabilityGradientRows(GM_ADDR raw_g, GM_ADDR 
   gm_g.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(raw_g));
   gm_v.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(raw_v));
   gm_packets.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(packets));
+  if constexpr (extent > hidden) AscendC::Duplicate(products[hidden], 0.0f, extent - hidden);
   AscendC::Duplicate(packet, 0.0f, kProbabilityPacketElements);
   AscendC::PipeBarrier<PIPE_V>();
   for (int64_t row = first; row < end; row += stride) {

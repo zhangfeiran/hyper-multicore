@@ -11,7 +11,7 @@ class MxLaunchDescriptor(ctypes.LittleEndianStructure):
         'rank', 'ep', 'experts', 'hidden', 'local_tokens', 'cube_count',
     )] + [('runtime_bytes', ctypes.c_uint64), ('event_bytes', ctypes.c_uint64)] + [
         ('magic', ctypes.c_uint32), ('version', ctypes.c_uint32),
-        ('buffer_count', ctypes.c_uint32), ('reserved', ctypes.c_uint32),
+        ('buffer_count', ctypes.c_uint32), ('indexed_source_rows', ctypes.c_uint32),
         ('buffer_bytes', ctypes.c_uint64 * MAX_GRAPH_BUFFERS),
     ]
 
@@ -19,6 +19,7 @@ class MxLaunchDescriptor(ctypes.LittleEndianStructure):
 def serialize_mx_launch_metadata(
     buffer_sizes: Sequence[int], *, rank: int, ep: int, experts: int, hidden: int,
     local_tokens: int, cube_count: int, runtime_bytes: int, event_bytes: int,
+    indexed_source_rows: int = 0,
 ) -> bytes:
     """Build the byte-list launch descriptor without reading any device data."""
     if not 0 < len(buffer_sizes) <= MAX_GRAPH_BUFFERS or any(size < 0 for size in buffer_sizes):
@@ -33,7 +34,15 @@ def serialize_mx_launch_metadata(
     for name, value in fields.items():
         setattr(record, name, value)
     record.magic = 0x4D584C47
-    record.version, record.reserved = 1, 0
+    record.version = 1
+    if indexed_source_rows:
+        if (not 0 < indexed_source_rows <= min(16384, local_tokens)
+                or len(buffer_sizes) not in (27, 32) or hidden not in (4096, 5120)
+                or buffer_sizes[2] != indexed_source_rows * hidden * 2
+                or buffer_sizes[3] != experts * 8 + indexed_source_rows * 8 * 4):
+            raise ValueError("Invalid indexed MXFP8 forward operands")
+        record.version = 2
+        record.indexed_source_rows = indexed_source_rows
     record.buffer_count = len(buffer_sizes)
     for index, size in enumerate(buffer_sizes):
         record.buffer_bytes[index] = size

@@ -228,6 +228,11 @@ Ascend 950 的 BF16 和 MXFP8 HotReplica Push 可用实验开关 `HMC_A5_W13_REM
 当专家有跨 rank 梯度返回且队列允许重排时，先执行涉及梯度返回的 W13，再执行只在本地使用的 W13。
 MXFP8 继续使用 FP32 根参数和 FP32 专家梯度。
 
+`HMC_A5_INDEXED_PUSH=1` 在 BF16 和 MXFP8 Push
+用源行索引做前向分发，适用于 H4096 或 H5120、TopK8 和支持 MTE 的 EP 组。
+`HMC_A5_FUSED_RECOMPUTE=1` 供 BF16 HotReplica Push 的非重入 checkpoint 合并重算与反向，
+支持 H4096/I1408 和 H5120/I1792，保留 FP32 副本梯度返回。
+
 ### 旧 HotReplica 接口退役
 
 独立 Native EP 的 `HotReplica`、`plan_native()` 和旧输入预留参数 `source_token_bound` 已退役。

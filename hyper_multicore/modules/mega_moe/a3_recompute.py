@@ -43,11 +43,23 @@ def requested(specification) -> bool:
     )
 
 
+def requested_on_a5(specification) -> bool:
+    """Use the 950 BF16 provider with the same checkpoint and SHMEM contract."""
+    return (
+        os.environ.get("HMC_A5_FUSED_RECOMPUTE") == "1"
+        and specification["hot_replica"] and specification["precision"] == "bf16"
+        and specification["dispatch_mode"] == "push" and not specification["apply_probs_before_fc2"]
+        and specification["top_k"] == 8
+        and (specification["hidden_size"], specification["intermediate_size"]) in ((4096, 1408), (5120, 1792))
+    )
+
+
 @lru_cache(maxsize=1)
-def require_vendor() -> None:
+def require_vendor(architecture: int = 2201) -> None:
     """Reject an old operator package before submitting compound descriptors."""
     vendor = require_multicore_environment() / "op_api" / "lib" / "libcust_opapi.so"
     api = ctypes.CDLL(str(vendor), mode=ctypes.RTLD_LOCAL)
-    version = getattr(api, "HmcA3RecomputeBackwardVersion", None)
-    if version is None or version() != 5:
-        raise RuntimeError("The loaded MegaMoE operator package does not support A3 fused recompute")
+    symbol, abi = ("HmcA5RecomputeBackwardVersion", 1) if architecture == 3510 else ("HmcA3RecomputeBackwardVersion", 5)
+    version = getattr(api, symbol, None)
+    if version is None or version() != abi:
+        raise RuntimeError(f"The loaded MegaMoE operator package is missing fused recompute ABI {symbol}={abi}")

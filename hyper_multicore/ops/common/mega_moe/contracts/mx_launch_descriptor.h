@@ -6,11 +6,12 @@
 namespace MulticoreMx {
 constexpr uint32_t MX_LAUNCH_MAGIC = 0x4D584C47;
 constexpr uint32_t MX_LAUNCH_VERSION = 1;
+constexpr uint32_t MX_INDEXED_LAUNCH_VERSION = 2;
 constexpr uint32_t MX_BUFFER_LIMIT = 64;
 struct MxLaunchDescriptor {
   int64_t rank, ep, experts, hidden, local_tokens, cube_count;
   uint64_t runtime_bytes, event_bytes;
-  uint32_t magic, version, buffer_count, reserved;
+  uint32_t magic, version, buffer_count, indexed_source_rows;
   uint64_t buffer_bytes[MX_BUFFER_LIMIT];
 };
 static_assert(sizeof(MxLaunchDescriptor) == 592, "MX launch descriptor size mismatch");

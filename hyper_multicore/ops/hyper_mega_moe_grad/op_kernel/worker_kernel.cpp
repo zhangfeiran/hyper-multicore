@@ -16,7 +16,7 @@
 #include <cstddef>
 
 #include "kernel_operator.h"
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
 #include "common/mega_moe/forward_worker.h"
 #else
 #include "swi_glu/swi_glu.cpp"
@@ -76,8 +76,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 
   __aicore__ inline void RunBackward(bool input_already_dispatched = false, CycleTraceRecorder *trace = nullptr,
                                     const __gm__ MulticoreMoE::A3RecomputeCall *recompute = nullptr) {
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
     input_already_dispatched_ = input_already_dispatched;
+#endif
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
     trace_ = trace;
 #endif
 #if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
@@ -192,7 +194,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
       case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
         MulticoreMoE::ExecuteTransfer<DTYPE_DISPATCH_TARGET>(task_desc, input_list,
-                                                          input_list[TILING_IDX], input_list[EVENT_IDX]);
+            input_list[TILING_IDX], input_list[EVENT_IDX], 0, nullptr, input_already_dispatched_);
 #else
         ExecuteShmemPutMem(task_desc);
 #endif
@@ -217,8 +219,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   const __gm__ MulticoreMoE::ReplicaLaunch *replica_launch_ = nullptr;
   const __gm__ MulticoreMoE::ReplicaGradientBandRecord *gradient_bands_[2] = {nullptr, nullptr};
   bool replica_bf16_partials_ = false;
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
   bool input_already_dispatched_ = false;
+#endif
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
   bool act_grad_done_ = false;
   CycleTraceRecorder *trace_ = nullptr;
 #endif
@@ -700,10 +704,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 
 }  // namespace MulticoreRuntime
 
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
 // Compile the forward and backward workers as separate device functions.
 // Both execute on the same launch and use the same scratch and completion state.
-__aicore__ static __attribute__((noinline)) void RunA3RecomputeForwardFrame(
+__aicore__ static __attribute__((noinline)) void RunRecomputeForwardFrame(
     uint32_t worker_id, const __gm__ MulticoreMoE::A3RecomputeCall *call, GM_ADDR cann_workspace,
     MulticoreRuntime::CycleTraceRecorder *trace) {
   GM_ADDR inputs[MulticoreMoE::kA3ForwardInputs];
@@ -722,13 +726,16 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
   bool dispatched = false;
   MulticoreRuntime::CycleTraceRecorder *trace = nullptr;
   const __gm__ MulticoreMoE::A3RecomputeCall *call = nullptr;
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
   MulticoreRuntime::CycleTraceRecorder recorder;
   if (MulticoreRuntime::getExtraValueFromTiling(input_list[MulticoreRuntime::KernelWorker::TILING_IDX], 4) &
       MulticoreMoE::kA3RecomputeSequence) {
     call = reinterpret_cast<const __gm__ MulticoreMoE::A3RecomputeCall *>(
         input_list[MulticoreRuntime::KernelWorker::DIAGNOSTIC_IDX]);
     if (call->magic != MulticoreMoE::kA3RecomputeCall) AscendC::Trap();
+#if __NPU_ARCH__ == 3510
+    if (call->pg_ready != 0 || call->gradient_rows_per_batch != 0) AscendC::Trap();
+#endif
     if (call->trace != 0) {
       const uint32_t cube_count =
           MulticoreRuntime::getExtraValueFromTiling(input_list[MulticoreRuntime::KernelWorker::TILING_IDX], 5);
@@ -736,7 +743,7 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
       recorder.Init(worker_id, reinterpret_cast<GM_ADDR>(call->trace), capacity, capacity, cube_count);
       trace = &recorder;
     }
-    RunA3RecomputeForwardFrame(worker_id, call, input_list[29], trace);
+    RunRecomputeForwardFrame(worker_id, call, input_list[29], trace);
     dispatched = true;
   }
 #endif

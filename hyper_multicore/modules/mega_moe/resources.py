@@ -42,6 +42,10 @@ class _MegaMoeExecutionResources:
         """Bind resources once to the first NPU tensor."""
         bound_specification = {**specification, "expert_weight_layout": expert_weight_layout}
         self.spec = bind_mega_moe_spec(bound_specification, tensor)
+        self.a5_indexed_push = (self.spec.architecture == 3510 and self.spec.dispatch_mode == "push"
+                                and not self.spec.apply_probs_before_fc2
+                                and self.spec.top_k == 8 and self.spec.hidden_size in (4096, 5120)
+                                and specification.get("a5_indexed_push", False))
         self._token_capacity = self.spec.local_num_tokens
         self._plans = {}
         if dist.is_initialized():
@@ -92,15 +96,20 @@ class _MegaMoeExecutionResources:
                         raise ValueError("MXFP8 HotReplica requires mte_udma and 8, 16 or 32 UDMA QPs")
                 if transport == "udma":
                     moe_transport.require_queue_backend()
-                fused_recompute = specification.get("a3_recompute", False)
-                if fused_recompute:
+                a3_fused_recompute = specification.get("a3_recompute", False)
+                a5_fused_recompute = specification.get("a5_recompute", False)
+                if a3_fused_recompute:
                     if self.spec.architecture != 2201 or transport != "mte":
                         raise ValueError("Fused recompute requires A3 BF16 MTE Push")
                     a3_recompute.require_vendor()
+                if a5_fused_recompute:
+                    if self.spec.architecture != 3510:
+                        raise ValueError("A5 fused recompute requires Ascend950")
+                    a3_recompute.require_vendor(3510)
                 self.plan = self._initial_plan(tensor)
                 self.workspace = MegaMoeWorkspace(
                     shared=shared, event_experts=_workspace_event_experts(specification) if placement else None,
-                    a3_fused_recompute=fused_recompute,
+                    a3_fused_recompute=a3_fused_recompute or a5_fused_recompute,
                 )
                 self.workspace.transport_engine = self.spec.transport_engine
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
@@ -202,7 +211,7 @@ class _MegaMoeExecutionResources:
                   "precision", "transport_engine", "ready_depth", "math_dependency_poll_interval_us",
                   "schedule_policy", "lowering", "udma_qp_policy", "forward_count_fence",
                   "batch_experts", "nominal_schedule", "hot_replica", "planner_key", "replica_bank",
-                  "indexed_push", "a3_recompute")
+                  "indexed_push", "a3_recompute", "a5_indexed_push", "a5_recompute")
         # Both backends exchange BF16 hidden rows. The literal tags identify the route protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout, self.spec.architecture,
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))

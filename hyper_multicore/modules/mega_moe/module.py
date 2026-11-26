@@ -19,6 +19,7 @@ from __future__ import annotations
 __all__ = ["MegaMoeExperts"]
 
 from collections.abc import Mapping
+import os
 from typing import Any
 
 import torch
@@ -235,6 +236,7 @@ class MegaMoeExperts(MulticoreModule):
             "cross_node_cost": cross_node_cost,
             "receive_capacity_percent": receive_capacity_percent,
             "indexed_push": indexed_push,
+            "a5_indexed_push": os.environ.get("HMC_A5_INDEXED_PUSH") == "1",
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
             "math_dependency_poll_interval_us": scheduler.math_dependency_poll_interval_us,
@@ -247,6 +249,7 @@ class MegaMoeExperts(MulticoreModule):
         }
         specification["auto_tokens"] = True
         specification["a3_recompute"] = a3_recompute.requested(specification)
+        specification["a5_recompute"] = a3_recompute.requested_on_a5(specification)
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())

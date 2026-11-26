@@ -101,6 +101,8 @@ def prepare_expert_invocation(
                 record = None
 
         options = {"autograd_mask": mask}
+        if resources.a5_indexed_push:
+            options["indexed_source"] = True
         if planner is not None:
             options["select_placement"] = partial(placement.select, planner=planner)
             if counts is None and placement.indexed_push:

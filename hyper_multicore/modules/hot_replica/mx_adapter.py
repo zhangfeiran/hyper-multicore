@@ -195,10 +195,11 @@ class MXPlacementResources:
         if metadata is not None and use_snapshot:
             self.statistics["mx_packed_home_routes"] += 1
         parent.prepare_auto_workspace(summary.plan_tokens, summary.maximum, hidden)
-        permuted = route._permute_topk_input(hidden, ids)
+        permuted, indexed_rows = route._a5_route_permutation(
+            hidden, ids, spec, workspace, indexed_source=parent.a5_indexed_push)
         return route._finalize_dynamic_route(
             permuted, counts, summary, raw, metadata, None, gathered, spec, workspace,
-            hidden.device, hidden.shape[0])
+            hidden.device, hidden.shape[0], indexed_rows)
 
     def _select(self, hidden, gathered, summary, raw, source_rows, mask, stream, *, snapshot=None, use_snapshot=False):
         spec = self.parent.spec
@@ -275,11 +276,12 @@ class MXPlacementResources:
         if self.pool is None:
             self._allocate_banks(hidden, tokens, peak)
         parent.prepare_auto_workspace(tokens, peak, hidden)
-        permuted = route._permute_topk_input(hidden, virtual_ids)
+        permuted, indexed_rows = route._a5_route_permutation(
+            hidden, virtual_ids, spec, parent.workspace, indexed_source=parent.a5_indexed_push)
         prepared = route._finalize_dynamic_route(
             permuted, geometry.counts[spec.rank_id], route._RouteSummary(max(1, local), tokens, peak), None,
             geometry.metadata, None, gathered, parent._route_spec(geometry.counts.shape[1]),
-            parent.workspace, hidden.device, hidden.shape[0])
+            parent.workspace, hidden.device, hidden.shape[0], indexed_rows)
         return replace(prepared, weight_binding=MXBindings(placement, self.pool.prefetch, self.pool))
 
     def _allocate_banks(self, hidden, tokens, received):

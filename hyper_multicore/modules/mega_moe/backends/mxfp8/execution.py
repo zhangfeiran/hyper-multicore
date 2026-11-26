@@ -48,11 +48,12 @@ class MXFP8Execution:
         self.weight_prefetch = weight_prefetch
         self.gradient_pool = gradient_pool
 
-    def _launch(self, buffers, runtime, events, plan, direction="forward"):
+    def _launch(self, buffers, runtime, events, plan, direction="forward", *, indexed_source_rows=0):
         """Submit the graph with exact buffer bounds and optional profiling."""
         if events.numel() < runtime.event_capacity * 4:
             raise ValueError("MX event storage is smaller than the graph")
         launch_graph = partial(launch_mxfp8_experts, direction=direction)
+        bind_launch = partial(prepare_mxfp8_launch, indexed_source_rows=indexed_source_rows)
         if mx_profile_capture_enabled():
             scope = current_mx_profile_scope() or self._profile_scope
             if direction == 'forward':
@@ -60,9 +61,9 @@ class MXFP8Execution:
             elif scope is not None:
                 scope = {**scope, 'phase': 'backward'}
             profile_mx_launch(buffers, runtime, events, plan.spec, direction,
-                              prepare_mxfp8_launch, launch_graph, scope=scope)
+                              bind_launch, launch_graph, scope=scope)
             return
-        launch = prepare_mxfp8_launch(buffers, runtime.runtime, events, plan.spec)
+        launch = bind_launch(buffers, runtime.runtime, events, plan.spec)
         # Disabled diagnostics never read this binding, matching the BF16 adapter.
         launch_graph(buffers, runtime.runtime, events, events, launch)
 
@@ -101,9 +102,12 @@ class MXFP8Execution:
             if not pull:
                 dispatch_buffer = workspace.expert_buffer
             routed_buffer = workspace.routed_buffer
+            indexed = route.indexed_dispatch_offsets
+            dispatch_offsets = transport.dispatch_src_off if indexed is None else indexed
+            indexed_rows = 0 if indexed is None else source_buffer.shape[0]
             buffers = [
                 dispatch_buffer, transport.dispatch_target_off, source_buffer,
-                transport.dispatch_src_off, transport.dispatch_size,
+                dispatch_offsets, transport.dispatch_size,
                 weight1.col_data, metadata.group_list, up, a_row, weight2.col_data, metadata.group_list, down,
                 routed_buffer, transport.combine_target_off,
                 transport.combine_src_off, transport.combine_size,
@@ -112,12 +116,14 @@ class MXFP8Execution:
             ]
             events = workspace.prepare_event_counters(forward=True, counter_bytes=forward.event_capacity * 4)
             if self.placement is None:
-                self._launch(buffers, forward, events, plan)
+                self._launch(buffers, forward, events, plan, indexed_source_rows=indexed_rows)
             else:
                 with self.weight_prefetch.lease((weight1, weight2), self.placement,
                                                 backward=False) as (guests, ready):
-                    self._launch([*buffers, *guests, ready], forward, events, plan)
-            expert_output = routed_buffer[:route.routed_tokens.shape[0]]
+                    self._launch([*buffers, *guests, ready], forward, events, plan,
+                                 indexed_source_rows=indexed_rows)
+            rows = route.unpermute_mapping.numel()
+            expert_output = routed_buffer[:rows]
             if (retain_backward and not pull and source_buffer.numel()
                     and source_buffer.untyped_storage().data_ptr() != hidden.untyped_storage().data_ptr()):
                 # This stream orders the copy after the Push graph's last use of the permutation.
@@ -136,7 +142,7 @@ class MXFP8Execution:
                       transport.combine_src_off, transport.combine_size) if retain_backward else ())
             return MXFP8ForwardState(
                 output.reshape_as(hidden), saved,
-                _ExecutionMetadata(plan, tuple(hidden.shape), route.routed_tokens.shape[0], probs.dtype,
+                _ExecutionMetadata(plan, tuple(hidden.shape), rows, probs.dtype,
                                    metadata.all_experts_active), workspace,
             )
         finally:

@@ -63,7 +63,7 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker, VectorWorkerPolicy::A
         MulticoreMx::ExecuteMxQuantTask(task, input_list); break;
       case 105:
       case 141: MulticoreMoE::ExecuteTransfer<bfloat16_t>(task, input_list,
-                                                        input_list[TILING_IDX], input_list[EVENT_IDX]); break;
+          input_list[TILING_IDX], input_list[EVENT_IDX], launch->indexed_source_rows); break;
 #endif
       default: AscendC::Trap();
     }
@@ -130,7 +130,17 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker, VectorWorkerPolicy::A
 __aicore__ inline void RunMegaMoeMxfp8(GM_ADDR buffers, GM_ADDR runtime, GM_ADDR events,
                                      GM_ADDR diagnostic, GM_ADDR launch_metadata) {
   auto launch = reinterpret_cast<__gm__ MulticoreMx::MxLaunchDescriptor*>(launch_metadata);
-  if (launch->magic != MulticoreMx::MX_LAUNCH_MAGIC || launch->version != 1 || launch->reserved != 0 ||
+  const uint64_t indexed_rows = launch->indexed_source_rows;
+  const bool ordinary = launch->version == MulticoreMx::MX_LAUNCH_VERSION && indexed_rows == 0;
+  const bool indexed = launch->version == MulticoreMx::MX_INDEXED_LAUNCH_VERSION &&
+      indexed_rows > 0 && indexed_rows <= MulticoreMoE::A3_INDEXED_MAX_TOKENS &&
+      launch->local_tokens > 0 && indexed_rows <= static_cast<uint64_t>(launch->local_tokens) &&
+      (launch->hidden == 4096 || launch->hidden == 5120) &&
+      (launch->buffer_count == 27 || launch->buffer_count == 32) &&
+      launch->buffer_bytes[2] == indexed_rows * launch->hidden * sizeof(bfloat16_t) &&
+      launch->buffer_bytes[3] == static_cast<uint64_t>(launch->experts) * sizeof(int64_t) +
+                                 indexed_rows * MulticoreMoE::A3_INDEXED_TOP_K * sizeof(int32_t);
+  if (launch->magic != MulticoreMx::MX_LAUNCH_MAGIC || (!ordinary && !indexed) ||
       launch->buffer_count == 0 || launch->buffer_count > 64 ||
       !MulticoreMx::IsMxLaunchTopologyValid(launch->ep, launch->experts) ||
       !MulticoreRuntime::usesExplicitWorkerQueues(runtime)) AscendC::Trap();

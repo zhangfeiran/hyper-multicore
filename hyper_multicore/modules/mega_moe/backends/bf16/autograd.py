@@ -31,7 +31,9 @@ from ... import a3_indexed, a3_recompute
 from ...count_fence import CountFence
 from ...probability import PROBABILITY_PLANES, probability_stride
 from .plan import MegaMoePlan, record_plan_stream
-from ...route import PreparedTopKRoute, RouteMetadata, _materialize_route_permutation, restore_topk_output
+from ...route import (
+    PreparedTopKRoute, RouteMetadata, _indexed_topk_permutation, _materialize_route_permutation, restore_topk_output,
+)
 from ...workspace import MegaMoeWorkspace
 
 
@@ -531,7 +533,7 @@ def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime, *, trace=No
     plan, workspace = ctx.plan, ctx.workspace
     spec = plan.spec
     pg_ready = None
-    if (os.environ.get("HMC_A3_RECOMPUTE_EARLY_DA") == "1" and not spec.batch_experts
+    if (spec.architecture == 2201 and os.environ.get("HMC_A3_RECOMPUTE_EARLY_DA") == "1" and not spec.batch_experts
             and spec.local_experts <= a3_recompute.MAX_EARLY_EXPERTS_PER_RANK):
         pg_ready = torch.zeros(spec.local_experts * a3_recompute.READY_WORDS_PER_EXPERT,
                                dtype=torch.int32, device=grad_output.device)
@@ -554,7 +556,8 @@ def _recompute_call(ctx, recompute, saved, grad_output, fwd_runtime, *, trace=No
     for value in operands:
         value.record_stream(workspace.lease_stream)
     relaxed_barrier = pg_ready is not None and os.environ.get("HMC_A3_RECOMPUTE_RELAX_AIV_BARRIER") == "1"
-    descriptor = torch.tensor((a3_recompute.CALL_MAGIC, *arguments, a3_recompute.gradient_rows_per_batch(spec.hidden_size),
+    rows_per_batch = a3_recompute.gradient_rows_per_batch(spec.hidden_size) if spec.architecture == 2201 else 0
+    descriptor = torch.tensor((a3_recompute.CALL_MAGIC, *arguments, rows_per_batch,
                                int(relaxed_barrier)),
                               dtype=torch.int64, device=grad_output.device).view(torch.uint8)
     # Stream recording protects queued consumers. It cannot hold the synthetic
@@ -1059,6 +1062,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 runtime_override=backward_runtime,
                 recompute_call=recompute_call,
             )
+            if recompute_call is not None and plan.spec.architecture == 3510:
+                workspace.compound_recompute_calls += 1
             if recompute is not None and ctx.needs_input_grad[7]:
                 route_dp = recompute.returned_dp[:, 0].index_select(0, permutation_inputs[0])
                 grad_topk_weights = route_dp.view(ctx.token_rows, plan.spec.top_k).to(ctx.topk_dtype)

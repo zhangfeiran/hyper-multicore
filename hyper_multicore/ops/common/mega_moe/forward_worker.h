@@ -74,7 +74,7 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
     MulticoreMoE::PrefetchA5ReplicaWeights(replica_launch_, worker_id_);
 #endif
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
     recompute_ = recompute;
     trace_ = trace;
     const uint64_t forward_start = MulticoreMoE::RecomputeTraceStart(trace_);
@@ -121,7 +121,8 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
       case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
         MulticoreMoE::ExecuteTransfer<DTYPE_DISPATCH_TARGET>(task_desc, input_list,
-                                                          input_list[TILING_IDX], input_list[EVENT_IDX]);
+          input_list[TILING_IDX], input_list[EVENT_IDX],
+          getExtraValueFromTiling(input_list[TILING_IDX], MulticoreMoE::A3_INDEXED_TILING_SOURCE_ROWS), recompute_);
 #else
         ExecuteShmemPutMem(task_desc);
 #endif
@@ -141,7 +142,7 @@ class ForwardKernelWorker : public KernelWorkerBase<ForwardKernelWorker, VectorW
 
  private:
   const __gm__ MulticoreMoE::ReplicaLaunch *replica_launch_ = nullptr;
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
   const __gm__ MulticoreMoE::A3RecomputeCall *recompute_ = nullptr;
   CycleTraceRecorder *trace_ = nullptr;
 #endif
