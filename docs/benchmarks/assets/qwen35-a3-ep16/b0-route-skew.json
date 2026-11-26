@@ -1,0 +1,99 @@
+{
+  "scope": "MegaMoE B0, single-node Ascend A3, Qwen3.5-35B-A3B, 50 training steps per run",
+  "ep_size": 16,
+  "logical_experts": 256,
+  "resident_experts_per_rank": 16,
+  "input_tokens_per_rank": 8192,
+  "top_k": 8,
+  "mean_routed_rows_per_rank": 65536,
+  "metric": "For each layer invocation, divide the largest resident rank receive count by the mean across EP ranks.",
+  "evidence": "Bounds from committed receive capacities and growth triggers. Both runs disabled per-expert routing sampling.",
+  "runs": [
+    {
+      "run_id": "20261125-102500-22e0b7",
+      "training_stack": "Torch FSDP2 + AdamW",
+      "megamoe_branch": "hot-replica-a3",
+      "megamoe_build_commit": "41ca7519e721ed199b5583eb795f6e76e9e11f4c",
+      "rank_receipts_checked": 16,
+      "rank_steps_checked": 800,
+      "receive_capacity_rows_after_each_growth": [
+        {
+          "step": 1,
+          "rows": 258944
+        },
+        {
+          "step": 1,
+          "rows": 330752
+        },
+        {
+          "step": 2,
+          "rows": 413440
+        }
+      ],
+      "max_owner_rows_step_1": {
+        "lower_inclusive": 330625,
+        "upper_inclusive": 330752
+      },
+      "max_owner_ratio_step_1": {
+        "lower_inclusive": 5.0449371337890625,
+        "upper_inclusive": 5.046875
+      },
+      "max_owner_rows_steps_1_to_50": {
+        "lower_inclusive": 330753,
+        "upper_inclusive": 413440
+      },
+      "max_owner_ratio_steps_1_to_50": {
+        "lower_inclusive": 5.0468902587890625,
+        "upper_inclusive": 6.30859375
+      },
+      "max_owner_ratio_steps_23_to_50_upper_bound": 6.30859375,
+      "archive_rank0_receipts_sha256": {
+        "steps_rank00.jsonl": "9ec5715eb1ab6e19b32056da93bc6facfbfff0cc262eb80c8cd8a77a569b5775",
+        "complete_rank00.json": "fe67d30ec42ee93c712b69d8dc89a974edde194b6a366368d5bb814ebc314064"
+      }
+    },
+    {
+      "run_id": "20261125-110012-0f7ce4",
+      "training_stack": "Hyper FSDP + Hyper Muon std",
+      "megamoe_branch": "hot-replica-a3-perf",
+      "megamoe_build_commit": "b0d5c3258f72b9ece4f65d734b64cc470530e753",
+      "rank_receipts_checked": 16,
+      "rank_steps_checked": 800,
+      "receive_capacity_rows_after_each_growth": [
+        {
+          "step": 1,
+          "rows": 258944
+        },
+        {
+          "step": 1,
+          "rows": 332032
+        },
+        {
+          "step": 2,
+          "rows": 415104
+        }
+      ],
+      "max_owner_rows_step_1": {
+        "lower_inclusive": 331905,
+        "upper_inclusive": 332032
+      },
+      "max_owner_ratio_step_1": {
+        "lower_inclusive": 5.0644683837890625,
+        "upper_inclusive": 5.06640625
+      },
+      "max_owner_rows_steps_1_to_50": {
+        "lower_inclusive": 332033,
+        "upper_inclusive": 415104
+      },
+      "max_owner_ratio_steps_1_to_50": {
+        "lower_inclusive": 5.0664215087890625,
+        "upper_inclusive": 6.333984375
+      },
+      "max_owner_ratio_steps_23_to_50_upper_bound": 6.333984375,
+      "archive_rank0_receipts_sha256": {
+        "steps_rank00.jsonl": "05f0a8fe1c952fda07c4079ac111284a2c3d6515821fa2e7d70c16ff8b2519d5",
+        "complete_rank00.json": "52ac823fd4b727cec3133da14d7b2c7999c08299cb24ee173702a20d0d33429d"
+      }
+    }
+  ]
+}
