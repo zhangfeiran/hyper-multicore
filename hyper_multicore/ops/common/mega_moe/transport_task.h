@@ -18,15 +18,9 @@ namespace plane = hyper_multicore::shmem::data_plane;
 template <typename T>
 __aicore__ inline void PutIndexedA5(GM_ADDR target, GM_ADDR src, const __gm__ int32_t *indices,
     int64_t destination, int64_t first, int64_t rows, int64_t indexed_rows, int64_t hidden, int32_t peer) {
-  if (hidden == 5120) {
-    hyper_multicore::PutIndexedRows<T>(target, destination, src, indices,
-        first, rows, indexed_rows, peer, nullptr, false);
-  } else if (hidden == 4096) {
-    hyper_multicore::PutIndexedRows<T>(target, destination, src, indices,
-        first, rows, indexed_rows, peer, nullptr, false);
-  } else {
-    AscendC::Trap();
-  }
+  if (hidden != 4096 && hidden != 5120) AscendC::Trap();
+  hyper_multicore::PutIndexedRows<T>(target, destination, src, indices,
+      first, rows, indexed_rows, hidden, peer, nullptr, false);
 }
 #endif
 
@@ -97,7 +91,7 @@ __aicore__ inline void ExecuteTransfer(const MulticoreRuntime::TaskDesc &task, G
     if (indexed_rows > 0 && task.inputs[1].input_position == 2 && !pull) {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
       if ((source + first) % hidden || count % hidden
-          || (source + first + count) / hidden > indexed_rows * A3_INDEXED_TOP_K) AscendC::Trap();
+          || (source + first + count) / hidden > indexed_rows * A5_INDEXED_TOP_K) AscendC::Trap();
       const auto indices = reinterpret_cast<const __gm__ int32_t *>(source_offsets + experts);
       const int64_t row = (source + first) / hidden;
       const int64_t rows = count / hidden;
@@ -124,15 +118,9 @@ __aicore__ inline void ExecuteTransfer(const MulticoreRuntime::TaskDesc &task, G
       auto p = reinterpret_cast<GM_ADDR>(recompute->received_p);
       auto dp = reinterpret_cast<GM_ADDR>(recompute->local_dp);
       constexpr int64_t packet = kProbabilityPacketElements * sizeof(float);
-      if (hidden == 5120) {
-        RecomputedProbabilityGradientRows<5120>(g, inputs[11], dp, row, row + rows, 1);
-        ScaleRecomputedGradientRows<5120>(g, p, g, row, row + rows, 1, kProbabilityPacketElements);
-      } else if (hidden == 4096) {
-        RecomputedProbabilityGradientRows(g, inputs[11], dp, row, row + rows, 1);
-        ScaleRecomputedGradientRows(g, p, g, row, row + rows, 1, kProbabilityPacketElements);
-      } else {
-        AscendC::Trap();
-      }
+      if (hidden != 4096 && hidden != 5120) AscendC::Trap();
+      RecomputedProbabilityGradientRows(g, inputs[11], dp, hidden, row, row + rows, 1);
+      ScaleRecomputedGradientRows(g, p, g, hidden, row, row + rows, 1, kProbabilityPacketElements);
       plane::put_complete<float>(reinterpret_cast<GM_ADDR>(recompute->returned_dp) +
           (destination + first) / hidden * packet, dp + row * packet,
           rows * kProbabilityPacketElements, peer, engine);

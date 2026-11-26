@@ -121,4 +121,3 @@ def pack_dispatch_offsets(offsets: torch.Tensor, source_rows: torch.Tensor) -> t
 def launch_sequence(plan_tokens: int, source_rows: int, top_k: int, fenced: bool) -> int:
     """Encode the source extent, Top-K and readiness in the private launch attribute."""
     return -((plan_tokens << _SOURCE_BITS) | (top_k << _TOP_K_SHIFT) | source_rows | (_FENCED if fenced else 0))
-

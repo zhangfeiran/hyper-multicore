@@ -139,7 +139,7 @@ __aicore__ inline void RunMegaMoeMxfp8(GM_ADDR buffers, GM_ADDR runtime, GM_ADDR
       (launch->buffer_count == 27 || launch->buffer_count == 32) &&
       launch->buffer_bytes[2] == indexed_rows * launch->hidden * sizeof(bfloat16_t) &&
       launch->buffer_bytes[3] == static_cast<uint64_t>(launch->experts) * sizeof(int64_t) +
-                                 indexed_rows * MulticoreMoE::A3_INDEXED_TOP_K * sizeof(int32_t);
+                                 indexed_rows * MulticoreMoE::A5_INDEXED_TOP_K * sizeof(int32_t);
   if (launch->magic != MulticoreMx::MX_LAUNCH_MAGIC || (!ordinary && !indexed) ||
       launch->buffer_count == 0 || launch->buffer_count > 64 ||
       !MulticoreMx::IsMxLaunchTopologyValid(launch->ep, launch->experts) ||

@@ -32,7 +32,7 @@ from hyper_multicore.modules.mega_moe.workspace import MegaMoeWorkspace
 @pytest.mark.parametrize('mode', ['push', 'pull'])
 def test_error_converges_in_existing_route_and_releases_source_lease(mode):
     """Use the existing collective to reject weights and release the Pull lease."""
-    resources = SimpleNamespace(spec=SimpleNamespace(dispatch_mode=mode, auto_tokens=True),
+    resources = SimpleNamespace(a5_indexed_push=False, spec=SimpleNamespace(dispatch_mode=mode, auto_tokens=True),
                                 workspace=Mock(), prepare_auto_workspace=Mock(), placement=None)
     hidden, ids, probs = torch.ones(1, 64), torch.zeros(1, 1), torch.ones(1, 1)
     def _reject(*args, **options):

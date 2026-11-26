@@ -8,6 +8,7 @@ namespace MulticoreMoE {
 constexpr uint32_t A3_INDEXED_MAX_TOP_K = 8;
 constexpr uint32_t A3_INDEXED_MAX_HIDDEN = 8192;
 constexpr uint32_t A3_INDEXED_HIDDEN_ALIGNMENT = 16;
+constexpr int64_t A5_INDEXED_TOP_K = 8;
 constexpr int64_t A3_INDEXED_TOP_K_SHIFT = 17;
 constexpr int64_t A3_INDEXED_TOP_K_MASK = 15;
 constexpr uint32_t A3_INDEXED_MAX_TOKENS = 16384;
