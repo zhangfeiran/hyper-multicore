@@ -59,6 +59,7 @@ class PreparedTopKRoute:
     maximum_received_slots: int = 0
     weight_binding: Any = field(default=None, repr=False, compare=False)
     checkpoint_record: Any = field(default=None, repr=False, compare=False)
+    dump_weights: bool = False
 
 
 _record_metadata_stream = RouteMetadata.record_stream
@@ -71,6 +72,7 @@ class _RouteSummary(NamedTuple):
     plan_tokens: int
     maximum: int
     all_experts_active: bool = False
+    dump_weights: bool = False
 
 
 @dataclass(frozen=True)
@@ -550,15 +552,22 @@ def _validate_dynamic_sizes(rows: list[list[int]], spec: MegaMoeSpec) -> None:
 
 
 _INVALID_WEIGHT_MASK = 1 << 5
+_TENSOR_DUMP_MASK = 1 << 6
+
+
+def _validate_dynamic_mask(rows: list[list[int]]) -> None:
+    """Require matching autograd participation while allowing rank-local capture."""
+    expected = rows[0][2] & ~_TENSOR_DUMP_MASK
+    if expected & _INVALID_WEIGHT_MASK or any((row[2] & ~_TENSOR_DUMP_MASK) != expected for row in rows):
+        if any(row[2] & _INVALID_WEIGHT_MASK for row in rows):
+            raise ValueError("expert weights do not match the bound layout on all EP ranks")
+        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
 
 
 def _validate_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> None:
     """Validate every rank before any automatic allocation or SHMEM write."""
     _validate_dynamic_sizes(rows, spec)
-    if rows[0][2] & _INVALID_WEIGHT_MASK or any(row[2] != rows[0][2] for row in rows):
-        if any(row[2] & _INVALID_WEIGHT_MASK for row in rows):
-            raise ValueError("expert weights do not match the bound layout on all EP ranks")
-        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
+    _validate_dynamic_mask(rows)
     if any(not _valid_route_counts(row, spec.top_k) for row in rows):
         raise RuntimeError("MegaMoe counts must describe the actual distinct Top-K routes")
 
@@ -566,7 +575,7 @@ def _validate_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> None:
 def _dynamic_summary(payload: torch.Tensor, spec: MegaMoeSpec, source_rows: list | None = None) -> _RouteSummary:
     """Use one Host summary for shape, participation, receive limits, and schedule."""
     counts = payload[:, 3:]
-    # Each column belongs to one expert. Reduce over every source before checking for empty experts.
+    # Each column belongs to one expert. Reduce every source before checking for empty experts.
     expert_loads = counts.sum(0).reshape(spec.ep_size, spec.local_experts)
     summary = torch.cat((payload[:, :3], counts.sum(1, keepdim=True),
                          counts.amin(1, keepdim=True), counts.amax(1, keepdim=True),
@@ -593,7 +602,8 @@ def _summarize_dynamic_rows(
     plan_tokens = max(128, _align_capacity(max(row[1] for row in rows)))
     if plan_tokens * max(spec.hidden_size, spec.top_k) > 2**31 - 1 or maximum > 2**31 - 1:
         raise RuntimeError("MegaMoe dynamic route exceeds native INT32 size limits")
-    return _RouteSummary(max(1, rows[spec.rank_id][6]), plan_tokens, maximum, all_experts_active)
+    dump_weights = any(row[2] & _TENSOR_DUMP_MASK for row in rows)
+    return _RouteSummary(max(1, rows[spec.rank_id][6]), plan_tokens, maximum, all_experts_active, dump_weights)
 
 
 def _read_dynamic_route(
@@ -609,6 +619,28 @@ def _read_dynamic_route(
     if source_rows is not None:
         source_rows.extend(sum(row[3:]) for row in raw)
     return summary, raw
+
+
+def _read_packed_dynamic_route(
+    payload: torch.Tensor, spec: MegaMoeSpec, tokens: int, source_rows: list[int] | None = None,
+) -> tuple[_RouteSummary, RouteMetadata] | None:
+    """Submit invocation-owned offsets before reading the one collective summary."""
+    if (spec.architecture != 3510 or spec.precision != "mxfp8"
+            or spec.ep_size * spec.num_experts <= _HOST_ROUTE_MAX_COUNTS):
+        return None
+    ub = _packed_route_ub(payload, spec, header=3)
+    if ub is None:
+        return None
+    offsets, sizes, summary = multicore_ops.route_offsets_and_summary(
+        payload, spec.rank_id, ub, spec.hidden_size)
+    if summary is None:
+        return None
+    rows = summary.tolist()
+    result = _summarize_dynamic_rows(rows, spec, all_experts_active=rows[spec.rank_id][7] > 0)
+    if source_rows is not None:
+        source_rows.extend(row[3] for row in rows)
+    metadata = _unpack_route_offsets(offsets, sizes, spec, result.capacity)
+    return result, metadata.with_active_experts(result.all_experts_active, tokens, result.plan_tokens)
 
 
 def _summarize_host_route(raw: list[list[int]], spec: MegaMoeSpec) -> _RouteSummary:
@@ -651,15 +683,12 @@ def _reuse_cached_route(
 ) -> tuple[_RouteSummary, list[list[int]], RouteMetadata | None]:
     """Validate and reuse one exact cached descriptor."""
     _validate_dynamic_sizes(raw, spec)
-    expected_mask = raw[0][2] & ~_INVALID_WEIGHT_MASK
-    if any(row[2] != expected_mask for row in raw):
-        if any(row[2] & _INVALID_WEIGHT_MASK for row in raw):
-            raise ValueError("expert weights do not match the bound layout on all EP ranks")
-        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
+    _validate_dynamic_mask(raw)
     if source_rows is not None:
         source_rows.extend(cached.source_totals)
     cached.wait(device, stream)
-    return cached.summary, raw, cached.metadata
+    summary = cached.summary._replace(dump_weights=any(row[2] & _TENSOR_DUMP_MASK for row in raw))
+    return summary, raw, cached.metadata
 
 
 def _host_route_cache_available(spec: MegaMoeSpec, workspace: MegaMoeWorkspace | None) -> bool:
@@ -874,8 +903,12 @@ def _resolve_dynamic_permutation(
         if work is not None:
             work.wait()
             work = None
-        summary, host_rows, metadata = _read_cached_route(
-            gathered, spec, workspace, hidden_states.device, stream=route_stream)
+        packed = _read_packed_dynamic_route(gathered, spec, hidden_states.shape[0])
+        if packed is None:
+            summary, host_rows, metadata = _read_cached_route(
+                gathered, spec, workspace, hidden_states.device, stream=route_stream)
+        else:
+            summary, metadata = packed
         if prepare_workspace is None:
             raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
         prepare_workspace(summary.plan_tokens, summary.maximum)
@@ -905,6 +938,7 @@ def _finalize_dynamic_route(
         received_counts=received_counts,
         maximum_received_slots=summary.maximum,
         metadata=metadata,
+        dump_weights=summary.dump_weights,
     )
 
 
@@ -999,7 +1033,8 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
     metadata = placement.route_metadata
     virtual_table = gathered if metadata is not None else torch.cat((gathered[:, :3], table.to(gathered.dtype)), dim=1)
     local_load = placement.local_receive_capacity
-    virtual_summary = _RouteSummary(max(1, local_load), summary.plan_tokens, placement.receive_capacity)
+    virtual_summary = _RouteSummary(max(1, local_load), summary.plan_tokens, placement.receive_capacity,
+                                    dump_weights=summary.dump_weights)
     virtual_tokens = _materialize_route_permutation(hidden, placement.virtual_ids, virtual_spec, workspace)
     route = _finalize_dynamic_route(
         virtual_tokens, virtual_counts, virtual_summary, None, metadata, None, virtual_table,

@@ -150,6 +150,30 @@ class TestMegaMoeFunction(unittest.TestCase):
                 for value in (gradients.act_grad, gradients.swiglu_grad, gradients.gate_dx):
                     self.assertEqual(value.dtype, torch.bfloat16)
 
+    def test_fused_replica_owner_buffers_follow_the_device_protocol(self) -> None:
+        """A5 fused TN writes FP32 even when the owner weights and final gradients are BF16."""
+        rows = torch.empty(8, 4, dtype=torch.bfloat16)
+        workspace = Mock(expert_buffer=rows, routed_buffer=rows, swiglu_grad_workspace=torch.empty(1))
+        saved = SimpleNamespace(dispatch=rows, group_list=torch.tensor([4, 4, 8], dtype=torch.int64))
+        owner_weights = (torch.empty(2, 4, 6, dtype=torch.bfloat16),
+                         torch.empty(2, 3, 4, dtype=torch.bfloat16))
+        for architecture, dtype in ((2201, torch.bfloat16), (3510, torch.float32)):
+            with self.subTest(architecture=architecture):
+                spec = SimpleNamespace(architecture=architecture, hidden_size=4,
+                                       intermediate_size=3, dispatch_mode="push")
+                plan = SimpleNamespace(spec=spec, weight_grad_dtype=torch.float32,
+                                       event_counter_bytes=None, reuse_backward_dispatch=False)
+                with (
+                    patch.object(function_module, "_kernel_workspace"),
+                    patch.object(function_module.multicore_ops, "zero_empty_expert_gradients") as zero_empty,
+                ):
+                    execution = function_module._prepare_backward_execution(
+                        workspace, plan, saved, rows, owner_weights=owner_weights)
+                buffers = execution.intermediates
+                self.assertEqual((buffers.grad_weight1.dtype, buffers.grad_weight2.dtype), (dtype, dtype))
+                zero_empty.assert_called_once()
+                torch.testing.assert_close(zero_empty.call_args.args[-1], saved.group_list[:2])
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_backward_unpacks_saved_tensors_once(self) -> None:

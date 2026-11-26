@@ -41,14 +41,17 @@ def forward(
         route_experts = binding.placement.counts_by_source.shape[1]
         if route_experts != resources.spec.num_experts:
             ordinary_options["route_experts"] = route_experts
+        if resources.spec.architecture == 3510:
+            # Preserve the precision of the owner and guest partials through the bank reduction.
+            ordinary_options["weight_grad_dtype"] = torch.float32
     if binding is not None and binding.fused:
         plan = resources.plan_for_tokens(
             route.metadata.plan_tokens, hidden_flat.device,
             weight_grad_dtype=torch.float32 if binding.mode is ReplicaExecutionMode.FP32_BAND else None,
             route_experts=ordinary_options.get("route_experts"),
-            replica_pipeline=True, reserve_merge_workers=binding.owns_returns,
+            replica_pipeline=True, reserve_merge_workers=binding.owns_returns or resources.spec.architecture == 3510,
         )
-        if plan.fwd_diagnostics.is_tensor_dump_active:
+        if route.dump_weights:
             if binding.mode is ReplicaExecutionMode.FP32_BAND:
                 ordinary_options["weight_grad_dtype"] = torch.float32
             binding = binding.for_tensor_dump()

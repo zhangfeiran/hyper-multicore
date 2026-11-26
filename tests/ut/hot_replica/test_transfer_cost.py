@@ -81,6 +81,8 @@ def test_equal_replica_cost_prefers_fewer_cross_node_token_rows():
 
 @pytest.mark.parametrize(("arch", "precision", "engine", "charge_whole_copies", "minimum_rows"), [
     (2201, "bf16", "mte", False, 1),
+    (3510, "bf16", "udma", True, 1),
+    (3510, "mxfp8", "udma", False, 8192),
 ])
 def test_training_auto_uses_the_backend_coefficients(arch, precision, engine, charge_whole_copies, minimum_rows):
     """Select the backend coefficients in the common score and preserve the explicit limit."""
@@ -168,3 +170,20 @@ def test_search_and_capacity_repair_respect_peer_edges():
     assert select_replica_plan(counts, config, peer_edges=edges) is None
     with pytest.raises(ReplicaCapacityError):
         select_replica_plan(counts, config, peer_edges=edges, limit=64)
+
+
+def test_measured_admission_uses_the_same_cost_and_keeps_the_qualified_scope(monkeypatch):
+    """Retain the measured admission price for the matching training transport."""
+    monkeypatch.setenv("HYPER_MULTICORE_SHMEM_UDMA_QP_NUM", "16")
+    nodes = (0,) * 8 + (1,) * 8
+    planner = HotReplicaPlanner()
+    args = (3072, 1152, 32, True, "udma", 49152, 32768 * 16, 16, None)
+    scope = {"architecture": 3510, "precision": "mxfp8", "rank_nodes": nodes}
+    price, _, _ = planner._policy(*args, **scope)
+    guard = price.admission
+    assert guard is not None
+    assert guard.transfer(4, 1) + guard.setup > 49152 - 32768
+    assert guard.transfer(1, 1) + guard.setup < 49152 - 32768
+    assert HotReplicaPlanner(cross_node_cost=1.)._policy(*args, **scope)[0].admission is None
+    monkeypatch.setenv("HYPER_MULTICORE_SHMEM_UDMA_QP_NUM", "8")
+    assert planner._policy(*args, **scope)[0].admission is None

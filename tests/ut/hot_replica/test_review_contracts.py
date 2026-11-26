@@ -156,7 +156,7 @@ def test_tensor_dump_preserves_the_original_replay_binding():
 
 def test_successful_fused_weight_acquire_records_prefetch_and_returns_operands():
     """Exercise the successful projection-ready path as well as failure cleanup."""
-    pool, placement = Mock(), Mock()
+    pool, placement = Mock(requires_mte_edges=False), Mock()
     pool.statistics = {}
     binding = ExpertWeightBinding(pool, placement, "EOI", execution_mode=ReplicaExecutionMode.FP32_BAND)
     weights = (torch.empty(1), torch.empty(1))

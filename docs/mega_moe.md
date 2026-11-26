@@ -155,11 +155,12 @@ from hyper_multicore.experimental import HotReplicaPlanner, MegaMoeTuningOptions
 tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
 ```
 
-- 省略 `expert_placement` 时使用原属路由。Push 和 Pull 的默认 guest 槽上限都是每 rank 的原属专家数 L。显式槽数须在 1 到 L 之间。自动模式在槽位预算内比较原属、单槽和多槽布局。
-- `cross_node_cost` 表示跨节点副本矩阵搬运的相对代价。`None` 和 `1.0` 的倍率相同。Push 和 Pull 都接受显式倍率，EP 组内使用相同配置。
-- `receive_capacity_percent="auto"` 默认按预计净收益选点。Push 评分同时考虑已经预留的接收区。
+- 省略 `expert_placement` 时使用原属路由。BF16 Push 和 Pull 的默认 guest 槽上限都是每 rank 的原属专家数 L。显式槽数须在 1 到 L 之间。自动模式在槽位预算内比较原属、单槽和多槽布局。
+- `cross_node_cost` 表示跨节点副本矩阵搬运的相对代价。`None` 和 `1.0` 的倍率相同。BF16 Push 和 Pull 都接受显式倍率，MXFP8 Push 的训练规划也使用该参数。EP 组内使用相同配置。
+- BF16 的 `receive_capacity_percent="auto"` 默认按预计净收益选点。Push 评分同时考虑已经预留的接收区。
   显式 `receive_capacity_percent=102` 将各 rank 的实际接收行数限制在 EP 均值的 102%，向上取整到一行。
-  两种设置共用评分和源端配额规则。EP 组内使用相同设置。槽位不足或搜索无法找到合规计划时，调用报错。
+  MXFP8 Push 同样支持显式行数上限，每个专家的内部切点保持 64 行对齐。原属路由超限时尝试必需的副本放置。
+  EP 组内使用相同设置。槽位不足或搜索无法找到合规计划时，调用报错。
 - `ascend910_93` 支持 BF16 EIO 和 EOI 的 MTE Push 和 Pull。槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
   Pull 需要支持按实际行数切分 GET 的 A3 制品。默认放置策略沿用 Push 的配额计算，由执行 rank 从对称源区拉取 token。
   自定义策略从 `hyper_multicore.experimental` 导入 `BasePlanner`、`PlacementRequest` 和 `ExpertPlacement`。
@@ -179,8 +180,28 @@ tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
   显式 FP32 partial 在专家矩阵元素数和本地专家数均为奇数时补一个 BF16 bank 记录，以保持 FP32 尾区地址对齐。
   若放置需要 BF16 partial 协议，应加载支持该协议的 A3 制品。捕获实际张量的 tensor dump 使用其专用捕获路径。
   副本同步标志独立分配，并随 SHMEM 堆重建重新初始化。
+- `ascend950` 的 BF16 Push 和 UDMA Pull 满足核内布局要求时，在主算子内按投影预取权重，并按固定 peer 和 slot 顺序归并 dW。
+  MTE Pull 及其他不满足融合条件的 BF16 调用使用独立预取和归并，沿用相同的 planner、配额和接收上限。
+  BF16 副本边要求 owner 与 guest 双向具备 MTE 和直接映射。执行器按实际 SHMEM runtime 探测并约束落位。
+  需要副本才能满足硬接收行数上限且没有可用落位时，所有 EP rank 在启动算子前报错。
+  活跃副本路径以 FP32 计算和归并权重梯度，最终转换为 BF16 参数梯度。
+  A5 核内预取的重算读取当前权重，首次 F 无需保存 guest 权重快照。
+  任一 BF16 EP rank 采集 tensor dump 时，同一调用的全部 rank 使用 staged 副本协议。
+- `ascend950` 的 MXFP8 专家副本支持 EIO Push。设置 `MegaMoeNumericsOptions(partial_weight_grad_dtype="float32")`，
+  使用内置 `HotReplicaPlanner`。默认 guest 槽上限为每 rank 的原属专家数 L。可通过
+  `HotReplicaPlanner(replica_slots_per_rank=2)` 等配置指定 1 到 L 个 guest 槽，
+  该上限同时约束落位、权重缓冲与梯度 inbox。设备须报告 32 个 Cube 核。
+  各 rank 启动前设置 `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable`，SHMEM 使用 `mte_udma`，
+  `HYPER_MULTICORE_SHMEM_UDMA_QP_NUM` 为 8、16 或 32。模型传入 FP32 roots，TN 累加和公开 dW 均为 FP32。
+  MXFP8 的 checkpoint 重算重新准备路由与落位，并解析当次物化的列轴权重。反向解析当次物化的行轴权重。
 - 同一 EP/heap 上，尺寸、dtype、执行协议和标志布局兼容的层串行租用一份 bank。
+  MXFP8 共享权重缓冲和 FP32 梯度 bank，要求相同的 EP 进程组、权重布局和 guest 槽预算。
   `MegaMoeTuningOptions(replica_bank="dedicated", expert_placement=...)` 为该执行资源组预留一份独占 bank。
+
+在支持的 A3 BF16、A5 BF16 与 A5 MXFP8 训练路径上，`auto` 共用接收配额搜索。
+它按各自执行路径的系数，对预计的接收计算峰、繁忙端点与实际产生的矩阵复制计费。
+已有准入校准的拓扑用同一代价函数复核物化后的可选落位。
+`receive_capacity_percent` 传入整数时，落位必须满足相应的接收上限。
 
 每次正向按实际路由决定是否启用副本。模型继续持有原属专家参数、优化器状态和 checkpoint，
 反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，
@@ -377,6 +398,7 @@ d_a = BF16(FP32(d_fc2_input) * p)
 设置后 MegaMoE 按该大小建立固定堆。路由和新增资源仍可在堆内调整布局。若本次布局的最小容量超过上限，
 执行器在申请或重建前报错，并报告所需字节数与配置值。未设置时，MegaMoE 根据实际布局选择堆大小并按需增长。
 堆分配失败或无法安全重启时同样会报错。
+Ascend950 MXFP8 Push 仅需扩大接收区且当前堆满足新布局时，执行器可在堆内更新接收区。
 容量策略和失败恢复见 [SHMEM runtime restart](shmem.md#runtime-restart)。
 
 ### 资源共享与关闭
@@ -460,6 +482,10 @@ experts = MegaMoeExperts(
 同一个 EP 组的对应层必须使用一致的有效配置，同一个 workspace 不能切换通信模式。
 参数、checkpoint 与优化器状态由外层模型管理，接入方式见
 [Checkpoint 与参数归属](../examples/README.md#checkpoint与参数归属)。
+
+### Ascend950 MXFP8 路由摘要
+
+普通路由可在 offset 算子有空闲 AIV 时同时生成摘要，其余调用使用通用张量归约。
 
 ### 调度选项
 

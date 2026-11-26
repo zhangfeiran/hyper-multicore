@@ -9,6 +9,8 @@
 #define ASCEND_HOT_REPLICA_EXPORT
 #endif
 
+extern "C" ASCEND_HOT_REPLICA_EXPORT int hmc_hot_replica_mte_peers(void* stream, uint8_t* peers);
+
 extern "C" ASCEND_HOT_REPLICA_EXPORT int hmc_hot_replica_prefetch_weight_kernel_do(
     void* stream, uint8_t* home, uint8_t* slots, uint8_t* copies,
     int64_t experts, int64_t hidden, int64_t projection, int64_t local_slots,

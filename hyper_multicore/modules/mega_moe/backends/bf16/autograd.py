@@ -271,6 +271,9 @@ def _prepare_backward_execution(
     grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
     weights = (saved.weight1, saved.weight2) if owner_weights is None else owner_weights
     groups = saved.group_list if owner_weights is None else saved.group_list[:weights[0].shape[0]]
+    grad_dtype = plan.weight_grad_dtype
+    if owner_weights is not None and plan.spec.architecture == 2201:
+        grad_dtype = weights[0].dtype
     return _BackwardExecution(
         dispatch=dispatch,
         grad_x=grad_x,
@@ -286,8 +289,7 @@ def _prepare_backward_execution(
             grad_output,
             *weights,
             dispatch[:saved.dispatch.shape[0]] if plan.reuse_backward_dispatch else None,
-            weight_grad_dtype=(plan.weight_grad_dtype if owner_weights is None
-                               else weights[0].dtype),
+            weight_grad_dtype=grad_dtype,
             group_list=groups,
             all_experts_active=all_experts_active,
         ),
@@ -705,12 +707,18 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             saved_probabilities = permutation_inputs[-1] if plan.spec.apply_probs_before_fc2 else None
             permutation_inputs = permutation_inputs[:1]
             fused_owner_weights = owner_weights if acquired and binding.fused_gradients else None
+            all_experts_active = ctx.all_experts_active
+            if fused_owner_weights is not None and plan.spec.architecture == 3510:
+                # The A5 kernel casts its FP32 owner buffer after adding guest gradients.
+                home_rows = binding.placement.owner_rows
+                all_experts_active = (home_rows is not None and len(home_rows) == owner_weights[0].shape[0]
+                                      and all(rows > 0 for rows in home_rows))
             execution = _prepare_backward_execution(
                 workspace,
                 plan,
                 saved,
                 grad_output,
-                all_experts_active=ctx.all_experts_active,
+                all_experts_active=all_experts_active,
                 owner_weights=fused_owner_weights,
             )
             grad_weight1 = execution.intermediates.grad_weight1

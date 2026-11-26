@@ -371,10 +371,11 @@ class _HeapManager:
             growth = self._token_growth_layouts(entry, tokens, received)
             if growth is None:
                 return entry.bound_spec
-            _, layouts = growth
+            layout, layouts = growth
             required = self._required_bytes(layouts)
             heap_bytes = self._budget(required)
-            self._restart(layouts, heap_bytes)
+            if not self._grow_mx_receive(entry, layout, heap_bytes):
+                self._restart(layouts, heap_bytes)
             return entry.bound_spec
 
     def _token_growth_layouts(
@@ -403,6 +404,89 @@ class _HeapManager:
             entry, receive_capacity, token_capacity, minimum=(minimum_received, minimum_tokens),
         )
         return None if layout == entry.layout else (layout, layouts)
+
+    def _grow_mx_receive(self, entry: _HeapEntry, layout: _WorkspaceLayout, heap_bytes: int) -> bool:
+        """Replace only quiescent MXFP8 Push receive scratch within the attached heap."""
+        spec, workspace, old_layout = entry.bound_spec, entry.workspace, entry.layout
+        if (not self._runtime_attached or heap_bytes != self.heap_bytes or workspace.expert_buffer is None
+                or spec.architecture != 3510 or spec.precision != "mxfp8" or spec.dispatch_mode != "push"
+                or spec.apply_probs_before_fc2 or layout.token_capacity != old_layout.token_capacity):
+            return False
+
+        new_spec = self._layout_spec(entry, layout)
+        replacements = workspace.describe_restart_allocations(new_spec, self.dtype, layout.receive_capacity)
+        started = time.perf_counter()
+
+        def prepare() -> None:
+            workspace.validate_restart_allocations(spec, self.dtype, old_layout.receive_capacity, replacements)
+            if workspace.used:
+                workspace.completion_event.synchronize()
+
+        owner_index = next(index for index, candidate in enumerate(self.entries) if candidate is entry)
+        self._run_and_check_consistency(
+            prepare, stage="MX Push receive growth preflight", value=(owner_index, old_layout, layout),
+        )
+        receive = next(item for item in replacements if item.current is workspace.expert_buffer)
+        try:
+            stages_ms = self._replace_mx_push_receive(workspace, receive)
+        except Exception:
+            self.state = "failed"
+            raise
+        if stages_ms is None:
+            return False
+        workspace.expert_capacity = workspace.capacity_floor = layout.receive_capacity
+        entry.bound_spec = new_spec
+        entry.layout = layout
+        self._record_growth(
+            started, self.heap_bytes, mode="mx_push_storage",
+            old_receive=old_layout.receive_capacity, receive=layout.receive_capacity,
+            old_source=spec.local_num_tokens, source=new_spec.local_num_tokens,
+            replaced=["expert_buffer"], release_first=True, stages_ms=stages_ms,
+        )
+        return True
+
+    @torch.inference_mode(False)
+    def _replace_mx_push_receive(
+        self, workspace: MegaMoeWorkspace, replacement: _lifecycle._AllocationReplacement,
+    ) -> dict[str, float] | None:
+        """Retire quiescent receive scratch before allocating its larger buffer."""
+        current, target = replacement.current, replacement.target
+        old_shape, old_dtype = tuple(current.shape), current.dtype
+
+        def release() -> None:
+            shmem.free(current)
+            workspace.expert_buffer = None
+
+        def allocate(shape: tuple[int, ...], dtype: torch.dtype) -> None:
+            workspace.expert_buffer = shmem.empty(shape, dtype=dtype, alignment=target.alignment_bytes)
+
+        started = time.perf_counter()
+        _collective.collective_call(release, stage="MX Push receive release", group=self.root_group)
+        released = time.perf_counter()
+        failure = None
+        recoverable = False
+        local_error = None
+        try:
+            allocate(target.shape, target.dtype)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            local_error = error
+            failure = _collective.failure_report(error)
+            # A null result from the native aligned allocator did not register a new Allocation.
+            recoverable = (failure[1].startswith(
+                "[HYPER_MULTICORE_SHMEM_ERROR] error_code=CANN_ERROR operation=Allocate phase=CannCall "
+            ) and _lifecycle._runtime_is_healthy())
+        peers = _collective.exchange((failure, recoverable), group=self.root_group,
+                                     failure_prefix="MX Push receive allocation failed while converging Root ranks")
+        if all(item[0] is None for item in peers):
+            return {"release_ms": (released - started) * 1000,
+                    "allocate_ms": (time.perf_counter() - released) * 1000}
+        if all(item[1] for item in peers):
+            # Restore the committed scratch shape before the usual whole-heap fallback.
+            _collective.collective_call(lambda: allocate(old_shape, old_dtype),
+                                        stage="MX Push receive restoration", group=self.root_group)
+            return None
+        failures = _collective.format_collective_failures([item[0] for item in peers])
+        raise RuntimeError(f"MX Push receive allocation failed on {failures}") from local_error
 
     def _growth_layouts(
         self, entry: _HeapEntry, received: int, tokens: int | None, *, minimum: tuple[int, int | None],

@@ -47,7 +47,13 @@ _WORKSPACE_ALIGNMENT = 512
 
 def _workspace_event_experts(specification: Mapping[str, Any]) -> int:
     """Reserve counter space for the widest route that can use this workspace."""
-    return specification["num_experts"] * (2 if specification.get("hot_replica") else 1)
+    experts = specification["num_experts"]
+    if not specification.get("hot_replica"):
+        return experts
+    slots = specification.get("replica_slots_per_rank")
+    if specification.get("precision") == "mxfp8" and slots is not None:
+        return experts + specification["ep_size"] * slots
+    return 2 * experts
 
 
 def _workspace_allocation_specs(
@@ -189,6 +195,9 @@ class MegaMoeWorkspace:
             dtype=dtype,
             apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
+        if precision == "mxfp8" and spec.dispatch_mode == "push" and not spec.apply_probs_before_fc2:
+            # Keep the long-lived routed and event buffers away from the growing receive allocation.
+            return (*allocations[1:], allocations[0])
         return allocations
 
     def probabilities(self, spec: MegaMoeSpec) -> ProbabilityWorkspace:

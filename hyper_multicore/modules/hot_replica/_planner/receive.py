@@ -101,10 +101,38 @@ _A3_BF16 = {
                                              phases=_BF16_TRAINING_PHASES if training else ((1., 1.),))
     for transport, scale in (("mte", 8.), ("other", 1.)) for training in (False, True)
 }
-_BASE_PROFILES = {(2201, "bf16", transport, training): profile
-                  for (transport, training), profile in _A3_BF16.items()}
-_AUTO_TRAINING = {(2201, "bf16", "mte"): _A3_BF16["mte", True]}
-_AUTO_ADMISSION = {}
+_A5_BF16 = {
+    True: _CostCoefficients(setup_peak_fraction=.25, endpoint_per_half_inner=1.),
+    False: _CostCoefficients(setup_peak_fraction=.4),
+}
+_A5_MXFP8 = {
+    True: _CostCoefficients(setup_peak_fraction=.25, endpoint_per_half_inner=1., minimum_replica_rows=8192),
+    False: _CostCoefficients(setup_peak_fraction=.25, minimum_replica_rows=8192),
+}
+
+_BASE_PROFILES = {
+    **{(2201, "bf16", transport, training): profile for (transport, training), profile in _A3_BF16.items()},
+    **{(3510, "bf16", transport, training): profile
+       for transport in ("mte", "udma") for training, profile in _A5_BF16.items()},
+    **{(3510, "mxfp8", "udma", training): profile for training, profile in _A5_MXFP8.items()},
+}
+_AUTO_TRAINING = {
+    (2201, "bf16", "mte"): _A3_BF16["mte", True],
+    (3510, "bf16", "udma"): replace(_A5_BF16[True], setup_peak_fraction=.12, copy_rows=1600.),
+    (3510, "mxfp8", "udma"): replace(_A5_MXFP8[True], endpoint_per_half_inner=1.25),
+}
+
+# Convert the previously qualified MXFP8 latency fit to the common equivalent-row model.
+# The reference matrix area fixes the units of the fit across hidden/intermediate sizes.
+_MX_MEASURED_RATE_RATIO = 32768 * 6 * 5120 * 1792 / (.009681789 * 32 * 7.4e12)
+_AUTO_ADMISSION = {
+    (3510, "mxfp8", "udma"): ((8, 8), "16", _CostCoefficients(
+        setup_seconds=-.00172378 * _MX_MEASURED_RATE_RATIO,
+        setup_peak_fraction=.806552 / 9.681789,
+        endpoint_seconds=.001412271 * _MX_MEASURED_RATE_RATIO,
+        endpoint_rows=.233497 * 32768 / 9.681789,
+    )),
+}
 
 
 def bf16_cost(hidden_size, intermediate_size, cube_cores, training, *, transport_engine="mte"):

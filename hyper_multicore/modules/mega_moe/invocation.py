@@ -19,8 +19,9 @@ from functools import partial
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 import torch
+from hyper_multicore.diagnostics.common.session import _get_active_session
 from .route import (
-    _INVALID_WEIGHT_MASK, PreparedTopKRoute, _materialize_route_permutation, prepare_topk_route,
+    _INVALID_WEIGHT_MASK, _TENSOR_DUMP_MASK, PreparedTopKRoute, _materialize_route_permutation, prepare_topk_route,
 )
 
 if TYPE_CHECKING:
@@ -33,7 +34,7 @@ def prepare_expert_invocation(
     hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
     counts: torch.Tensor | None, weights: tuple[torch.Tensor, torch.Tensor],
     resources: "_MegaMoeExecutionResources", *, weight_error: bool = False,
-    planner: "BasePlanner | None" = None,
+    planner: "BasePlanner | None" = None, training: bool = True,
 ) -> Iterator[PreparedTopKRoute]:
     """Converge weight errors on the existing route collective before physical binding.
 
@@ -56,11 +57,20 @@ def prepare_expert_invocation(
             leased_workspace = resources.workspace
 
     placement = getattr(resources, "placement", None)
+    mx_placement = placement is not None and resources.spec.precision == "mxfp8"
+    if mx_placement:
+        with torch.inference_mode(False), torch.no_grad():
+            route = placement.prepare_route(hidden, ids, probs, counts, mask, training=training)
+        yield route
+        return
     record, replay = None, False
     try:
         if placement is not None:
             from hyper_multicore.modules.hot_replica.checkpoint import agree_replay, route_record  # pylint: disable=import-outside-toplevel
 
+            dump = _get_active_session("tensor_dump")
+            if dump is not None and dump.is_capture_enabled():
+                mask |= _TENSOR_DUMP_MASK
             record, replay = route_record(resources)
             if replay and agree_replay(
                     record, hidden, ids, probs, counts, resources.spec, mask, weight_error=weight_error):

@@ -56,31 +56,34 @@ class Resources(_MegaMoeExecutionResources):
             active_specifications=active_specifications,
         )
         self._plans = OrderedDict()
+        self._plan_cache_size = 8 if self.placement is not None else 4
 
     def _initial_plan(self, tensor):
         # Capability rejection participates in the common construction collective.
         if self.spec.architecture != 3510:
             raise ValueError("MXFP8 experts require arch35")
 
-    def plan_for_capacity(self, capacity, device, *, tokens=None):
-        """Cache pointer-free Pull plans independently of the live per-expert loads."""
+    def plan_for_capacity(self, capacity, device, *, tokens=None, route_experts=None):
+        """Cache pointer-free plans by graph width and committed capacities."""
         coverage = self.spec.local_num_tokens if tokens is None else tokens
         if coverage > self._token_capacity:
             raise ValueError("MX plan exceeds committed source capacity")
-        active_spec = replace(self.spec, local_num_tokens=coverage)
-        if active_spec.dispatch_mode == 'pull':
-            limit = min(active_spec.ep_size * active_spec.routed_slots, (1 << 32) - 1)
+        if self.spec.dispatch_mode == 'pull':
+            limit = min(self.spec.ep_size * coverage * self.spec.top_k, (1 << 32) - 1)
             if not 1 <= capacity <= limit:
                 raise ValueError(f"Pull receive capacity must be in [1, {limit}]")
             capacity = limit
-        key = (coverage, capacity)
+        key = (coverage, capacity, route_experts)
         if key not in self._plans:
-            spec = replace(active_spec, receive_capacity=capacity)
-            self._plans[key] = _MXFP8Plan(
-                spec, _device_runtime(build_mxfp8_runtime(spec, forward=True), device, spec),
-                _device_runtime(build_mxfp8_runtime(spec, forward=False), device, spec))
+            spec = replace(self._route_spec(route_experts), local_num_tokens=coverage, receive_capacity=capacity)
+            home_experts = self.spec.local_experts if route_experts is not None else None
+            forward = build_mxfp8_runtime(spec, forward=True, home_experts=home_experts)
+            backward = build_mxfp8_runtime(spec, forward=False, home_experts=home_experts,
+                                          gradient_helpers=home_experts is not None)
+            self._plans[key] = _MXFP8Plan(spec, _device_runtime(forward, device, spec),
+                                        _device_runtime(backward, device, spec))
         self._plans.move_to_end(key)
-        while len(self._plans) > 4:
+        while len(self._plans) > self._plan_cache_size:
             self._plans.popitem(last=False)
         return self._plans[key]
 
@@ -101,5 +104,11 @@ def forward(module, hidden_states, hidden_flat, topk_ids, topk_weights, weights,
     del hidden_flat, topk_ids
     shapes = ((module.local_experts, module.hidden_size, 2 * module.intermediate_size),
               (module.local_experts, module.intermediate_size, module.hidden_size))
-    execution = MXFP8Execution(resources, nograd_no_clone=module.nograd_no_clone)
+    binding = route.weight_binding
+    if binding is None:
+        execution = MXFP8Execution(resources, nograd_no_clone=module.nograd_no_clone)
+    else:
+        execution = MXFP8Execution(resources, nograd_no_clone=module.nograd_no_clone,
+                                   placement=binding.placement, weight_prefetch=binding.prefetch,
+                                   gradient_pool=binding.gradients)
     return execute_mxfp8_experts(hidden_states, *weights, route, topk_weights, shapes, execution)

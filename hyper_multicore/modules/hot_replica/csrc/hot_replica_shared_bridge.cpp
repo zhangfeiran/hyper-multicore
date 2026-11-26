@@ -19,6 +19,17 @@ static void check_runtime(int64_t rank, int64_t ranks) {
     TORCH_CHECK(ranks == aclshmem_n_pes(), "expert-transfer world differs from active MegaMoE SHMEM root");
 }
 
+static void mte_peers(torch::Tensor peers, int64_t rank) {
+    TORCH_CHECK(peers.device().is_privateuseone() && peers.scalar_type() == at::kInt &&
+                peers.dim() == 1 && peers.is_contiguous(), "MTE probe output must be contiguous NPU INT32");
+    c10::DeviceGuard guard(peers.device());
+    check_runtime(rank, peers.numel());
+    const auto stream = c10_npu::getCurrentNPUStream(peers.device().index()).stream(false);
+    at_npu::native::OpCommand::RunOpApi("HyperMulticoreHotReplicaMtePeers", [=]() -> int {
+        return hmc_hot_replica_mte_peers(stream, static_cast<uint8_t*>(peers.data_ptr()));
+    });
+}
+
 static void prefetch(torch::Tensor home, torch::Tensor slots, torch::Tensor copies,
                      int64_t rank, int64_t ranks, int64_t blocks, bool publish, bool finish) {
     check_runtime(rank, ranks);
@@ -107,5 +118,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
                pybind11::arg("blocks"),
                pybind11::arg("publish") = true, pybind11::arg("finish") = true);
     module.attr("native_home_gradient") = true;
+    module.def("mte_peers", &mte_peers);
     module.def("runtime_state", []() { return std::vector<int>{aclshmem_my_pe(), aclshmem_n_pes()}; });
 }

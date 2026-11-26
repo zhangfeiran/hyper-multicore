@@ -67,10 +67,11 @@ class MegaMoeTuningOptions:
             integer multiple of 128, excluding bool.
         combine_split: Combine tile rows, with the same constraints as dispatch.
         scheduler: Optional per-instance math scheduling and lowering options.
-        expert_placement: A3 BF16 HotReplica planner for a multi-rank EP group.
-            None keeps experts on their home ranks.
-        replica_bank: "shared" leases one compatible bank across serial layers.
-            "dedicated" reserves a separate bank for this executor's resource group.
+        expert_placement: Experimental HotReplica planner for multi-rank EP.
+            Supports A3/A5 BF16 and A5 MXFP8 Push. None keeps experts on home ranks.
+        replica_bank: "shared" leases one compatible bank across serial
+            layers and "dedicated" reserves a bank for this resource group.
+            MXFP8 shares weight prefetch buffers and the FP32 gradient bank.
     """
 
     dispatch_mode: Literal["push", "pull"] = "push"

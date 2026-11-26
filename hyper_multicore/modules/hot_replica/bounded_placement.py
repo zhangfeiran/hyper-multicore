@@ -164,6 +164,7 @@ class BoundedPlacement:
         self, hidden: torch.Tensor, ids: torch.Tensor, counts: torch.Tensor, source_rows: list[int],
         inverse: torch.Tensor | None, prices: ReplicaCost, snapshot: PlacementWire | None = None,
         *, host_rows: list[list[int]] | None = None, limit: int | None = None, resident: int | None = None,
+        peer_edges: tuple = (),
     ) -> _LoweredPlacement | None:
         """Choose and materialize one plan for the agreed counts and receive budget."""
         spec = self.spec
@@ -175,11 +176,11 @@ class BoundedPlacement:
             wire = counts.cpu().numpy()
 
         stream = torch.npu.current_stream(hidden.device) if hidden.device.type == "npu" else None
-        key = (prices, hidden.device, stream, torch.is_inference_mode_enabled(), limit, resident)
+        key = (prices, hidden.device, stream, torch.is_inference_mode_enabled(), limit, resident, peer_edges)
         if self.key != key or not np.array_equal(self.snapshot, wire):
             plan = select_replica_plan(
                 wire, self.config, nodes=self.nodes, prices=prices, cross_node_cost=self.cross_node_cost,
-                limit=limit, resident=resident,
+                limit=limit, resident=resident, peer_edges=peer_edges,
             )
             maximum = max(source_rows) // spec.top_k
             geometry = None if plan is None else render_geometry(

@@ -20,7 +20,7 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -44,6 +44,7 @@ from hyper_multicore.modules.mega_moe.route import (
     _publish_staged_pull,
     _read_cached_route,
     _read_dynamic_route,
+    _read_packed_dynamic_route,
     _resolve_counts,
     _upload_route_tensor,
     _validate_dynamic_rows,
@@ -584,7 +585,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         return torch.tensor(rows, dtype=dtype)
 
     @staticmethod
-    def _reference(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int, int, bool]:
+    def _reference(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int, int, bool, bool]:
         """Use tensor reductions to independently check the Host list implementation."""
         counts = payload[:, 3:]
         loads = counts.reshape(spec.ep_size, spec.ep_size, spec.local_experts).sum((0, 2))
@@ -592,7 +593,8 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         schedule = max(128, (maximum_tokens + 127) // 128 * 128)
         first = spec.rank_id * spec.local_experts
         incoming = counts[:, first:first + spec.local_experts].sum(0)
-        return max(1, int(loads[spec.rank_id])), schedule, int(loads.max()), bool((incoming > 0).all())
+        capture = bool((payload[:, 2] & route_module._TENSOR_DUMP_MASK).any())
+        return max(1, int(loads[spec.rank_id])), schedule, int(loads.max()), bool((incoming > 0).all()), capture
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
@@ -612,6 +614,18 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                         self.assertEqual(
                             _read_dynamic_route(payload, spec)[0], self._reference(payload, spec)
                         )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_packed_summary_falls_back_when_the_launch_cannot_fit(self) -> None:
+        """Leave separate summary and offsets available when all AIV workers are in use."""
+        spec = replace(self._spec(768), architecture=3510, precision="mxfp8")
+        wire = self._payload(spec.num_experts, torch.int32)
+        with (patch.object(route_module, "_packed_route_ub", return_value=192 * 1024),
+              patch.object(route_module.multicore_ops, "route_offsets_and_summary", return_value=(None, None, None))
+              as prepare):
+            self.assertIsNone(_read_packed_dynamic_route(wire, spec, 0))
+        prepare.assert_called_once_with(wire, spec.rank_id, 192 * 1024, spec.hidden_size)
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"

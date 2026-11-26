@@ -158,9 +158,10 @@ class MegaMoeExperts(MulticoreModule):
                 None uses after-FC2 probability weighting and native partial dW.
             tuning_options: Public experimental tuning controls, imported from
                 ``hyper_multicore.experimental``. None selects the default policy.
-                Options are validated and copied into the instance configuration;
-                An expert_placement planner enables A3 BF16 MTE Push or Pull on a
-                multi-rank EP group. Pull requires a wheel with runtime-row GET support.
+                Options are validated and copied into the instance configuration.
+                An expert_placement planner enables A3/A5 BF16 or A5 MXFP8 Push
+                expert replicas on a multi-rank EP group. A3 BF16 Pull requires
+                a wheel with runtime-row GET support.
 
         Numerical choices and tuning options are fixed for this instance.
         Construct another executor to change them.
@@ -181,10 +182,13 @@ class MegaMoeExperts(MulticoreModule):
         cross_node_cost = None
         receive_capacity_percent = None
         if planner is not None:
-            if precision != "bf16":
-                raise ValueError("HotReplica requires BF16 precision")
             from ..hot_replica.planner import HotReplicaPlanner, replica_slot_budget  # pylint: disable=import-outside-toplevel
 
+            if precision == "mxfp8":
+                if tuning.dispatch_mode != "push" or type(planner) is not HotReplicaPlanner:
+                    raise ValueError("MXFP8 HotReplica requires Push and the built-in planner")
+                if numerics.partial_weight_grad_dtype != "float32":
+                    raise ValueError("MXFP8 HotReplica requires float32 partial weight gradients")
             if ep_size <= 1:
                 raise ValueError("HotReplica requires an explicit EP group with more than one rank")
             if isinstance(planner, HotReplicaPlanner):
@@ -392,6 +396,8 @@ class MegaMoeExperts(MulticoreModule):
         if self.precision == "mxfp8":
             try:
                 self._backend.validate_weights(self, expert_weights, hidden_states)
+                if self._planner is not None and (weight1.dtype != torch.float32 or weight2.dtype != torch.float32):
+                    raise ValueError("MXFP8 HotReplica requires FP32 expert roots for FP32 parameter gradients")
             except (AttributeError, TypeError, ValueError, RuntimeError) as error:
                 raise _InvalidExpertWeights(str(error)) from error
             if self._resource_group.resources is None:
@@ -509,7 +515,7 @@ class MegaMoeExperts(MulticoreModule):
         resources = self._get_execution_resources(hidden_flat)
         with prepare_expert_invocation(
             hidden_flat, topk_ids, topk_weights, tokens_per_expert, weights, resources,
-            weight_error=weight_error, planner=self._planner,
+            weight_error=weight_error, planner=self._planner, training=self.training,
         ) as route:
             return self._backend.forward(
                 self, hidden_states, hidden_flat, topk_ids, topk_weights, weights, resources, route,

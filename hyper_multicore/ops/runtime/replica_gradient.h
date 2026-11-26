@@ -118,6 +118,18 @@ __aicore__ inline void StoreReplicaCompletion(GM_ADDR address, int32_t epoch) {
   AscendC::PipeBarrier<PIPE_ALL>();
 }
 
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+__aicore__ inline void WaitReplicaCompletion(GM_ADDR address, int32_t epoch) {
+  AscendC::GlobalTensor<int32_t> flag;
+  flag.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(address), 1);
+  __gm__ volatile int32_t *value = reinterpret_cast<__gm__ volatile int32_t *>(address);
+  do {
+    AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                      AscendC::DcciDst::CACHELINE_OUT>(flag);
+  } while (*value < epoch);
+}
+#endif
+
 }  // namespace MulticoreRuntime
 
 #endif  // HYPER_MULTICORE_MULTICORE_REPLICA_GRADIENT_H

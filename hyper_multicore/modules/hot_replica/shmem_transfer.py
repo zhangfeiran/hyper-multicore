@@ -34,6 +34,7 @@ from hyper_multicore import _collective, shmem
 from hyper_multicore.shmem import _lifecycle
 
 from .bank_ops import prefetch_banks, reduce_banks
+from .capability import a5_mte_edges, unreachable_replica_edge
 from .placement import _LoweredPlacement
 from .pipeline import ReplicaPipeline, projection_shapes
 
@@ -101,6 +102,7 @@ class SharedExpertPool:
         }
         self.capacity_floor = local_experts
         self.expert_weight_layout = layout
+        self.requires_mte_edges = False
         self.pipeline = ReplicaPipeline(self) if pipeline else None
 
     @property
@@ -414,6 +416,8 @@ class ExpertWeightBinding:
     token: object = field(default_factory=object)
     transfers: tuple = ()
     gradient_storage: tuple = ()
+    gradient_outputs: tuple = ()
+    prefetch_table: torch.Tensor | None = None
     execution_mode: InitVar[ReplicaExecutionMode] = ReplicaExecutionMode.STAGED
     fused_slots: InitVar[int | None] = None
 
@@ -454,6 +458,11 @@ class ExpertWeightBinding:
         self, weights: tuple[torch.Tensor, ...], *, backward: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Lease reusable banks and publish this graph's saved owner weights."""
+        if self.pool.requires_mte_edges:
+            edges = a5_mte_edges(weights[0], self.pool.root)
+            edge = unreachable_replica_edge(self.placement, self.pool.local_experts, edges)
+            if edge is not None:
+                raise RuntimeError(f"A5 BF16 replica edge {edge} lacks bidirectional MTE in the current SHMEM heap")
         self.pool.claim(self.layout)
         try:
             if self.fused:
@@ -492,6 +501,8 @@ class ExpertWeightBinding:
 
     def save_snapshot(self, weights: tuple[torch.Tensor, ...]) -> None:
         """Retain borrowed weights for the reentrant checkpoint path."""
+        if self.fused and self.pool.pipeline.device_prefetch:
+            return
         start = 0 if self.fused else self.pool.local_experts
         used = self.placement.published_slots
         stop = start + (self.placement.borrowed_capacity if used is None else used)
@@ -508,7 +519,7 @@ class ExpertWeightBinding:
         if self.fused_gradients:
             stats = self.pool.statistics
             stats["fused_gradient_returns"] = stats.get("fused_gradient_returns", 0) + 1
-            return gradients
+            return self.gradient_outputs or gradients
         if self.fused:
             # Both dX projections for every populated guest have waited for
             # their incoming weights. Drain outgoing copies on the same

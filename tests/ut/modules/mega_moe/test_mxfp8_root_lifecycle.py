@@ -2,6 +2,11 @@
 import pytest
 import torch
 
+from hyper_multicore import MegaMoeExperts
+from hyper_multicore.experimental import HotReplicaPlanner, MegaMoeTuningOptions
+from hyper_multicore.modules.mega_moe import module
+from hyper_multicore.modules.mega_moe.numerics import MegaMoeNumericsOptions
+
 from hyper_multicore.modules.mega_moe.backends.mxfp8.autograd import MXFP8ForwardState, execute_mxfp8_experts
 from hyper_multicore.modules.mega_moe.backends.mxfp8.weights import MXFP8ExpertWeightBinding
 
@@ -13,6 +18,33 @@ def physical(root, shape):
     root.col_scale = torch.empty((e, m // 64, n, 2), dtype=torch.uint8)
     root.row_data = torch.empty(shape, dtype=torch.float8_e4m3fn)
     root.row_scale = torch.empty((e, m, n // 64, 2), dtype=torch.uint8)
+
+
+def test_hot_replica_requires_fp32_roots_and_ordinary_mx_accepts_bf16(monkeypatch):
+    monkeypatch.setattr(module, "_resolve_ep_size", lambda _group: 2)
+    monkeypatch.setattr(torch.Tensor, "is_npu", property(lambda _tensor: True))
+    args = dict(hidden_size=64, intermediate_size=64, num_experts=2, top_k=1, precision="mxfp8")
+    ordinary = MegaMoeExperts(**args)
+    placed = MegaMoeExperts(
+        **args, numerics_options=MegaMoeNumericsOptions(partial_weight_grad_dtype="float32"),
+        tuning_options=MegaMoeTuningOptions(expert_placement=HotReplicaPlanner(replica_slots_per_rank=1)),
+    )
+    hidden = torch.empty(0, 64, dtype=torch.bfloat16)
+    shapes = ((1, 64, 128), (1, 64, 64))
+    try:
+        for dtype in (torch.bfloat16, torch.float32):
+            roots = tuple(torch.empty(shape, dtype=dtype) for shape in shapes)
+            for root, shape in zip(roots, shapes):
+                physical(root, shape)
+            ordinary._validate_tensors(hidden, roots)
+            if dtype == torch.float32:
+                placed._validate_tensors(hidden, roots)
+            else:
+                with pytest.raises(ValueError, match="FP32 expert roots"):
+                    placed._validate_tensors(hidden, roots)
+    finally:
+        ordinary.close()
+        placed.close()
 
 
 def test_missing_backward_storage_reports_required_axis():

@@ -25,7 +25,8 @@ import sysconfig
 
 def cann_includes(cann: Path, source: Path, sdk: Path) -> list[str]:
     """Use the same CANN and private SHMEM SDK as the enclosing native build."""
-    paths = [source.parent, sdk / "include", sdk / "include/device", sdk / "src", sdk / "src/device"]
+    paths = [source.parent, source.parents[2] / "shmem/ccsrc", sdk / "include", sdk / "include/device",
+             sdk / "src", sdk / "src/device"]
     paths += [
         cann / path
         for path in (
@@ -165,7 +166,7 @@ def main() -> None:
     parser.add_argument("--sdk-root", type=Path)
     parser.add_argument("--device-root", type=Path)
     parser.add_argument("--cxx-standard", type=int, default=17)
-    parser.add_argument("--npu-arch", type=int, choices=(2201,), default=2201)
+    parser.add_argument("--npu-arch", type=int, choices=(2201, 3510), default=2201)
     args = parser.parse_args()
     if args.phase == "planner":
         build_host_planner(args.output_dir)

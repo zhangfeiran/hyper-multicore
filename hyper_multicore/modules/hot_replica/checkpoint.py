@@ -28,6 +28,10 @@ from typing import Any, ClassVar
 import torch
 import torch.distributed as dist
 
+from ..mega_moe.route import _TENSOR_DUMP_MASK
+
+_ACTIVATION_REPLAY_BIT = 1 << 5
+
 
 @dataclass
 class ReplayRecord:
@@ -151,16 +155,18 @@ def agree_replay(
                 if (value.shape == hidden.shape and score.shape == probs.shape
                         and record.input_versions == (value._version, score._version)):
                     same_values = same_ids & (value == hidden).all() & (score == probs).all()
-                    flag += same_values.to(torch.int32).reshape(1) * 32
+                    flag += same_values.to(torch.int32).reshape(1) * _ACTIVATION_REPLAY_BIT
         else:
             flag = torch.zeros(1, dtype=torch.int32, device=hidden.device)
         gathered = flag.new_empty(spec.ep_size)
         dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
         flags = gathered.tolist()
-    first = flags[0] % 32
-    reuse = first != 0 and all(value % 32 == first for value in flags)
+    capture_weights = any(value & _TENSOR_DUMP_MASK for value in flags)
+    first = flags[0] % _ACTIVATION_REPLAY_BIT
+    reuse = first != 0 and all(value % _ACTIVATION_REPLAY_BIT == first for value in flags)
     if record is not None:
-        record.allow_activation = reuse and all(value >= 32 for value in flags)
+        reuse = reuse and record.route.dump_weights == capture_weights
+        record.allow_activation = reuse and not capture_weights and all(value & _ACTIVATION_REPLAY_BIT for value in flags)
     return reuse
 
 

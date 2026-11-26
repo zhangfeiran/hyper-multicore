@@ -198,7 +198,8 @@ class BuildChecks(unittest.TestCase):
         self.assertIn(record["id"], record["torch_so"])
         replica_calls = [call for call in commands.calls if "--phase" in call
                       and any(str(value).endswith("/hot_replica/build.py") for value in call)]
-        targets = {"arch22": ("ascend910_93", "hot_replica", "2201")}
+        targets = {"arch22": ("ascend910_93", "hot_replica", "2201"),
+                   "arch35": ("ascend950", "hot_replica_bf16_arch35", "3510")}
         expected = [(backend, target) for backend, target in targets.items()
                     if target[0] in sdks.get(backend, {}).get("soc_list", ())]
         phases = [call[call.index("--phase") + 1] for call in replica_calls]

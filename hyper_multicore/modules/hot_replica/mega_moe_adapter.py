@@ -29,9 +29,11 @@ from hyper_multicore.modules.mega_moe.heap_manager import _HeapCapacityError, _W
 from hyper_multicore.modules.mega_moe.spec import _COMMUNICATION_SPLIT, _align_capacity, _resolve_receive_capacity
 
 from ..base_planner import BasePlanner, PlacementRequest
-from ._planner.receive import receive_limit
+from ._planner.receive import ReplicaCapacityError, receive_limit
 from .bounded_placement import BoundedPlacement, PlacementWire, render_geometry, supports_bounded_placement
+from .capability import a5_mte_edges, unreachable_replica_edge
 from .checkpoint import is_checkpointing
+from .mx_gradient import MXGradientPool
 from .pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline
 from .placement import _LoweredPlacement, validate_lowered_ids, validate_quotas
 from .planner import HotReplicaPlanner, replica_slot_budget
@@ -51,7 +53,7 @@ _SHARED_BANKS = weakref.WeakKeyDictionary()
 
 
 def _get_mega_bank(
-    hidden, parent, owner, *, tokens, received, preferred_receive=None, pipeline=False,
+    hidden, parent, owner, *, tokens, received, preferred_receive=None, pipeline=False, mx_guest_slots=None,
 ):
     """Register a HotReplica allocation in the existing MegaMoE heap transaction."""
     spec = parent.spec
@@ -60,17 +62,22 @@ def _get_mega_bank(
     owner_id = id(owner) if dedicated else None
     extent = owner.bank_extent if pipeline else None
     cube_cores = spec.num_cube_cores
+    device_prefetch = pipeline and spec.architecture == 3510
     key = (spec.local_experts, spec.hidden_size, spec.intermediate_size, hidden.dtype, owner_id, extent,
            cube_cores)
+    if mx_guest_slots is not None:
+        key += (spec.ep_group, spec.expert_weight_layout, spec.transport_engine, mx_guest_slots)
     with manager.access():
         banks = _SHARED_BANKS.setdefault(manager, weakref.WeakValueDictionary())
         pool = banks.get(key)
         if pool is None or pool.closed:
-            pool = SharedExpertPool(
+            pool_type = SharedExpertPool if mx_guest_slots is None else MXGradientPool
+            pool_options = {} if mx_guest_slots is None else {"guest_slots": mx_guest_slots}
+            pool = pool_type(
                 hidden, spec.ep_group, spec.local_experts, spec.intermediate_size,
-                spec.num_cube_cores, spec.expert_weight_layout, root=manager, access=manager.access,
-                pipeline=pipeline and dedicated,
+                spec.num_cube_cores, spec.expert_weight_layout, root=manager, access=manager.access, **pool_options,
             )
+            pool.requires_mte_edges = spec.architecture == 3510 and mx_guest_slots is None
             reservation = {
                 "kind": pool.pool_kind, "layout": spec.expert_weight_layout, "local_experts": spec.local_experts,
             }
@@ -79,10 +86,11 @@ def _get_mega_bank(
                 str(hidden.dtype), spec.expert_weight_layout, cube_cores,
             )
             if pipeline:
-                if not dedicated:
-                    pool.pipeline = ReplicaPipeline(pool, shared_layouts=True)
+                pool.pipeline = ReplicaPipeline(pool, shared_layouts=not dedicated, device_prefetch=device_prefetch)
                 pool.bank_experts = extent
                 signature += (pool.bank_experts,)
+            if mx_guest_slots is not None:
+                signature += (mx_guest_slots,)
             layout = _WorkspaceLayout(pool.allocation_bytes, signature, spec.local_experts)
             added = manager.reserve(
                 ((reservation, layout),), allow_resize=True,
@@ -111,16 +119,17 @@ def _release_mega_bank(parent, owner):
     if pool is not None:
         manager = parent.heap_manager
         with manager.access():
-            pool.owners.discard(owner)
-            if not pool.owners and not pool.closed:
+            if len(pool.owners) == 1 and owner in pool.owners and not pool.closed:
                 manager.close_workspace(pool)
+            pool.owners.discard(owner)
+            owner.pool = None
 
 
 class PlacementResources:
     """Select BF16 routes and own their lazy expert bank."""
 
     def __init__(self, parent: Any, specification: dict[str, Any], shared: bool, *,
-                 bf16_partials: bool = False, rank_nodes: tuple[int, ...] = ()) -> None:
+                 bf16_partials: bool = False, a5_pipeline: bool = False, rank_nodes: tuple[int, ...] = ()) -> None:
         """Attach lazy placement resources to one existing BF16 owner."""
         self.parent = parent
         self.shared = shared
@@ -133,14 +142,14 @@ class PlacementResources:
         spec = parent.spec
         can_split_weights = supports_bounded_placement(spec)
         self.requires_fused_return = can_split_weights and spec.expert_weight_layout == "EIO"
-        supported = built_in and can_split_weights
+        supported = built_in and (can_split_weights or spec.architecture == 3510)
         self.bounded = (BoundedPlacement(spec, replica_slots_per_rank=self.replica_slots_per_rank,
                                         cross_node_cost=self.cross_node_cost,
                                         nodes=rank_nodes)
                         if supported else None)
         self.bf16_partials = False
         self.prefer_bf16_partials = False
-        self.pipeline_enabled = False
+        self.pipeline_enabled = a5_pipeline and supports_pipeline(spec, 1, bank_experts=self.bank_extent)
         self.dedicated_bank = specification.get("replica_bank") == "dedicated"
         if can_split_weights:
             fp32_partials = self._uses_fp32_partials()
@@ -192,6 +201,7 @@ class PlacementResources:
         resident = self.shared_receive_rows()
         if self.bounded is None:
             limit = receive_limit(self.receive_capacity_percent, total, spec.ep_size)
+            peer_edges = self._peer_edges(hidden)
             request = self.request(hidden, gathered, summary, total, training, checkpointing, resident, host_rows)
             placement = self._select_custom(planner, request, hidden, ids, inverse, limit,
                                             mandatory=limit is not None and summary.maximum > limit)
@@ -199,16 +209,35 @@ class PlacementResources:
             prices, limit, keep_home = planner._policy(  # pylint: disable=protected-access
                 spec.hidden_size, spec.intermediate_size, spec.num_cube_cores, training,
                 spec.transport_engine, summary.maximum, total, spec.ep_size, resident,
+                architecture=spec.architecture, rank_nodes=self.rank_nodes,
             )
             if keep_home:
                 return None
-            placement = self.bounded.select(
-                hidden, ids, gathered[:, 3:], source_rows, inverse, prices, snapshot,
-                host_rows=host_rows, limit=limit, resident=resident,
-            )
+            peer_edges = self._peer_edges(hidden)
+            try:
+                placement = self.bounded.select(
+                    hidden, ids, gathered[:, 3:], source_rows, inverse, prices, snapshot,
+                    host_rows=host_rows, limit=limit, resident=resident, peer_edges=peer_edges,
+                )
+            except ReplicaCapacityError as error:
+                if not peer_edges:
+                    raise
+                raise ReplicaCapacityError(f"{error} Permitted A5 BF16 replica edges require bidirectional MTE.") from error
         mandatory = limit is not None and summary.maximum > limit
+        if placement is not None:
+            edge = unreachable_replica_edge(placement, spec.local_experts, peer_edges)
+            if edge is not None:
+                if mandatory:
+                    raise ReplicaCapacityError(f"A5 BF16 replica edge {edge} lacks bidirectional MTE")
+                self.statistics["protocol_rejections"] = self.statistics.get("protocol_rejections", 0) + 1
+                return None
         return self.bind(hidden, placement, tokens=summary.plan_tokens,
                          mandatory=mandatory)
+
+    def _peer_edges(self, hidden):
+        if self.parent.spec.architecture == 3510:
+            return a5_mte_edges(hidden, self.parent.heap_manager)
+        return ()
 
     def _select_custom(self, planner, request, hidden, ids, inverse, limit, *, mandatory):
         """Converge bad quotas and verify that every EP rank will execute the same dispatch."""
@@ -315,6 +344,8 @@ class PlacementResources:
             slots = fused_replica_slots(spec, placement, bank_experts=extent)
             if slots:
                 return ReplicaExecutionMode.FP32_BAND, slots
+        if spec.architecture == 3510:
+            return ReplicaExecutionMode.STAGED, None
         if self.bf16_partials:
             slots = fused_replica_slots(spec, placement, bank_experts=extent, bf16_partials=True)
             if slots:
@@ -324,7 +355,7 @@ class PlacementResources:
     def _uses_fp32_partials(self):
         """Use the same partial-gradient dtype as the ordinary placed launch."""
         spec = self.parent.spec
-        return spec.partial_weight_grad_dtype == "float32"
+        return spec.architecture == 3510 or spec.partial_weight_grad_dtype == "float32"
 
     @property
     def bank_extent(self):

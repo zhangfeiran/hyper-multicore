@@ -15,6 +15,7 @@
 """Precision-independent workspace, lease and distributed resource ownership."""
 from collections.abc import Mapping
 from dataclasses import replace
+import os
 from typing import Any
 import torch
 import torch.distributed as dist
@@ -46,13 +47,15 @@ class _MegaMoeExecutionResources:
             self._validate_distributed_configuration(active_specifications)
         # Agree on optional stages before any HotReplica-only collective.
         placement = specification.get("hot_replica", False)
-        replica_bf16_partials = False
+        mx_placement = placement and self.spec.precision == "mxfp8"
+        fused_support = False
         rank_nodes = ()
         if placement:
             from hyper_multicore.modules.hot_replica.capability import require_capability  # pylint: disable=import-outside-toplevel
-            replica_bf16_partials, rank_nodes = require_capability(
+            fused_support, rank_nodes = require_capability(
                 tensor, specification["ep_group"],
-                dispatch_mode=self.spec.dispatch_mode,
+                dispatch_mode=self.spec.dispatch_mode, architecture=self.spec.architecture,
+                mx_cube_cores=self.spec.num_cube_cores if mx_placement else None,
             )
             if self.spec.architecture == 2201 and self.spec.dispatch_mode == "pull":
                 self.spec = replace(self.spec, compact_pull=True)
@@ -72,7 +75,7 @@ class _MegaMoeExecutionResources:
             def construct() -> None:
                 """Build and bind local resources before converging construction results."""
                 transport = self.spec.transport_engine
-                if transport in (None, "udma"):
+                if transport in (None, "udma") or mx_placement:
                     config = shmem.debug_state()["config"]
                     active_udma = config["data_engine"] == "mte_udma"
                     if transport == "udma" and not active_udma:
@@ -80,6 +83,8 @@ class _MegaMoeExecutionResources:
                     if transport is None:
                         transport = "udma" if active_udma else "mte"
                         self.spec = replace(self.spec, transport_engine=transport)
+                    if mx_placement and (transport != "udma" or config["udma_qp_num"] not in (8, 16, 32)):
+                        raise ValueError("MXFP8 HotReplica requires mte_udma and 8, 16 or 32 UDMA QPs")
                 if transport == "udma":
                     moe_transport.require_queue_backend()
                 self.plan = self._initial_plan(tensor)
@@ -103,10 +108,21 @@ class _MegaMoeExecutionResources:
         self._closed = False
         self._workspace_closed = False
         self.placement = None
-        if placement:
+        if mx_placement:
+            from ..hot_replica.mx_adapter import MXPlacementResources  # pylint: disable=import-outside-toplevel
+
+            self.placement = MXPlacementResources(
+                self, replica_slots_per_rank=specification.get("replica_slots_per_rank"),
+                dedicated_bank=specification.get("replica_bank") == "dedicated",
+                cross_node_cost=specification.get("cross_node_cost"),
+                receive_capacity_percent=specification.get("receive_capacity_percent"), rank_nodes=rank_nodes,
+            )
+        elif placement:
             from hyper_multicore.modules.hot_replica.mega_moe_adapter import PlacementResources  # pylint: disable=import-outside-toplevel
             self.placement = PlacementResources(
-                self, specification, shared, bf16_partials=replica_bf16_partials, rank_nodes=rank_nodes,
+                self, specification, shared, rank_nodes=rank_nodes,
+                bf16_partials=fused_support and self.spec.architecture == 2201,
+                a5_pipeline=fused_support and self.spec.architecture == 3510,
             )
 
     def _route_spec(self, experts: int | None) -> MegaMoeSpec:
@@ -171,9 +187,11 @@ class _MegaMoeExecutionResources:
                   "ep_size", "auto_tokens",
                   "precision", "transport_engine", "ready_depth", "schedule_policy", "lowering",
                   "batch_experts", "nominal_schedule", "hot_replica", "planner_key", "replica_bank")
-        # BF16 is the sole supported dtype; the literal tags also identify the protocol.
+        # Both backends exchange BF16 hidden rows. The literal tags identify the route protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout, self.spec.architecture,
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
+        if self.spec.architecture == 3510:
+            manifest = (*manifest, os.environ.get("HYPER_MULTICORE_SHMEM_UDMA_QP_NUM", "1"))
         # Resource groups must have the same order as their symmetric allocations.
         manifests = [None] * self.spec.ep_size
         dist.all_gather_object(manifests, manifest, group=self.spec.ep_group)

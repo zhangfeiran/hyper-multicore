@@ -284,6 +284,24 @@ def test_fused_backward_invalidates_a_generic_bank_generation_even_with_resident
     assert pool.generation > staged
 
 
+def test_a5_fused_bank_builds_device_weight_edges_for_both_directions():
+    bank = (torch.empty(6, 16, 32, dtype=torch.bfloat16), torch.empty(6, 16, 16, dtype=torch.bfloat16))
+    pool = SimpleNamespace(local_experts=2, ranks=2, rank=0, hidden=16, intermediate=16, blocks=8,
+                           expert_weight_layout="EIO", leased_banks=bank, generation=0, device="cpu")
+    pipeline = ReplicaPipeline(pool, device_prefetch=True)
+    pipeline.storage = torch.empty(pipeline.signal_words, dtype=torch.int32)
+    binding = SimpleNamespace(token=object(), edges=(2, (1, (1 << 64) - 1), ((1, 1, 0),)),
+                              placement=SimpleNamespace(borrowed_capacity=2))
+    with patch.object(pipeline, "_publish_weights", side_effect=AssertionError("host weight transfer")):
+        for backward in (False, True):
+            weights = pipeline.begin(tuple(t[:2] for t in bank), binding, backward)
+            assert all(w.shape[0] == 4 for w in weights)
+            payload = binding.prefetch_table.view(torch.uint64).tolist()
+            assert payload == [2, int(backward), 0, 2, pipeline.storage.data_ptr(), 512, 256, 1,
+                               1, (1 << 64) - 1, 1, 1, 0]
+            assert binding.launch[4] - binding.launch[3] == 2 * 4 * 64
+
+
 @pytest.mark.parametrize(("home", "layout"), [(4, "EOI"), (6, "EIO"), (8, "EOI")])
 def test_fused_bank_rebuilds_flags_and_restores_a_retained_binding(home, layout):
     """Restart gives the flags independent storage and the retained graph can republish weights."""

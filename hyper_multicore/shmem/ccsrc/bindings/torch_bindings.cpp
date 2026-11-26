@@ -732,6 +732,7 @@ py::object ConfigObject(const std::optional<Config> &config) {
   result["heap_size_bytes"] = config->heap_size_bytes;
   result["timeout_seconds"] = config->timeout_seconds;
   result["data_engine"] = ToString(config->data_engine);
+  result["udma_qp_num"] = config->udma_qp_num;
   result["bootstrap_endpoint_base"] = config->bootstrap_endpoint_base;
   return std::move(result);
 }

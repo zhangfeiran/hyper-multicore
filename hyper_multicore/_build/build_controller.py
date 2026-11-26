@@ -144,6 +144,8 @@ def build_framework(python: Path, identity: dict, common: Path, sdks: dict[str, 
                              run.commands, link_env)
                 validate_elf(replica_output / "_replica_host.so", identity["host_arch"], run.commands, link_env)
                 paths[replica_target[1]] = MANIFEST.hot_replica_bf16_paths(identifier, backend)
+                if backend == "arch35":
+                    paths[replica_target[1]]["kernel_pipeline"] = MANIFEST.A5_BF16_KERNEL_PIPELINE_VERSION
         with run.commands.scope("Load"):
             load_backend(python, payload, common, sdk, backend, run, selected_env, identifier)
         validate_elf(output / "hyper_multicore_shmem_torch.so", identity["host_arch"], run.commands, selected_env)

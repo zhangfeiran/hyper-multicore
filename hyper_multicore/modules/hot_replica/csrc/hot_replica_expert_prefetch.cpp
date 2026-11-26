@@ -3,6 +3,7 @@
 #include <cstdint>
 #include "acl/acl.h"
 
+#include "cann/device.h"
 #include "kernel_operator.h"  // NOLINT(build/include_subdir)
 #include "shmem.h"            // NOLINT(build/include_subdir)
 
@@ -40,6 +41,31 @@ __aicore__ inline int32_t AivWorkerIndex() {
 }
 
 }  // namespace
+
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void hmc_hot_replica_mte_peer_kernel(
+    uint64_t ffts, GM_ADDR peers) {
+    if ASCEND_IS_AIC {
+        return;
+    }
+    util_set_ffts_config(ffts);
+    const auto* state = aclshmemi_get_state();
+    GlobalTensor<int32_t> output;
+    output.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(peers), state->npes);
+    for (int32_t peer = 0; peer < state->npes; ++peer) {
+        uint64_t ub, bytes;
+        const bool reachable = hyper_multicore::shmem::cann::device::query_mte_resources(peer, ub, bytes) &&
+                               bytes >= 32 && bytes <= UINT32_MAX && state->p2p_device_heap_base[peer] != nullptr;
+        output.SetValue(peer, reachable);
+    }
+    for (int32_t peer = 0; peer < state->npes; ++peer) {
+        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(output[peer]);
+    }
+}
+
+extern "C" ASCEND_HOT_REPLICA_EXPORT int hmc_hot_replica_mte_peers(void* stream, uint8_t* peers) {
+    hmc_hot_replica_mte_peer_kernel<<<1, nullptr, stream>>>(shmemx_get_ffts_config(), peers);
+    return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
+}
 
 __aicore__ inline int32_t CollectBorrowedExperts(__gm__ int32_t* plan,
         __ubuf__ int32_t* expert_tab, __ubuf__ int32_t* slot_tab, int64_t B, int64_t E) {

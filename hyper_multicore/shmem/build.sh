@@ -212,7 +212,7 @@ function build_backend() {
         if [[ ! -s "${private_library_path}" ]]; then
             fail "EXPECTED_ARTIFACT_MISSING" "Private SHMEM library is missing: ${private_library_path}." 11
         fi
-        if ! readelf -d "${private_library_path}" | grep -Eq "\(SONAME\).*\[${private_library}\]"; then
+        if ! readelf -d "${private_library_path}" | grep -E "\(SONAME\).*\[${private_library}\]" >/dev/null; then
             fail "SHMEM_PRIVATE_SONAME_INVALID" \
                 "Private SHMEM SONAME does not match ${private_library}: ${private_library_path}." 11
         fi
