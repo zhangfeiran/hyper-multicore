@@ -77,9 +77,12 @@ def _load_native() -> None:
     with native_loading("torch") as needed:
         if not needed:
             return
-        preload_vendor_library(vendor_root)
+        vendor_library = preload_vendor_library(vendor_root)
         try:
             torch.ops.load_library(str(adapter_path))
+            configure_aclnn_vendor = getattr(torch.ops.hyper_multicore, "_configure_aclnn_vendor", None)
+            if configure_aclnn_vendor is not None:
+                configure_aclnn_vendor(str(vendor_library))
             if torch.ops.hyper_multicore.mega_moe_transport_version() != 2:
                 raise RuntimeError("adapter transport ABI mismatch; rebuild the Torch adapter")
             # Torch exposes operator alias metadata through this private schema attribute.

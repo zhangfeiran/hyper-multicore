@@ -81,8 +81,9 @@ class TestTorchOps(unittest.TestCase):
         """
         with (
             patch.object(ops, "get_multicore_paths", return_value=(Path("vendor"), Path("good.so"))),
-            patch.object(ops, "preload_vendor_library") as preload,
+            patch.object(ops, "preload_vendor_library", return_value=Path("vendor/op_api/lib/libcust_opapi.so")) as preload,
             patch.object(ops.torch.ops, "load_library") as load,
+            patch.object(ops.torch.ops.hyper_multicore, "_configure_aclnn_vendor", create=True) as configure,
             patch.object(ops.torch.ops.hyper_multicore, "mega_moe_transport_version",
                          return_value=2, create=True) as version,
             patch.object(ops.torch.ops.hyper_multicore, "mega_moe_grad", self._backward_op(), create=True) as backward,
@@ -106,6 +107,7 @@ class TestTorchOps(unittest.TestCase):
             self.backend.assert_called_once_with()
             preload.assert_called_once_with(Path("vendor"))
             load.assert_called_once_with("good.so")
+            configure.assert_called_once_with("vendor/op_api/lib/libcust_opapi.so")
             for protocol, alias, message in ((0, "a", "transport ABI"), (2, "e", "storage reuse")):
                 _loader._loaded_kinds.clear()
                 _loader._native_failure = None
