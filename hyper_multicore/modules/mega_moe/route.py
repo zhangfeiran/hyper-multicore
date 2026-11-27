@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 import torch.distributed as dist
+from torch.autograd.function import once_differentiable
 
 from hyper_multicore._device import device_ub_bytes
 from hyper_multicore._loader import load_torch_npu
@@ -1064,6 +1065,32 @@ class _EmptyTopKOutput(torch.autograd.Function):  # pylint: disable=abstract-met
         return grad_experts, grad_probabilities
 
 
+class _LegacyTopKRestore(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
+    """Use the explicit ACLNN gradients with FP32 Router probabilities on TorchNPU 2.7.1."""
+
+    @staticmethod
+    def forward(
+        ctx: Any, expert_output: torch.Tensor, mapping: torch.Tensor, probabilities: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(expert_output, mapping, probabilities)
+        return load_torch_npu().npu_moe_token_unpermute(expert_output, mapping, probs=probabilities)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor | None, None, torch.Tensor | None]:
+        expert_output, mapping, probabilities = ctx.saved_tensors
+        grad_experts = torch.empty_like(expert_output)
+        grad_probabilities = torch.empty_like(probabilities)
+        multicore_ops.mega_moe_unpermute_grad_out(
+            expert_output, gradient, mapping, probabilities, grad_experts, grad_probabilities,
+        )
+        return (
+            grad_experts if ctx.needs_input_grad[0] else None,
+            None,
+            grad_probabilities if ctx.needs_input_grad[2] else None,
+        )
+
+
 def restore_topk_output(
     expert_output: torch.Tensor,
     unpermute_mapping: torch.Tensor,
@@ -1082,8 +1109,8 @@ def restore_topk_output(
     if topk_weights.shape[0] == 0:
         # Keep both the expert backward and the empty routing-weight gradient connected.
         return _EmptyTopKOutput.apply(expert_output, topk_weights)
-    return load_torch_npu().npu_moe_token_unpermute(
-        expert_output,
-        unpermute_mapping,
-        probs=topk_weights.float().contiguous(),
-    )
+    probabilities = topk_weights.float().contiguous()
+    backend = load_torch_npu()
+    if expert_output.device.type == "npu" and backend.__version__ == "2.7.1" and torch.is_grad_enabled():
+        return _LegacyTopKRestore.apply(expert_output, unpermute_mapping, probabilities)
+    return backend.npu_moe_token_unpermute(expert_output, unpermute_mapping, probs=probabilities)
