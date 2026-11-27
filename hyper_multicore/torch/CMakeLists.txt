@@ -16,11 +16,26 @@ find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 
 hp_detect_torch_build_contract("${Python3_EXECUTABLE}" TORCH)
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/torch_cxx_standard.txt" "${TORCH_CXX_STANDARD}")
-hp_detect_op_plugin_version("${TORCH_PACKAGE_ROOT}" "${TORCH_NPU_PACKAGE_ROOT}" TORCH_OP_PLUGIN_VERSION)
 
 set(TORCH_INCLUDE_ROOT "${TORCH_PACKAGE_ROOT}/include")
 set(TORCH_NPU_INCLUDE_ROOT "${TORCH_NPU_PACKAGE_ROOT}/include")
 set(OP_PLUGIN_ROOT "${TORCH_NPU_INCLUDE_ROOT}/third_party/op-plugin")
+set(OP_PLUGIN_EXTENSION "${OP_PLUGIN_ROOT}/op_plugin/include/npu_cpp_extension.h")
+set(HMC_USE_ACLNN_BRIDGE OFF)
+if(EXISTS "${OP_PLUGIN_EXTENSION}")
+    hp_detect_op_plugin_version("${TORCH_PACKAGE_ROOT}" "${TORCH_NPU_PACKAGE_ROOT}" TORCH_OP_PLUGIN_VERSION)
+else()
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c
+                "from importlib.metadata import version; print(version('torch-npu'))"
+        OUTPUT_VARIABLE PTA_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE PTA_VERSION_STATUS)
+    if(NOT PTA_VERSION_STATUS EQUAL 0 OR NOT PTA_VERSION STREQUAL "2.7.1")
+        message(FATAL_ERROR "The active TorchNPU environment is missing ${OP_PLUGIN_EXTENSION}")
+    endif()
+    set(HMC_USE_ACLNN_BRIDGE ON)
+    message(STATUS "HyperMulticore: using the public ACLNN bridge for TorchNPU ${PTA_VERSION}")
+endif()
 set(TORCH_LINK_LIBRARIES
     "${TORCH_PACKAGE_ROOT}/lib/libc10.so"
     "${TORCH_PACKAGE_ROOT}/lib/libtorch.so"
@@ -32,7 +47,6 @@ foreach(required_path IN ITEMS
     "${TORCH_INCLUDE_ROOT}"
     "${TORCH_INCLUDE_ROOT}/torch/csrc/api/include"
     "${TORCH_NPU_INCLUDE_ROOT}"
-    "${OP_PLUGIN_ROOT}/op_plugin/include/npu_cpp_extension.h"
     ${TORCH_LINK_LIBRARIES})
     if(NOT EXISTS "${required_path}")
         message(FATAL_ERROR
@@ -92,10 +106,16 @@ foreach(utility_arch IN LISTS HP_MULTICORE_NPU_ARCHS)
 endforeach()
 hp_apply_torch_cxx_standard(
     hyper_multicore_torch "${TORCH_CXX_STANDARD}")
-# Match the active op-plugin compatibility headers.
 target_compile_definitions(hyper_multicore_torch PRIVATE
-    _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI}
-    CURRENT_VERSION=${TORCH_OP_PLUGIN_VERSION})
+    _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI})
+if(HMC_USE_ACLNN_BRIDGE)
+    target_sources(hyper_multicore_torch PRIVATE csrc/aclnn_bridge.cpp)
+    target_compile_definitions(hyper_multicore_torch PRIVATE HMC_USE_ACLNN_BRIDGE=1)
+    target_include_directories(hyper_multicore_torch PRIVATE "${CANN_ROOT}/include/aclnnop")
+    target_link_libraries(hyper_multicore_torch PRIVATE nnopbase ${CMAKE_DL_LIBS})
+else()
+    target_compile_definitions(hyper_multicore_torch PRIVATE CURRENT_VERSION=${TORCH_OP_PLUGIN_VERSION})
+endif()
 target_include_directories(hyper_multicore_torch PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${Python3_INCLUDE_DIRS}
