@@ -73,6 +73,8 @@ def prepare_expert_invocation(
         from ..hot_replica.checkpoint import agree_replay, route_record  # pylint: disable=import-outside-toplevel
 
         record, replay = route_record(resources)
+        if replay and not scheduled:
+            finish_vote = partial(agree_replay, record, hidden, ids, probs, counts, resources.spec, mask)
     if scheduled:
         from ..hot_replica.prefetch import start_replay_vote, start_wire  # pylint: disable=import-outside-toplevel
 
@@ -80,8 +82,6 @@ def prepare_expert_invocation(
             finish_vote = start_replay_vote(record, hidden, ids, probs, counts, resources, mask)
         else:
             pending = start_wire(hidden, ids, probs, counts, resources, mask)
-    elif replay:
-        finish_vote = partial(agree_replay, record, hidden, ids, probs, counts, resources.spec, mask)
 
     @contextmanager
     def consume() -> Iterator[PreparedTopKRoute]:
