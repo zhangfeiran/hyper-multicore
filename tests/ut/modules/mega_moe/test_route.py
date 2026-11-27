@@ -69,6 +69,17 @@ class TestMegaMoeRoute(unittest.TestCase):
             with self.subTest(capacity=capacity), patch.object(route_module, "device_ub_bytes", return_value=capacity):
                 self.assertEqual(_packed_route_ub(wire, spec), expected)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_stock_torch_npu_uses_separate_push_counting(self) -> None:
+        """Use the existing histogram and permutation on stock TorchNPU 2.7.1."""
+        hidden = SimpleNamespace(device=SimpleNamespace(type="npu"), shape=(8, 4))
+        spec = replace(self._spec(), dispatch_mode="push")
+        for version, fused in (("2.7.1", False), ("2.7.1.post4", True)):
+            with self.subTest(version=version), patch.object(
+                route_module, "load_torch_npu", return_value=SimpleNamespace(__version__=version),
+            ):
+                self.assertEqual(route_module._can_fuse_count(hidden, spec, None), fused)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
