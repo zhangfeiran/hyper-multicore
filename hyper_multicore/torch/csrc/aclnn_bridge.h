@@ -52,6 +52,7 @@ using AclObject = std::unique_ptr<T, AclDeleter<T, Destroy>>;
 class AclnnArguments {
  public:
   explicit AclnnArguments(c10_npu::NPUStream stream) : stream(stream) {}
+  ~AclnnArguments() { executor.reset(); }  // Release an unsubmitted executor before its descriptors.
 
   aclTensor *Convert(const at::Tensor &tensor);
   aclTensor *Convert(const c10::optional<at::Tensor> &tensor);
