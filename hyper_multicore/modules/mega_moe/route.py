@@ -259,7 +259,7 @@ def _permute_and_count(hidden: torch.Tensor, ids: torch.Tensor, spec: MegaMoeSpe
 
 
 def _can_fuse_count(hidden: torch.Tensor, spec: MegaMoeSpec, supplied_counts) -> bool:
-    # Stock 2.7.1's MoeInitRoutingV3 binding can return an invalid workspace size.
+    # Stock 2.7.1 can call MoeInitRoutingV3 without the required scale tensor.
     return (hidden.device.type == "npu" and spec.dispatch_mode == "push" and
             supplied_counts is None and hidden.shape[0] > 0 and load_torch_npu().__version__ != "2.7.1")
 
