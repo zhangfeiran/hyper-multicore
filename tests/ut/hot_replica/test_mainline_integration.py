@@ -502,6 +502,7 @@ def test_checkpoint_converges_weight_errors_before_building_routes(monkeypatch, 
 
 
 @pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("scheduled", [False, True], ids=["immediate", "scheduled"])
 @pytest.mark.parametrize(("change_counts", "invalid", "non_reentrant"), [
     (lambda counts: counts.add_(1), False, True),
     (lambda counts: counts.add_(1), False, False),
@@ -510,8 +511,12 @@ def test_checkpoint_converges_weight_errors_before_building_routes(monkeypatch, 
     (lambda counts: counts.float(), True, True),
     (lambda counts: torch.empty_like(counts, device="meta"), True, True),
 ], ids=["different", "reentrant-fallback", "omitted", "shape", "dtype", "device"])
-def test_checkpoint_replay_agrees_before_changing_layout(monkeypatch, rank, change_counts, invalid, non_reentrant):
+def test_checkpoint_replay_agrees_before_changing_layout(
+    monkeypatch, rank, scheduled, change_counts, invalid, non_reentrant,
+):
     """Keep non-reentrant replay on its original placement and converge invalid metadata."""
+    from hyper_multicore.modules.hot_replica import prefetch
+
     monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "stream")
     hidden, probs, ids = torch.ones(1, 2), torch.ones(1, 2), torch.tensor([[0, 1]])
     counts = torch.ones(2, dtype=torch.int32)
@@ -528,6 +533,16 @@ def test_checkpoint_replay_agrees_before_changing_layout(monkeypatch, rank, chan
     prepare = Mock(return_value=route.PreparedTopKRoute(hidden, ids, physical_counts, physical_counts, object()))
     monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
     monkeypatch.setattr(invocation, "prepare_topk_route", prepare)
+    if scheduled:
+        def stage(flag, spec, _stream):
+            host = flag.new_empty((spec.ep_size, 1))
+            gather(host.flatten(), flag)
+            return SimpleNamespace(host=host, ready=Mock())
+
+        monkeypatch.setattr(prefetch, "_control_stream", lambda *_: "control")
+        monkeypatch.setattr(prefetch, "_gather_to_host", stage)
+        monkeypatch.setattr(torch.npu, "stream", lambda _: nullcontext())
+        monkeypatch.setattr(torch.Tensor, "record_stream", lambda *_: None)
     tape = replay.ReplayCheckpoint(lambda: 1)
     forward, recompute = tape.contexts() if non_reentrant else (tape.scope(False), tape.scope(True))
     weights = hidden, hidden
@@ -541,9 +556,18 @@ def test_checkpoint_replay_agrees_before_changing_layout(monkeypatch, rank, chan
         error = pytest.raises(ValueError, match="tokens_per_expert")
     elif non_reentrant:
         error = pytest.raises(RuntimeError, match="original expert layout")
-    with recompute, error, invocation.prepare_expert_invocation(
-            hidden, ids, probs, current_counts, weights, resources):
-        pass
+    with recompute, error:
+        pending = invocation.prepare_expert_invocation(
+            hidden, ids, probs, current_counts, weights, resources, scheduled=scheduled,
+        )
+        if scheduled:
+            gather.assert_called_once()
+            prepare.assert_called_once()
+        # A nested scheduling callback may have a different checkpoint scope when it consumes the vote.
+        other_scope = (replay.ReplayCheckpoint(lambda: 1).scope(True, non_reentrant=not non_reentrant)
+                       if scheduled else nullcontext())
+        with other_scope, pending:
+            pass
     gather.assert_called_once()
     assert prepare.call_count == (1 if non_reentrant else 2)
     assert stats == {"route_replays": 0, "route_replay_misses": int(not non_reentrant)}

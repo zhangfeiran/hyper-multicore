@@ -15,6 +15,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 """Shared error convergence, source leases and dynamic MX plan bounds."""
 from collections import OrderedDict
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -22,7 +23,7 @@ import pytest
 import torch
 
 from hyper_multicore.modules.mega_moe import invocation
-from hyper_multicore.modules.mega_moe.route import _INVALID_WEIGHT_MASK
+from hyper_multicore.modules.mega_moe.route import _INVALID_COUNTS_MASK, _INVALID_WEIGHT_MASK
 from hyper_multicore.modules.mega_moe.backends.mxfp8 import backend
 from hyper_multicore.modules.mega_moe.backends.mxfp8.graph import build_mxfp8_runtime
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -80,3 +81,62 @@ def test_mx_plan_cache_distinguishes_committed_token_coverage():
         assert small.forward.graph.get_op('dispatch').task_num < large.forward.graph.get_op('dispatch').task_num
         with pytest.raises(ValueError, match='committed'):
             resources.plan_for_capacity(8192, 'cpu', tokens=2048)
+
+
+def test_scheduled_routes_start_before_either_workspace_is_used(monkeypatch):
+    """Stage both masks and retain separate receipts, including a failing second read."""
+    from hyper_multicore.modules.hot_replica import prefetch
+
+    spec = SimpleNamespace(auto_tokens=True, dispatch_mode="push", ep_size=2, num_experts=4)
+    resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=Mock())
+    resources.placement.uses_placement_wire.return_value = True
+    first, second = Mock(), Mock()
+    first.payload = second.payload = torch.zeros(7)
+    second.snapshot.side_effect = ValueError("bad peer weight")
+    start = Mock(side_effect=[first, second])
+    monkeypatch.setattr(prefetch, "start_wire", start)
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _: "compute")
+    finish = Mock(return_value=object())
+    monkeypatch.setattr(invocation, "_prepare_placed_route", finish)
+    h = torch.ones(1, 2, requires_grad=True)
+    ids, probs = torch.zeros(1, 1, dtype=torch.int32), torch.ones(1, 1, requires_grad=True)
+    args = (h, ids, probs, None, (h, h), resources)
+    u = invocation.prepare_expert_invocation(*args, planner=object(), scheduled=True)
+    g = invocation.prepare_expert_invocation(*args, planner=object(), scheduled=True, weight_error=True)
+    assert [call.args[-1] for call in start.call_args_list] == [31, _INVALID_WEIGHT_MASK]
+    resources.workspace.wait_for_reuse.assert_not_called()
+    first.snapshot.assert_not_called()
+    second.snapshot.assert_not_called()
+    with u as routed:
+        assert routed is finish.return_value
+        assert finish.call_args.kwargs["snapshot"] is first.snapshot.return_value
+    with pytest.raises(ValueError, match="bad peer weight"), g:
+        pytest.fail("a rejected route may not start the expert kernel")
+    finish.assert_called_once()
+
+
+def test_scheduled_route_exchanges_invalid_supplied_counts(monkeypatch):
+    """Report a wrong-device histogram in the wire before any rank prepares experts."""
+    from hyper_multicore.modules.hot_replica import prefetch
+
+    spec = SimpleNamespace(auto_tokens=True, hidden_size=2, top_k=1, num_experts=2)
+    resources = SimpleNamespace(spec=spec)
+    hidden, probs = torch.ones(1, 2), torch.ones(1, 1)
+    ids = torch.zeros(1, 1, dtype=torch.int32)
+    counts = torch.ones(2, dtype=torch.int32, device="meta")
+    record_stream = Mock()
+    exchange = Mock()
+    monkeypatch.setattr(prefetch, "_control_stream", lambda *_: "control")
+    monkeypatch.setattr(prefetch, "_gather_to_host", exchange)
+    monkeypatch.setattr(torch.npu, "stream", lambda _: nullcontext())
+    monkeypatch.setattr(torch.Tensor, "record_stream", record_stream)
+
+    result = prefetch.start_wire(hidden, ids, probs, counts, resources, 1)
+
+    assert result is exchange.return_value
+    record_stream.assert_called_once_with("control")
+    exchange.assert_called_once()
+    payload, bound_spec, stream = exchange.call_args.args
+    assert bound_spec is spec and stream == "control"
+    expected = torch.tensor([0, 1, 1 | _INVALID_COUNTS_MASK, 0, 0], dtype=torch.int32)
+    torch.testing.assert_close(payload, expected)

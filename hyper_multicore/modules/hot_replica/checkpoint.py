@@ -196,6 +196,19 @@ def agree_replay(
     counts: torch.Tensor | None, spec: Any, mask: int,
 ) -> bool:
     """Agree across EP on exact routing, activation validity and guest snapshots."""
+    flag, non_reentrant = local_replay_vote(record, hidden, ids, probs, counts, spec, mask)
+    with torch.no_grad():
+        gathered = flag.new_empty(spec.ep_size)
+        dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
+        flags = gathered.tolist()
+    return resolve_replay_vote(record, flags, non_reentrant=non_reentrant)
+
+
+def local_replay_vote(
+    record: ReplayRecord | None, hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
+    counts: torch.Tensor | None, spec: Any, mask: int,
+) -> tuple[torch.Tensor, bool]:
+    """Compute the vote on the caller's stream and capture its replay policy."""
     scope = _ACTIVE.get()
     assert scope is not None
     if counts is not None:
@@ -209,16 +222,18 @@ def agree_replay(
             flag = _replay_vote(record, hidden, ids, probs, counts, mask)
         else:
             flag = torch.full((1,), invalid, dtype=torch.int32, device=hidden.device)
-        gathered = flag.new_empty(spec.ep_size)
-        dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
-        flags = gathered.tolist()
+    return flag, scope.non_reentrant
+
+
+def resolve_replay_vote(record: ReplayRecord | None, flags: list[int], *, non_reentrant: bool) -> bool:
+    """Use the same group decision for synchronous and staged agreements."""
     route_mask = ~(_REPLAY_ACTIVATION_MASK | _REPLAY_GUEST_MASK)
     first = flags[0] & route_mask
     reuse = first != 0 and not first & _INVALID_ROUTE_INPUT_MASK and all(
         (value & route_mask) == first for value in flags)
     if not reuse:
         _reject_invalid_route_inputs(flags)
-        if scope.non_reentrant:
+        if non_reentrant:
             raise RuntimeError("Non-reentrant MegaMoe checkpoint could not replay its original expert layout "
                                "on all EP ranks")
     if record is not None:
