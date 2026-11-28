@@ -397,6 +397,7 @@ def test_paired_routes():
     from torch.utils.checkpoint import set_checkpoint_early_stop
 
     from hyper_multicore.modules.hot_replica import prefetch
+    from hyper_multicore.modules.hot_replica.checkpoint import _ACTIVE
 
     rank = int(os.environ["LOCAL_RANK"])
     torch_npu.npu.set_device(rank)
@@ -427,11 +428,14 @@ def test_paired_routes():
 
         prefetch._gather_to_host = track_gather
 
-        def run(staged, pair_votes=False):
+        def run(staged, pair_votes=False, reorder_second=False):
             def pair(*inputs):
                 def call(branch, **options):
                     h, p, gate_up, down = inputs[4 * branch:4 * branch + 4]
-                    return experts[branch](h, ids[branch], p, expert_weights=(gate_up, down), **options)
+                    topk = ids[branch]
+                    if reorder_second and rank == 0 and branch == 1 and _ACTIVE.get().replay:
+                        topk = topk.flip(-1).contiguous()
+                    return experts[branch](h, topk, p, expert_weights=(gate_up, down), **options)
 
                 if not staged:
                     return call(0), call(1)
@@ -469,6 +473,13 @@ def test_paired_routes():
             assert [width for width in staged_widths if width <= 2] == widths
             for actual, expected in zip(staged, serial, strict=True):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        try:
+            run(True, pair_votes=True, reorder_second=True)
+        except RuntimeError as error:
+            if "could not replay its original expert layout" not in str(error):
+                raise
+        else:
+            raise AssertionError("The second replay vote missed a rank-local change to the Top-K order")
         for expert in experts:
             expert.close()
     finally:
