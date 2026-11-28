@@ -169,6 +169,14 @@ def agree_replay(
     counts: torch.Tensor | None, spec: Any, mask: int,
 ) -> bool:
     """Agree across EP on exact routing and activation validity."""
+    flag = local_replay_vote(record, hidden, ids, probs, counts, spec, mask)
+    gathered = flag.new_empty(spec.ep_size)
+    dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
+    return resolve_replay_vote(record, gathered.tolist())
+
+
+def local_replay_vote(record, hidden, ids, probs, counts, spec, mask):
+    """Compute the existing vote on the caller's computation stream."""
     scope = _ACTIVE.get()
     assert scope is not None
     if counts is not None:
@@ -179,12 +187,14 @@ def agree_replay(
     invalid = mask & _INVALID_ROUTE_INPUT_MASK
     with torch.no_grad():
         if not invalid and _can_replay(record, ids, counts, mask, scope):
-            flag = _replay_vote(record, hidden, ids, probs, counts, mask)
-        else:
-            flag = torch.full((1,), invalid, dtype=torch.int32, device=hidden.device)
-        gathered = flag.new_empty(spec.ep_size)
-        dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
-        flags = gathered.tolist()
+            return _replay_vote(record, hidden, ids, probs, counts, mask)
+        return torch.full((1,), invalid, dtype=torch.int32, device=hidden.device)
+
+
+def resolve_replay_vote(record, flags):
+    """Apply the same replay decision for immediate and scheduled consumption."""
+    scope = _ACTIVE.get()
+    assert scope is not None
     route_mask = ~_REPLAY_ACTIVATION_MASK
     first = flags[0] & route_mask
     reuse = first != 0 and not first & _INVALID_ROUTE_INPUT_MASK and all(
