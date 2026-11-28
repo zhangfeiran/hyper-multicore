@@ -15,6 +15,21 @@
 #ifndef HYPER_MULTICORE_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
 #define HYPER_MULTICORE_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
 
+#ifdef HMC_USE_ACLNN_BRIDGE
+
+#include "aclnn_bridge.h"
+
+#define HYPER_EXEC_NPU_CMD_EXT(aclnn_api, ...)                                      \
+  do {                                                                            \
+    static const auto entry = ::hyper_multicore::ResolveAclnn(                     \
+        #aclnn_api, #aclnn_api "GetWorkspaceSize");                                 \
+    ::hyper_multicore::EnqueueAclnn(#aclnn_api, entry,                              \
+        reinterpret_cast<decltype(&aclnn_api##GetWorkspaceSize)>(entry.prepare),   \
+        __VA_ARGS__);                                                             \
+  } while (false)
+
+#else
+
 #include <mutex>
 
 #include "op_plugin/include/npu_cpp_extension.h"
@@ -73,5 +88,7 @@ class CachedOpApiResolver final {
       EXEC_NPU_CMD_V1_EXT(aclnn_api, __VA_ARGS__);                                   \
     }                                                                                \
   } while (false)
+
+#endif
 
 #endif  // HYPER_MULTICORE_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
