@@ -72,11 +72,11 @@ def prepare_expert_invocation(
     finish_vote, pending = None, None
     if placement is not None:
         from hyper_multicore.modules.hot_replica.checkpoint import (  # pylint: disable=import-outside-toplevel
-            forward_plan_replay_mask, route_record,
+            forward_route_replay_mask, route_record,
         )
 
         record, replay = route_record(resources, executor)
-        mask = forward_plan_replay_mask(record, hidden, ids, probs, counts, mask)
+        mask = forward_route_replay_mask(record, hidden, ids, probs, counts, mask)
     direct_replay = replay and bool(mask & _FORWARD_ROUTE_REPLAY_MASK)
     if scheduled and not direct_replay:
         from hyper_multicore.modules.hot_replica.prefetch import start_replay_vote, start_wire  # pylint: disable=import-outside-toplevel
@@ -144,7 +144,7 @@ def _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace,
     stats["route_replays"] += 1
     direct_replay = bool(record.autograd_mask & _FORWARD_ROUTE_REPLAY_MASK)
     if direct_replay:
-        stats["forward_plan_replays"] = stats.get("forward_plan_replays", 0) + 1
+        stats["forward_router_replays"] = stats.get("forward_router_replays", 0) + 1
     route = record.route
     if tensor_dump:
         record.allow_activation = False

@@ -605,7 +605,7 @@ def _reject_invalid_route_inputs(flags: list[int]) -> None:
         raise ValueError("tokens_per_expert must be an int32 or int64 histogram of shape (num_experts,) "
                          "on the route tensor device on all EP ranks")
     if any(flag & _INVALID_FORWARD_ROUTE_REPLAY_MASK for flag in flags):
-        raise ValueError("Forward plan replay requires a bound expert executor, a parameter version, "
+        raise ValueError("Forward router replay requires a bound router and expert executor, a parameter version, "
                          "and omitted tokens_per_expert on all EP ranks")
 
 
@@ -617,7 +617,7 @@ def _validate_route_flags(rows: list[list[int]]) -> None:
         if any((row[2] ^ flags) & _TENSOR_DUMP_MASK for row in rows):
             raise RuntimeError("MegaMoe Tensor Dump mode differs across EP ranks")
         if any((row[2] ^ flags) & _FORWARD_ROUTE_REPLAY_MASK for row in rows):
-            raise RuntimeError("MegaMoe forward plan replay mode differs across EP ranks")
+            raise RuntimeError("MegaMoe forward router replay mode differs across EP ranks")
         raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
 
 

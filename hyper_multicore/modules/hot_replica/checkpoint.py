@@ -35,6 +35,15 @@ from hyper_multicore.modules.mega_moe.route import (
 )
 
 
+@dataclass(frozen=True)
+class _RouterSelection:
+    """Keep the original ordered Top-K tensor with its router."""
+
+    owner: object
+    ids: torch.Tensor
+    version: int
+
+
 @dataclass
 class ReplayRecord:
     """Save one forward's immutable route and optionally its owned activations."""
@@ -51,6 +60,7 @@ class ReplayRecord:
     allow_activation: bool = False
     executor: object | None = None
     source_rows: int | None = None
+    router_selection: _RouterSelection | None = None
 
 
 @dataclass
@@ -60,7 +70,8 @@ class _CheckpointScope:
     same_parameters: bool
     non_reentrant: bool = False
     cursor: int = 0
-    reuse_forward_plan: bool = False
+    reuse_forward_router: bool = False
+    pending_router: _RouterSelection | None = None
 
 
 _ACTIVE: ContextVar[_CheckpointScope | None] = ContextVar("hmc_hot_replica_checkpoint", default=None)
@@ -93,13 +104,13 @@ class _ReplayContext(AbstractContextManager):
 class ReplayCheckpoint:
     """Hold one checkpoint invocation's tape across original and replay contexts."""
 
-    def __init__(self, parameter_version: Callable[[], Any], *, reuse_forward_plan: bool = False) -> None:
+    def __init__(self, parameter_version: Callable[[], Any], *, reuse_forward_router: bool = False) -> None:
         """Register the caller's logical parameter version lookup."""
         self.parameter_version = parameter_version
         self.records: list[ReplayRecord] = []
         self.forward_version = None
         self.started = False
-        self._reuse_forward_plan = reuse_forward_plan
+        self._reuse_forward_router = reuse_forward_router
 
     def contexts(self) -> tuple[AbstractContextManager, AbstractContextManager]:
         """Provide the context_fn for one non-reentrant torch checkpoint call."""
@@ -108,8 +119,8 @@ class ReplayCheckpoint:
     @contextmanager
     def scope(self, replay: bool, *, non_reentrant: bool = False) -> Iterator[None]:
         """Enter the tape before running any operator of the checkpointed block."""
-        if self._reuse_forward_plan and not non_reentrant:
-            raise ValueError("Forward plan replay requires non-reentrant checkpoint contexts")
+        if self._reuse_forward_router and not non_reentrant:
+            raise ValueError("Forward router replay requires non-reentrant checkpoint contexts")
         version = self.parameter_version()
         if not replay:
             if self.started:
@@ -118,13 +129,15 @@ class ReplayCheckpoint:
             self.forward_version = version
         state = _CheckpointScope(
             self.records, replay, version is not None and version == self.forward_version,
-            non_reentrant=non_reentrant, reuse_forward_plan=self._reuse_forward_plan,
+            non_reentrant=non_reentrant, reuse_forward_router=self._reuse_forward_router,
         )
         token = _ACTIVE.set(state)
         try:
             yield
-            if state.reuse_forward_plan and replay and state.cursor != len(state.records):
-                raise RuntimeError("Checkpoint did not consume all of its forward expert calls")
+            if state.reuse_forward_router and (
+                state.pending_router is not None or (replay and state.cursor != len(state.records))
+            ):
+                raise RuntimeError("Checkpoint did not consume all of its forward router and expert calls")
         finally:
             _ACTIVE.reset(token)
 
@@ -156,38 +169,63 @@ def is_checkpointing() -> bool:
     return _ACTIVE.get() is not None
 
 
+def forward_router_indices(owner: object, select: Callable[[], torch.Tensor]) -> torch.Tensor:
+    """Select ordered IDs in forward and read them at the same checkpoint position in replay."""
+    scope = _ACTIVE.get()
+    if scope is None or not scope.reuse_forward_router:
+        return select()
+    if scope.pending_router is not None:
+        raise RuntimeError("The previous checkpoint router did not reach its expert executor")
+    if scope.replay:
+        selection = scope.records[scope.cursor].router_selection if scope.cursor < len(scope.records) else None
+        if (not scope.same_parameters or selection is None or selection.owner is not owner
+                or selection.ids._version != selection.version):  # pylint: disable=protected-access
+            raise RuntimeError("Cannot consume the recorded forward router in checkpoint replay")
+    else:
+        ids = select()
+        selection = _RouterSelection(owner, ids, ids._version)  # pylint: disable=protected-access
+    scope.pending_router = selection
+    return selection.ids
+
+
 def route_record(owner: Any, executor: object | None = None) -> tuple[ReplayRecord | None, bool]:
     """Get the record corresponding to the current invocation in this checkpoint."""
     scope = _ACTIVE.get()
     if scope is None:
         return None, False
+    selection, scope.pending_router = scope.pending_router, None
     if not scope.replay:
-        record = ReplayRecord(owner, executor=executor if scope.reuse_forward_plan else None)
+        record = ReplayRecord(
+            owner, executor=executor if scope.reuse_forward_router else None, router_selection=selection,
+        )
         scope.records.append(record)
         return record, False
     index = scope.cursor
     scope.cursor += 1
     if index < len(scope.records) and scope.records[index].owner is owner:
         record = scope.records[index]
-        if scope.reuse_forward_plan and record.executor is not executor:
-            raise RuntimeError("Checkpoint replay did not reach the recorded expert executor")
+        if scope.reuse_forward_router and (
+            record.executor is not executor or record.router_selection is not selection
+        ):
+            raise RuntimeError("Checkpoint replay did not reach the recorded router and expert executor")
         # Reuse the saved tensors while keeping each replay's agreement local to that invocation.
         return replace(record), True
     return None, True
 
 
-def forward_plan_replay_mask(
+def forward_route_replay_mask(
     record: ReplayRecord | None, hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
     counts: torch.Tensor | None, mask: int,
 ) -> int:
     """Advertise direct replay in the forward exchange and require its recorded plan in replay."""
     scope = _ACTIVE.get()
-    if scope is None or not scope.reuse_forward_plan:
+    if scope is None or not scope.reuse_forward_router:
         return mask
     mask |= _FORWARD_ROUTE_REPLAY_MASK
     invalid = counts is not None or not scope.same_parameters
     if not scope.replay:
-        if invalid or record is None or record.executor is None:
+        assert record is not None
+        if invalid or record.executor is None or record.router_selection is None:
             mask |= _INVALID_FORWARD_ROUTE_REPLAY_MASK
         return mask
     if (invalid or mask & _INVALID_ROUTE_INPUT_MASK or record is None

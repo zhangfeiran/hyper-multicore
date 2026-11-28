@@ -210,8 +210,9 @@ forward 返回前保持专家权重有效。两组已展开的权重可能同时
 有序 Top-K IDs、执行流和诊断模式一致，并同时省略 `tokens_per_expert` 或传入相同的计数。
 接入机制见[专家布局重放](design/mega_moe_design.md#专家布局重放)。
 
-非重入框架可以选择 `ReplayCheckpoint(..., reuse_forward_plan=True)`，在重算中直接使用对应的正向落位。
-调用方保证每次专家调用在原前向和重算中的逐 token 有序 Top-K IDs 相同。
+非重入框架可以选择 `ReplayCheckpoint(..., reuse_forward_router=True)`。
+Router 用 `forward_router_indices(router, select_topk)` 取得该次 F 的有序 IDs，再从当前分数 gather 概率。
+每个记录的 Router 随后进入对应的专家执行器，重算使用同一落位。
 每个 rank 需启用相同模式，关闭 checkpoint early stop，并省略 `tokens_per_expert`。
 正向计数交换会校验各 rank 的模式。框架需要在重放契约失效时终止分布式作业。
 
