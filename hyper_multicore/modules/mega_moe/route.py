@@ -1010,11 +1010,11 @@ def _prepare_dynamic_route(
 
 def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gathered,
                           work, stream, prepare_workspace, select_placement, autograd_mask=0,
-                          reuse_placement_geometry=False, snapshot=None):
+                          reuse_placement_geometry=False, snapshot=None, *, inverse_only=None):
     """Select a per-call route between count validation and capacity commitment."""
     if work is not None:
         work.wait()
-    inverse = None if permuted is None else permuted[1]
+    inverse = inverse_only if permuted is None else permuted[1]
     if reuse_placement_geometry:
         from ..hot_replica.bounded_placement import read_placement_wire  # pylint: disable=import-outside-toplevel
 
@@ -1043,6 +1043,9 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
         if reuse_placement_geometry:
             metadata = snapshot.ordinary_metadata(spec, hidden)
         prepare_workspace(summary.plan_tokens, summary.maximum)
+        if inverse_only is not None:
+            # The ordinary path keeps the exact permutation used by the fused route.
+            permuted, _ = _permute_and_count(hidden, ids, spec)
         permuted = _materialize_route_permutation(hidden, ids, spec, workspace, permuted)
         return _finalize_dynamic_route(
             permuted, counts, summary, host_rows, metadata, None, gathered, spec,

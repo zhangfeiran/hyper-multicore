@@ -115,7 +115,7 @@ def prepare_expert_invocation(
                     route = _prepare_placed_route(
                         hidden, ids, resources.spec, resources.workspace, pending.permuted, pending.payload[3:],
                         pending.gathered, None, stream, prepare_workspace, options["select_placement"], mask,
-                        reuse_placement_geometry=True, snapshot=snapshot,
+                        reuse_placement_geometry=True, snapshot=snapshot, inverse_only=pending.inverse_only,
                     )
             if not pull and not resources.spec.auto_tokens:
                 with torch.inference_mode(False):

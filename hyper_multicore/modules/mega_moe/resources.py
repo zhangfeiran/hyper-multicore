@@ -87,13 +87,15 @@ class _MegaMoeExecutionResources:
                 self.plan = self._initial_plan(tensor)
                 reuse_saved = os.environ.get("HYPER_MULTICORE_A3_PUSH_REUSE_SAVED") == "1"
                 reuse_scratch = reuse_saved or os.environ.get("HYPER_MULTICORE_A3_PUSH_REUSE_SCRATCH") == "1"
-                reuse_scratch = (reuse_scratch and bool(placement) and self.spec.precision == "bf16"
-                                 and self.spec.architecture == 2201 and self.spec.dispatch_mode == "push"
-                                 and transport == "mte" and load_torch_npu().__version__ == "2.7.1")
+                compact_wire = os.environ.get("HYPER_MULTICORE_A3_PUSH_COMPACT_ROUTE_WIRE") == "1"
+                eligible = ((reuse_scratch or compact_wire) and bool(placement) and self.spec.precision == "bf16"
+                            and self.spec.architecture == 2201 and self.spec.dispatch_mode == "push"
+                            and transport == "mte" and load_torch_npu().__version__ == "2.7.1")
                 self.workspace = MegaMoeWorkspace(
                     shared=shared, event_experts=_workspace_event_experts(specification) if placement else None,
-                    reuse_bf16_push_scratch=reuse_scratch,
-                    reuse_bf16_push_saved=reuse_scratch and reuse_saved,
+                    reuse_bf16_push_scratch=eligible and reuse_scratch,
+                    reuse_bf16_push_saved=eligible and reuse_saved,
+                    compact_push_route_wire=eligible and compact_wire,
                 )
                 self.workspace.transport_engine = self.spec.transport_engine
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)

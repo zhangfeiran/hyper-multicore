@@ -179,6 +179,7 @@ class MegaMoeWorkspace:
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
     reuse_bf16_push_scratch: bool = False
     reuse_bf16_push_saved: bool = False
+    compact_push_route_wire: bool = False
     _local_scratch: dict[tuple[str, torch.dtype], torch.Tensor] = field(
         default_factory=dict, init=False, repr=False)
     _saved_scratch: list[tuple[torch.Tensor, ...]] = field(default_factory=list, init=False, repr=False)

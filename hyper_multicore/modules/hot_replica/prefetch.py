@@ -25,6 +25,7 @@ class PendingWire:
     host: torch.Tensor
     ready: Any
     permuted: tuple[torch.Tensor, torch.Tensor] | None = None
+    inverse_only: torch.Tensor | None = None
 
     def snapshot(self, spec, workspace, stream):
         """Wait only for this readback and publish descriptors for the consumer stream."""
@@ -34,6 +35,8 @@ class PendingWire:
         if self.permuted is not None:
             for tensor in self.permuted:
                 tensor.record_stream(stream)
+        if self.inverse_only is not None:
+            self.inverse_only.record_stream(stream)
         wire = self.host.numpy()
         previous = workspace.placement_wire
         if previous is not None and previous.stream == stream and np.array_equal(previous.wire, wire):
@@ -72,6 +75,7 @@ def start_wire(hidden, ids, probs, counts, resources, mask):
     """Queue the histogram, EP gather and pinned D2H behind the router's producer."""
     spec = resources.spec
     control = _control_stream(resources, hidden.device)
+    workspace = getattr(resources, "workspace", None)
     with torch.npu.stream(control), torch.inference_mode(False), torch.no_grad():
         _validate_topk_inputs(hidden, ids, probs)
         flat = ids.reshape(-1)
@@ -80,11 +84,17 @@ def start_wire(hidden, ids, probs, counts, resources, mask):
         if counts is not None and not mask & _INVALID_COUNTS_MASK:
             counts.record_stream(control)
         within_limit = hidden.shape[0] * max(spec.hidden_size, spec.top_k) <= 2**31 - 1
-        permuted = None
+        permuted, inverse_only = None, None
         if within_limit and _can_fuse_count(hidden, spec, counts):
-            hidden.record_stream(control)
-            permuted, counts = _permute_and_count(hidden, ids, spec)
+            if getattr(workspace, "compact_push_route_wire", False) is True:
+                # Keep the same native sorting and histogram without reading activations.
+                placeholder = hidden.new_zeros((hidden.shape[0], 1))
+                (_, inverse_only), counts = _permute_and_count(placeholder, ids, spec)
+            else:
+                hidden.record_stream(control)
+                permuted, counts = _permute_and_count(hidden, ids, spec)
         _, payload, _ = _dynamic_route_payload(hidden, flat, spec, counts, mask)
         pending = _gather_to_host(payload, spec, control)
         pending.permuted = permuted
+        pending.inverse_only = inverse_only
         return pending
