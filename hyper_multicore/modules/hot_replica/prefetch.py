@@ -5,6 +5,7 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from time import monotonic, sleep
 from typing import Any
 
 import numpy as np
@@ -15,6 +16,10 @@ from ..mega_moe.route import (
     _route_input_mask, _start_dynamic_gather, _validate_topk_inputs,
 )
 from .bounded_placement import decode_placement_wire
+
+
+_READBACK_POLL_INTERVAL_S = 50e-6
+_READBACK_POLL_BUDGET_S = 0.5
 
 
 @dataclass
@@ -28,9 +33,17 @@ class PendingWire:
     ready: Any
     permuted: tuple[torch.Tensor, torch.Tensor] | None = None
 
+    def wait(self):
+        """Yield the host thread while the side-stream copy is in flight."""
+        deadline = monotonic() + _READBACK_POLL_BUDGET_S
+        while not self.ready.query() and monotonic() < deadline:
+            sleep(_READBACK_POLL_INTERVAL_S)
+        # Confirm completion and let the runtime surface asynchronous failures.
+        self.ready.synchronize()
+
     def snapshot(self, spec, workspace, stream):
         """Wait only for this readback and publish descriptors for the consumer stream."""
-        self.ready.synchronize()
+        self.wait()
         self.payload.record_stream(stream)
         self.gathered.record_stream(stream)
         if self.permuted is not None:
@@ -94,7 +107,7 @@ class _ReplayVotePair:
         if self.pending is None:
             raise RuntimeError("Stage both paired replay votes before executing either expert")
         if self.rows is None:
-            self.pending.ready.synchronize()
+            self.pending.wait()
             self.rows = self.pending.host.reshape(-1, 2).transpose(0, 1).tolist()
         return self.rows[index]
 
@@ -134,7 +147,7 @@ def start_replay_vote(record, hidden, ids, probs, counts, resources, mask):
     pending = _stage_votes([flag], resources)
 
     def finish():
-        pending.ready.synchronize()
+        pending.wait()
         return resolve_replay_vote(record, pending.host.flatten().tolist())
 
     return finish
