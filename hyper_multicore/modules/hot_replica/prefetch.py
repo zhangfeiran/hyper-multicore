@@ -68,23 +68,6 @@ def _gather_to_host(payload, spec, control):
     return PendingWire(payload, gathered, work, host, ready)
 
 
-def start_replay_vote(record, hidden, ids, probs, counts, resources, mask):
-    """Stage the existing vote and preserve the checkpoint mode's replay contract."""
-    from .checkpoint import local_replay_vote, resolve_replay_vote
-
-    flag = local_replay_vote(record, hidden, ids, probs, counts, resources.spec, mask)
-    control = _control_stream(resources, hidden.device)
-    with torch.npu.stream(control):
-        flag.record_stream(control)
-        pending = _gather_to_host(flag, resources.spec, control)
-
-    def finish():
-        pending.ready.synchronize()
-        return resolve_replay_vote(record, pending.host.flatten().tolist())
-
-    return finish
-
-
 def start_wire(hidden, ids, probs, counts, resources, mask):
     """Queue the histogram, EP gather and pinned D2H behind the router's producer."""
     spec = resources.spec

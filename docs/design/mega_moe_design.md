@@ -306,20 +306,14 @@ BF16 缓存考虑 token 桶和 partial dW 精度；MXFP8 按覆盖范围与接�
 重入模式使用 `wrap_checkpoint`，由包装器根据梯度开关进入相应上下文。
 这两个入口位于 [HotReplica 组件内部](../../hyper_multicore/modules/hot_replica/checkpoint.py)。
 
-重放记录保存原前向的落位、有序 Top-K IDs，以及调用方提供的逻辑专家计数。
-默认重算在设备上检查路由输入，并沿用现有 EP 投票确认布局。非重入反向持有原前向的 plan 和权重绑定，
-因此非重入布局确认失败时全组报错。重入重算可在布局未命中时重新规划。
+每次前向按专家调用顺序保存落位描述符、权重绑定和调用元数据。前向计数交换检查各 rank 的 checkpoint 参与状态。
+重算正常计算 Router，从本次 checkpoint 的记录中取回对应的落位。参数版本和调用元数据在本地校验，
+有序 Top-K 的一致性由调用方保证。重算省去 EP 投票、计数回读和落位重建。
+专家执行器用当前输入重新置换并计算专家激活。反向读取 autograd 上下文中的 plan。
 
-固定 Router 与专家调用关系的非重入框架可以显式复用正向的有序 Top-K IDs 和落位。
-正向计数交换校验 EP 各 rank 使用相同模式。重算用前向 IDs 从当前打分 gather 概率，
-再按调用顺序、执行器与资源身份取回落位。专家入口使用 Router 正常传下来的 IDs。
-该路径省去专家入口的 IDs clone、重算 Top-K、投票及回读。
 Push 的输入置换使用独立存储，专家算子取得 workspace 租约时建立 stream 依赖。
-bank 权重获取按租约和代际执行。
-
-取得 bank 租约后，重入重算可恢复布局确认通过的 guest 权重快照。
-在 FC2 前乘路由概率且各 rank 激活预算和重放校验均满足时，Push 和 Pull 可复用原前向激活。
-跳过重算前向的次数计入 `skipped_recomputes`。
+Pull 复用前向已提交的容量，取得 workspace 租约后发布重算输入。
+重入重算仍可在取得 bank 租约后恢复 guest 权重快照。
 
 ### 自动回收与清理接入
 

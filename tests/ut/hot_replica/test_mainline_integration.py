@@ -354,50 +354,21 @@ def test_a3_bounded_planning_uses_the_configured_slot_budget(mode, requested, ex
 
 
 
-def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
-    """Reject stale parameters across ranks, even if the token route matches."""
-    monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "s")
-    spec = SimpleNamespace(ep_size=2, ep_group=object(), num_experts=2)
-    hidden, probabilities = torch.ones((1, 4)), torch.ones((1, 2))
-    ids = torch.tensor([[0, 1]])
+def test_reentrant_checkpoint_rejects_stale_parameter_version():
+    """Require the recorded forward version before consuming a plan."""
     owner = object()
-    version = [0]
-    remote_dump = False
-
-    def _gather(out, flag, **_kwargs):
-        out.copy_(flag.expand_as(out))
-        if remote_dump:
-            out[1] |= route._TENSOR_DUMP_MASK
-
-    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", _gather)
-
-    def _invocation(counts=None, *, tensor_dump=False):
-        record, recomputing = replay.route_record(owner)
-        if recomputing:
-            mask = 15 | (route._TENSOR_DUMP_MASK if tensor_dump else 0)
-            route_matches = replay.agree_replay(
-                record, hidden, ids, probabilities, counts, spec, mask,
-            )
-            return route_matches, record.allow_activation
-        record.ids, record.stream, record.route = ids.clone(), "s", object()
-        record.inputs = hidden.detach(), probabilities.detach()
-        record.input_versions = (0, 0)
-        record.activation = object()
-        return None
-
-    wrapped = replay.wrap_checkpoint(_invocation, lambda: version[0], prepare_replay=True)
+    version = 0
+    wrapped = replay.wrap_checkpoint(lambda: replay.route_record(owner), lambda: version, prepare_replay=True)
     with torch.no_grad():
-        wrapped()
-    assert wrapped() == (True, True)
+        record, recomputing = wrapped()
+        assert not recomputing
+    replayed, recomputing = wrapped()
+    assert recomputing and replayed is record
     with torch.no_grad(), pytest.raises(RuntimeError, match="separate wrap_checkpoint"):
         wrapped()
-    remote_dump = True
-    assert wrapped() == (False, False)
-    assert wrapped(tensor_dump=True) == (True, True)
-    remote_dump = False
-    assert wrapped(torch.tensor([1, 1])) == (False, False)
-    version[0] += 1
-    assert wrapped() == (False, False)
+    version += 1
+    with pytest.raises(RuntimeError, match="original logical parameter version"):
+        wrapped()
 
 
 def test_nonreentrant_checkpoint_context_can_replay_a_retained_graph():
@@ -424,222 +395,162 @@ def test_nonreentrant_checkpoint_context_can_replay_a_retained_graph():
 
 
 @pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
-def test_forward_router_replay_preserves_interleaved_checkpoints_and_gradients(monkeypatch, dispatch_mode):
-    """Reuse one Router selection and the matching plan across interleaved checkpoints."""
+@pytest.mark.parametrize("reentrant", [False, True])
+def test_forward_plan_replay_preserves_interleaved_checkpoints_and_gradients(monkeypatch, dispatch_mode, reentrant):
+    """Recompute each router and consume the matching placement of each checkpoint."""
     monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "stream")
     monkeypatch.setattr(invocation, "_materialize_route_permutation", lambda hidden, ids, *_: (hidden, ids))
     spec = SimpleNamespace(ep_size=2, ep_group=None, num_experts=4, dispatch_mode=dispatch_mode, auto_tokens=True)
-    resources = SimpleNamespace(spec=spec, workspace=Mock(), prepare_auto_workspace=Mock(),
+    workspace = Mock()
+    resources = SimpleNamespace(spec=spec, workspace=workspace, prepare_auto_workspace=Mock(),
                                 placement=SimpleNamespace(statistics={"route_replays": 0}))
-    prepare = Mock(side_effect=lambda hidden, ids, *_args, **_kwargs:
-                   route.PreparedTopKRoute(hidden, ids, None, None, SimpleNamespace(plan_tokens=128)))
-    gather = Mock(side_effect=lambda output, flag, **_kwargs: output.copy_(flag.expand_as(output)))
+
+    def _prepare(hidden, ids, *_args, **options):
+        if dispatch_mode == "pull":
+            options["prepare_workspace"](128, hidden.shape[0] * 2)
+        return route.PreparedTopKRoute(hidden, ids, None, None, SimpleNamespace(plan_tokens=128))
+
+    prepare = Mock(side_effect=_prepare)
+    gather = Mock()
     monkeypatch.setattr(invocation, "prepare_topk_route", prepare)
-    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", gather)
     executors = object(), object()
     inputs = tuple(torch.randn(shape, generator=torch.Generator().manual_seed(seed))
                    for seed, shape in enumerate(((5, 3), (4, 3), (4, 3))))
 
-    def _run(direct):
+    def _run(checkpointed):
         topk_calls = []
 
         def _layer(hidden, router_weight, expert_weight):
             for executor in executors:
                 scores = (hidden @ router_weight.T).sigmoid()
-
-                def _select():
-                    topk_calls.append(executor)
-                    return scores.detach().topk(2, sorted=False).indices
-
-                ids = replay.forward_router_indices(executor, _select)
+                topk_calls.append(executor)
+                ids = scores.detach().topk(2, sorted=False).indices
                 probs = scores.gather(-1, ids)
                 with invocation.prepare_expert_invocation(
-                    hidden, ids.view_as(ids), probs, None, (expert_weight, expert_weight), resources,
-                    executor=executor,
+                    hidden, ids, probs, None, (expert_weight, expert_weight), resources, executor=executor,
                 ) as plan:
                     hidden = plan.routed_tokens + (expert_weight[plan.unpermute_mapping] * probs.unsqueeze(-1)).sum(1)
             return hidden.square().sum()
 
+        def _checkpoint():
+            if reentrant:
+                return checkpoint(replay.wrap_checkpoint(_layer, lambda: 3), *leaves, use_reentrant=True)
+            tape = replay.ReplayCheckpoint(lambda: 3)
+            return checkpoint(_layer, *leaves, use_reentrant=False, context_fn=tape.contexts)
+
         leaves = tuple(value.clone().requires_grad_() for value in inputs)
-        tapes = [replay.ReplayCheckpoint(lambda: 3, reuse_forward_router=direct) for _ in range(2)]
         with patch.object(DefaultDeviceType, "get_device_type", return_value="cpu"), set_checkpoint_early_stop(False):
-            outputs = tuple(checkpoint(_layer, *leaves, use_reentrant=False, context_fn=tape.contexts)
-                            for tape in tapes)
-        assert all(len(tape.records) == 2 for tape in tapes)
-        assert tapes[0].records[0].route.metadata is not tapes[1].records[0].route.metadata
-        assert all((record.ids is None) == direct for tape in tapes for record in tape.records)
-        assert all((record.router_selection is not None) == direct for tape in tapes for record in tape.records)
+            outputs = tuple(_checkpoint() if checkpointed else _layer(*leaves) for _ in range(2))
         for result in reversed(outputs):
             result.backward()
-        assert topk_calls == list(executors) * (2 if direct else 4)
+        assert topk_calls == list(executors) * (4 if checkpointed else 2)
         return (*outputs, *(leaf.grad for leaf in leaves))
 
-    expected = _run(False)
-    assert gather.call_count == 4
-    gather.reset_mock()
-    assert resources.workspace.wait_for_reuse.call_count == 4
-    resources.workspace.wait_for_reuse.reset_mock()
-    actual = _run(True)
-    gather.assert_not_called()
-    assert resources.workspace.wait_for_reuse.call_count == (4 if dispatch_mode == "pull" else 0)
+    expected, actual = _run(False), _run(True)
     for received, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(received, reference, rtol=0, atol=0)
+    gather.assert_not_called()
+    workspace.wait_for_reuse.assert_not_called()
+    assert resources.prepare_auto_workspace.call_count == (8 if dispatch_mode == "pull" else 0)
+    assert workspace.claim.call_count == (4 if dispatch_mode == "pull" else 0)
+    assert resources.placement.statistics["route_replays"] == 4
     assert prepare.call_count == 8
-    assert resources.placement.statistics["forward_router_replays"] == 4
-    assert all(call.kwargs["autograd_mask"] & route._FORWARD_ROUTE_REPLAY_MASK
+    assert all(call.kwargs["autograd_mask"] & route._FORWARD_PLAN_REPLAY_MASK
                for call in prepare.call_args_list[4:])
 
 
-@pytest.mark.parametrize("change", ["parameter", "router", "ids", "executor", "resources", "stream", "shape", "counts"])
-def test_forward_router_replay_rejects_a_changed_invocation(monkeypatch, change):
-    """Reject changed resources or invocation metadata without a local route fallback."""
-    version = 0
-    stream = "forward"
+@pytest.mark.parametrize("change", ["parameter", "executor", "resources", "stream", "shape", "dtype", "counts",
+                                    "schedule", "weight", "call_count"])
+def test_forward_plan_replay_rejects_a_changed_invocation(monkeypatch, change):
+    """Check invocation metadata before consuming the plan or entering a collective."""
+    version, stream = 0, "forward"
     monkeypatch.setattr(torch.npu, "current_stream", lambda _device: stream)
     hidden = torch.ones(1, 4)
     ids = torch.tensor([[2, 0]])
     probs = torch.ones(1, 2)
-    spec = SimpleNamespace(dispatch_mode="push", auto_tokens=True)
+    spec = SimpleNamespace(dispatch_mode="push", auto_tokens=True, num_experts=4)
     resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=Mock())
-    router, executor = object(), object()
+    executor = object()
     prepare = Mock(return_value=route.PreparedTopKRoute(hidden, ids, None, None, object()))
-    vote = Mock()
+    gather = Mock()
     monkeypatch.setattr(invocation, "prepare_topk_route", prepare)
-    monkeypatch.setattr(replay, "agree_replay", vote)
-    tape = replay.ReplayCheckpoint(lambda: version, reuse_forward_router=True)
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", gather)
+    tape = replay.ReplayCheckpoint(lambda: version)
     fwd, recompute = tape.contexts()
 
-    with fwd:
-        selected = replay.forward_router_indices(router, lambda: ids)
-        with invocation.prepare_expert_invocation(
-            hidden, selected.view_as(selected), probs, None, (hidden, hidden), resources, executor=executor,
-        ):
-            pass
+    with fwd, invocation.prepare_expert_invocation(
+        hidden, ids, probs, None, (hidden, hidden), resources, executor=executor,
+    ):
+        pass
     version += int(change == "parameter")
-    if change == "ids":
-        ids.add_(1)
     stream = "other" if change == "stream" else stream
     replay_executor = object() if change == "executor" else executor
     replay_resources = SimpleNamespace(**vars(resources)) if change == "resources" else resources
     rows = 2 if change == "shape" else 1
     counts = torch.ones(4, dtype=torch.int32) if change == "counts" else None
-    replay_router = object() if change == "router" else router
-    with pytest.raises(RuntimeError, match="[Rr]ecorded.*(router|expert)"), recompute:
-        selected = replay.forward_router_indices(replay_router, lambda: ids)
-        with invocation.prepare_expert_invocation(
-            hidden.expand(rows, -1), selected.expand(rows, -1), probs.expand(rows, -1),
-            counts, (hidden, hidden), replay_resources, executor=replay_executor,
-        ):
-            pytest.fail("Replay should reject the invocation before consuming its route")
+    replay_ids = ids.to(torch.int32) if change == "dtype" else ids
+    if change == "weight":
+        error = pytest.raises(ValueError, match="expert weights")
+    else:
+        error = pytest.raises(RuntimeError, match="recorded forward|Recorded forward|original logical parameter")
+    with error, recompute:
+        if change != "call_count":
+            with invocation.prepare_expert_invocation(
+                hidden.expand(rows, -1), replay_ids.expand(rows, -1), probs.expand(rows, -1),
+                counts, (hidden, hidden), replay_resources, executor=replay_executor,
+                weight_error=change == "weight", scheduled=change == "schedule",
+            ):
+                pytest.fail("Replay should reject the invocation before consuming its route")
     prepare.assert_called_once()
-    vote.assert_not_called()
+    gather.assert_not_called()
     assert not replay.is_checkpointing()
 
 
-def test_forward_router_replay_modes_use_the_existing_forward_header():
-    """Report the same protocol setup error using the flags already exchanged in forward."""
-    mask = route._FORWARD_ROUTE_REPLAY_MASK
-    with pytest.raises(RuntimeError, match="forward router replay mode differs across EP ranks"):
+def test_forward_plan_replay_participation_uses_the_existing_header():
+    """Reject inconsistent checkpoint registration or a missing version during forward."""
+    mask = route._FORWARD_PLAN_REPLAY_MASK
+    with pytest.raises(RuntimeError, match="checkpoint participation differs across EP ranks"):
         route._validate_route_flags([[0, 1, mask], [0, 1, 0]])
-    with pytest.raises(ValueError, match="omitted tokens_per_expert on all EP ranks"):
-        route._validate_route_flags([[0, 1, mask], [0, 1, mask | route._INVALID_FORWARD_ROUTE_REPLAY_MASK]])
+    with pytest.raises(ValueError, match="logical parameter version on all EP ranks"):
+        route._validate_route_flags([[0, 1, mask], [0, 1, mask | route._INVALID_CHECKPOINT_VERSION_MASK]])
 
 
-@pytest.mark.parametrize("rank", [0, 1])
-@pytest.mark.parametrize("supplied", [False, True])
-@pytest.mark.parametrize("bad_weight_rank", [None, 0, 1])
-def test_checkpoint_converges_weight_errors_before_building_routes(monkeypatch, supplied, bad_weight_rank, rank):
-    """Reuse a valid route or reject a peer's weight error in the same replay vote."""
-    monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "stream")
-    ids = torch.tensor([[0, 1]], dtype=torch.int32)
-    counts = torch.ones(2, dtype=torch.int32)
-    hidden, probs = torch.ones(1, 2), torch.ones(1, 2)
-    weights = (torch.ones(1, 2), torch.ones(1, 2))
-    route_counts = counts if supplied else None
-    spec = SimpleNamespace(ep_size=2, ep_group=object(), dispatch_mode="push", auto_tokens=True, num_experts=2)
-    placement = SimpleNamespace(statistics={"route_replays": 0, "route_replay_misses": 0})
-    resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=placement, ensure_capacity=Mock())
-    def _gather(out, local, **_kwargs):
-        out[:] = 1
-        if bad_weight_rank is not None:
-            out[bad_weight_rank] = route._INVALID_WEIGHT_MASK
-        assert int(out[rank]) == int(local)
-
-    gather = Mock(side_effect=_gather)
-    prepare = Mock(return_value=route.PreparedTopKRoute(hidden, ids, counts, counts, object()))
-    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
-    monkeypatch.setattr(invocation, "prepare_topk_route", prepare)
-    monkeypatch.setattr(invocation, "_materialize_route_permutation", lambda *args: (hidden, ids))
-    tape = replay.ReplayCheckpoint(lambda: 1)
-    with tape.scope(False), invocation.prepare_expert_invocation(
-            hidden, ids, probs, route_counts, weights, resources):
-        pass
-    current_counts = counts.to(torch.int64) if supplied else None
-    counts.add_(1)
-    local_error = rank == bad_weight_rank
-    current = (None, weights[1]) if local_error else weights
-    expected = (nullcontext() if bad_weight_rank is None else
-                pytest.raises((TypeError, ValueError), match="expert weights"))
-    with tape.scope(True), expected, invocation.prepare_expert_invocation(
-            hidden, ids, probs, current_counts, current, resources, weight_error=local_error) as restored:
-        if supplied:
-            torch.testing.assert_close(restored.tokens_per_expert, torch.ones_like(counts))
-    gather.assert_called_once()
-    prepare.assert_called_once()
-    assert placement.statistics["route_replays"] == (bad_weight_rank is None)
-
-
-@pytest.mark.parametrize("rank", [0, 1])
-@pytest.mark.parametrize(("change_counts", "invalid", "non_reentrant"), [
-    (lambda counts: counts.add_(1), False, True),
-    (lambda counts: counts.add_(1), False, False),
-    (lambda counts: None, False, True),
-    (lambda counts: counts[:1], True, True),
-    (lambda counts: counts.float(), True, True),
-    (lambda counts: torch.empty_like(counts, device="meta"), True, True),
-], ids=["different", "reentrant-fallback", "omitted", "shape", "dtype", "device"])
-def test_checkpoint_replay_agrees_before_changing_layout(monkeypatch, rank, change_counts, invalid, non_reentrant):
-    """Keep non-reentrant replay on its original placement and converge invalid metadata."""
+@pytest.mark.parametrize("counts_change", [None, "shape", "dtype", "device"])
+def test_checkpoint_replay_validates_explicit_histogram_metadata(monkeypatch, counts_change):
+    """Preserve the recorded histogram and validate supplied metadata locally."""
     monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "stream")
     hidden, probs, ids = torch.ones(1, 2), torch.ones(1, 2), torch.tensor([[0, 1]])
     counts = torch.ones(2, dtype=torch.int32)
-    spec = SimpleNamespace(ep_size=2, ep_group=object(), dispatch_mode="push", auto_tokens=True, num_experts=2)
-    stats = {"route_replays": 0, "route_replay_misses": 0}
+    spec = SimpleNamespace(ep_size=2, dispatch_mode="push", auto_tokens=True, num_experts=2)
+    stats = {"route_replays": 0}
     resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=SimpleNamespace(statistics=stats))
-
-    def _gather(out, local, **_kwargs):
-        out[:] = out.new_tensor([1, route._INVALID_COUNTS_MASK if invalid else 0])
-        assert int(out[rank]) == int(local)
-
-    gather = Mock(side_effect=_gather)
-    physical_counts = torch.tensor([1, 0, 0, 1], dtype=torch.int32)
-    prepare = Mock(return_value=route.PreparedTopKRoute(hidden, ids, physical_counts, physical_counts, object()))
-    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
+    prepare = Mock(return_value=route.PreparedTopKRoute(hidden, ids, counts, counts, object()))
+    gather = Mock()
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", gather)
     monkeypatch.setattr(invocation, "prepare_topk_route", prepare)
-    tape = replay.ReplayCheckpoint(lambda: 1)
-    forward, recompute = tape.contexts() if non_reentrant else (tape.scope(False), tape.scope(True))
+    monkeypatch.setattr(invocation, "_materialize_route_permutation", lambda *_: (hidden, ids))
+    forward, recompute = replay.ReplayCheckpoint(lambda: 1).contexts()
     weights = hidden, hidden
     with forward, invocation.prepare_expert_invocation(hidden, ids, probs, counts, weights, resources) as original:
         record = original.checkpoint_record
-        assert record.route.tokens_per_expert is physical_counts
-    current_counts = change_counts(counts) if rank == 1 else counts
-    torch.testing.assert_close(record.supplied_counts, torch.ones_like(counts))
-    error = nullcontext()
-    if invalid:
-        error = pytest.raises(ValueError, match="tokens_per_expert")
-    elif non_reentrant:
-        error = pytest.raises(RuntimeError, match="original expert layout")
+    current_counts = {
+        "shape": counts[:1], "dtype": counts.float(), "device": torch.empty_like(counts, device="meta"),
+    }.get(counts_change, counts.to(torch.int64))
+    counts.add_(1)
+    error = pytest.raises((TypeError, ValueError), match="tokens_per_expert") if counts_change else nullcontext()
     with recompute, error, invocation.prepare_expert_invocation(
-            hidden, ids, probs, current_counts, weights, resources):
-        pass
-    gather.assert_called_once()
-    assert prepare.call_count == (1 if non_reentrant else 2)
-    assert stats == {"route_replays": 0, "route_replay_misses": int(not non_reentrant)}
+            hidden, ids, probs, current_counts, weights, resources) as restored:
+        assert restored.metadata is record.route.metadata
+        torch.testing.assert_close(restored.tokens_per_expert, torch.ones_like(counts))
+    gather.assert_not_called()
+    prepare.assert_called_once()
+    assert stats["route_replays"] == int(counts_change is None)
 
 
 @pytest.mark.parametrize("guest_rows", [0, 1])
-def test_staged_replay_does_not_change_a_shared_bank_before_route_agreement(monkeypatch, guest_rows):
-    """A replay miss leaves a pending ordinary backward's bank lease valid."""
+def test_checkpoint_route_lookup_preserves_a_shared_bank_lease(monkeypatch, guest_rows):
+    """Looking up the saved plan leaves a pending ordinary backward's bank lease valid."""
     monkeypatch.setattr(torch.distributed, "get_rank", lambda _: 0)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda _: 2)
     stream = SimpleNamespace(device="npu:0", wait_event=Mock())
@@ -661,7 +572,8 @@ def test_staged_replay_does_not_change_a_shared_bank_before_route_agreement(monk
         record, is_replay = replay.route_record(pool)
         if not is_replay:
             record.route = SimpleNamespace(weight_binding=saved)
-        # A replay miss follows the ordinary B0 path with no replica lease.
+        else:
+            assert record.route.weight_binding is saved
 
     wrapped = replay.wrap_checkpoint(_layer, lambda: 1, prepare_replay=True)
     with torch.no_grad():

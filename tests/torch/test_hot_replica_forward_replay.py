@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Launch the A3 HotReplica forward Router and plan replay regression."""
+"""Launch the A3 HotReplica forward plan replay regression."""
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
@@ -23,7 +23,7 @@ from tests.common.port_utils import allocate_port
 
 @arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_forward_route_replay(monkeypatch):
-    """Exercise exact gradients, zero replay votes and consistent EP setup rejection."""
+    """Exercise exact gradients, zero route exchanges in replay, and EP setup rejection."""
     prepare_multicore_test_environment()
     monkeypatch.setenv("HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     with without_inherited_rank_environment():

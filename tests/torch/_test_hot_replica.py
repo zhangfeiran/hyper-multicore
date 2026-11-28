@@ -201,7 +201,7 @@ def test_placement_checkpoint_and_close():
             if replica:
                 owner = op._resource_group.resources.placement  # pylint: disable=protected-access
                 assert owner.statistics["route_replays"] == 1
-                assert owner.statistics["skipped_recomputes"] == 1
+                assert owner.statistics["skipped_recomputes"] == 0
                 assert owner.pool is not None, "The hot route must admit a replica"
                 counts = owner.pool.statistics
                 assert counts["remote_prefetches"] + counts.get("fused_prefetches", 0) > 0, counts
@@ -297,13 +297,12 @@ def test_nonreentrant_checkpoint_replay():
 
 
 def _check_checkpoint_count_rejections(op, inputs, ids, counts, rank):
-    """Reject rank-local counts errors before planning a replacement route."""
+    """Reject a rank-local forward error and invalid replay metadata before execution."""
     placement = op._resource_group.resources.placement  # pylint: disable=protected-access
     receipts = []
     for name, in_replay, invalid_counts, error, message in (
         ("forward_shape", False, counts[:-1], ValueError, "tokens_per_expert"),
         ("replay_shape", True, counts[:-1], ValueError, "tokens_per_expert"),
-        ("replay_values", True, counts.roll(1), RuntimeError, "original expert layout"),
     ):
         calls = 0
         before = placement.statistics["invocations"]
@@ -314,7 +313,8 @@ def _check_checkpoint_count_rejections(op, inputs, ids, counts, rank):
             nonlocal calls
             replaying = calls > 0
             calls += 1
-            local_counts = malformed_counts if rank == 1 and replaying == replay_error else counts
+            local_error = (replay_error or rank == 1) and replaying == replay_error
+            local_counts = malformed_counts if local_error else counts
             return op(hidden, ids, probs, expert_weights=(w1, w2), tokens_per_expert=local_counts)
 
         if in_replay:

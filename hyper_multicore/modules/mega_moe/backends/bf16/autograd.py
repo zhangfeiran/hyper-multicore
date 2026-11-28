@@ -787,39 +787,6 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             workspace.release(stream=workspace.lease_stream)
 
 
-class _CheckpointedMegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
-    """Bind a retained forward to the same BF16 backward used for ordinary calls."""
-
-    @staticmethod
-    def forward(
-        ctx: Any, flat: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, metadata: RouteMetadata,
-        plan: MegaMoePlan, workspace: MegaMoeWorkspace, activation: tuple[Any, ...], probs: torch.Tensor,
-        weight_binding: Any,
-    ) -> torch.Tensor:
-        """Restore the saved output and capture the current owner weights."""
-        output, dispatch, up, act, mapping, reservation = activation
-        ctx.source_rows = mapping.numel()
-        ctx.token_rows = flat.shape[0]
-        ctx.has_permutation = ctx.has_unpermute = True
-        ctx.topk_dtype = probs.dtype
-        ctx.activation_reservation = reservation
-        ctx.weight_binding = weight_binding
-        ctx.plan = plan
-        ctx.workspace = workspace
-        metadata = metadata.for_kernel(plan.spec.hidden_size)
-        w1 = _native_weight_operand(w1, plan)
-        w2 = _native_weight_operand(w2, plan)
-        ctx.save_for_backward(
-            dispatch, up, act, w1, w2, *_backward_route_tensors(metadata), mapping, probs.float().contiguous(),
-        )
-        workspace.track_graph(ctx)
-        if weight_binding is not None:
-            weight_binding.track_graph(ctx)
-        return output
-
-    backward = staticmethod(_MegaMoeFunction.backward)
-
-
 def execute_mega_moe(
     routed_tokens: Any,
     weight1: Any,
@@ -908,7 +875,7 @@ def _execute_mega_moe_without_autograd(
     route: PreparedTopKRoute,
     plan: MegaMoePlan,
     workspace: MegaMoeWorkspace,
-    *, workspace_claimed: bool = False, weight_binding: Any = None, save_activation=None,
+    *, workspace_claimed: bool = False, weight_binding: Any = None,
 ) -> torch.Tensor:
     """Restore owned token outputs before releasing inference-only scratch.
 
@@ -952,16 +919,7 @@ def _execute_mega_moe_without_autograd(
         if not rows:
             return route.routed_tokens.new_empty((0, plan.spec.hidden_size))
         if plan.spec.apply_probs_before_fc2:
-            output = _restore_unweighted_output(execution.combine[:rows], route.unpermute_mapping, plan.spec.top_k)
-            if save_activation is not None:
-                parts = execution.intermediates
-                dispatch = execution.dispatch
-                if plan.spec.dispatch_mode == "push":
-                    # Push's dispatch aliases the leased symmetric receive buffer.
-                    parts.down_proj.copy_(dispatch[:route.metadata.expert_capacity])
-                    dispatch = parts.down_proj
-                save_activation(output, dispatch, parts.up_proj, parts.activation, route.unpermute_mapping)
-            return output
+            return _restore_unweighted_output(execution.combine[:rows], route.unpermute_mapping, plan.spec.top_k)
         return restore_topk_output(
             execution.combine[:rows], route.unpermute_mapping, topk_weights)
     finally:

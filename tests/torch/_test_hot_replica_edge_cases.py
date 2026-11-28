@@ -88,7 +88,7 @@ def _check_joint_result(op, planner, observed, reference, config):
     assert transfers["remote_gradient_returns"] + transfers.get("fused_gradient_returns", 0) > 0
     if config[-1] == "reentrant":
         assert owner.statistics["route_replays"] == 1
-        assert owner.statistics["skipped_recomputes"] == 1
+        assert owner.statistics["skipped_recomputes"] == 0
     if config[-1] == "multiple_guests":
         placement = planner.last_placement
         assert max(sum(expert >= 0 for expert in row) for row in placement.copies_by_rank) >= 2
