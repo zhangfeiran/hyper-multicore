@@ -17,6 +17,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from hyper_multicore.modules.hot_replica.shmem_transfer import ReplicaExecutionMode
+from hyper_multicore.modules.hot_replica.checkpoint import is_checkpointing
 
 from ...route import PreparedTopKRoute, restore_topk_output
 
@@ -54,7 +55,9 @@ def forward(
             # original binding still selects its own replay protocol.
             route.weight_binding.snapshot = binding.snapshot
     else:
-        integrated_unpermute = pull or before_fc2
+        integrated_unpermute = (pull or before_fc2 or (
+            getattr(workspace, "reuse_bf16_push_saved", False) is True and not route.tensor_dump and is_checkpointing()
+        ))
         output = execute_mega_moe_with_permutation(
             hidden_flat, topk_ids, *weights, route, plan, workspace,
             topk_weights=topk_weights if integrated_unpermute else None,

@@ -40,6 +40,7 @@ class _ForwardIntermediates:
     up_proj: Any
     activation: Any
     down_proj: Any
+    combine_snapshot: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -158,8 +159,12 @@ def _stage_backward_source(ctx: Any, grad_output: Any, permutation_inputs: tuple
                 ctx.workspace.probabilities(ctx.plan.spec).slice(ctx.source_rows))
         return source, None
     if getattr(ctx.plan.spec, "dispatch_mode", "push") == "push":
-        return grad_output, None
-    source = _workspace_tensor(ctx.workspace.source_buffer, "source_buffer")[:ctx.source_rows]
+        if not ctx.has_unpermute:
+            return grad_output, None
+        shape = (ctx.source_rows, ctx.plan.spec.hidden_size)
+        source = ctx.workspace.borrow_local_scratch("push_source_rows", shape, grad_output)
+    else:
+        source = _workspace_tensor(ctx.workspace.source_buffer, "source_buffer")[:ctx.source_rows]
     if not ctx.has_unpermute:
         source.copy_(grad_output)
         return source, None
@@ -175,8 +180,16 @@ def _allocate_forward_intermediates(
     capacity: int,
     routed_tokens: Any,
     dispatch: Any,
+    *,
+    saved_workspace: MegaMoeWorkspace | None = None,
 ) -> _ForwardIntermediates:
     """Allocate outputs whose received rows are overwritten before use."""
+    if saved_workspace is not None:
+        shapes = ((capacity, spec.intermediate_size * 2), (capacity, spec.intermediate_size),
+                  (capacity, spec.hidden_size), (routed_tokens.shape[0], spec.hidden_size))
+        buffers = saved_workspace.borrow_saved_scratch(shapes, routed_tokens)
+        if buffers is not None:
+            return _ForwardIntermediates(*buffers)
     # GMM and SwiGLU cover the received prefix; an empty rank reads no rows.
     up_proj = torch.empty(
         (capacity, spec.intermediate_size * 2),
@@ -252,6 +265,8 @@ def _prepare_forward_execution(
     plan: MegaMoePlan,
     routed_tokens: Any,
     capacity: int,
+    *,
+    save_in_workspace: bool = False,
 ) -> _ForwardExecution:
     """Resolve workspace, event counters, and intermediate tensors for forward."""
     dispatch, source = _dispatch_and_source(plan.spec, workspace, routed_tokens, capacity)
@@ -267,6 +282,7 @@ def _prepare_forward_execution(
             capacity,
             routed_tokens,
             dispatch,
+            saved_workspace=workspace if save_in_workspace else None,
         ),
     )
 
@@ -341,9 +357,10 @@ def _save_forward_state(
     """Restore the owned output and save its backward state in the existing call."""
     spec = plan.spec
     output = execution.combine[:ctx.source_rows]
-    if not spec.apply_probs_before_fc2:
-        output = output.clone()
     intermediates = execution.intermediates
+    if not spec.apply_probs_before_fc2:
+        snapshot = intermediates.combine_snapshot
+        output = output.clone() if snapshot is None else snapshot.copy_(output)
     if spec.dispatch_mode == "pull":
         saved_dispatch = execution.dispatch
     else:
@@ -597,13 +614,12 @@ def _native_source(tensor: torch.Tensor) -> torch.Tensor:
 
 
 # Torch declares variadic autograd hooks; concrete functions use operator-specific signatures.
-def _validate_forward_probabilities(spec, permutation, topk_weights):
+def _validate_forward_probabilities(spec, permutation, topk_weights, *, allow_push=False):
     """Check the selected probability placement before leasing a workspace."""
     if topk_weights is not None and (
-        permutation is None or (spec.dispatch_mode != "pull" and not spec.apply_probs_before_fc2)
+        permutation is None or (spec.dispatch_mode != "pull" and not spec.apply_probs_before_fc2 and not allow_push)
     ):
-        raise ValueError("Integrated output unpermutation requires pull dispatch or pre-FC2 weighting, "
-                         "and an input permutation.")
+        raise ValueError("Integrated output unpermutation requires a supported dispatch path and an input permutation.")
     if spec.apply_probs_before_fc2 and topk_weights is None:
         raise ValueError("Pre-FC2 weighting requires the original Top-K probabilities and permutation.")
 
@@ -645,7 +661,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             Owned token-major rows with integrated unpermutation, otherwise expert-major rows.
         """
         spec = plan.spec
-        _validate_forward_probabilities(spec, permutation, topk_weights)
+        allow_push = getattr(workspace, "reuse_bf16_push_saved", False) is True
+        _validate_forward_probabilities(spec, permutation, topk_weights, allow_push=allow_push)
         metadata = route.for_kernel(spec.hidden_size)
         permutation_inputs = ()
         if permutation is not None:
@@ -678,6 +695,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 plan,
                 routed_tokens,
                 capacity,
+                save_in_workspace=allow_push and spec.dispatch_mode == "push"
+                and ctx.has_unpermute and not spec.apply_probs_before_fc2,
             )
             if spec.apply_probs_before_fc2:
                 probs = topk_weights.float().contiguous()

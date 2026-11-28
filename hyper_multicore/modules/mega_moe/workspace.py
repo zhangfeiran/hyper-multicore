@@ -33,6 +33,7 @@ from hyper_multicore.scheduler.config import (
     mega_moe_event_capacity,
 )
 from hyper_multicore.shmem import _lifecycle
+from hyper_multicore.torch import ops as multicore_ops
 
 from .probability import PROBABILITY_PLANES, ProbabilityPlane
 from .spec import MegaMoeSpec, _resolve_receive_capacity
@@ -43,6 +44,7 @@ from .spec import MegaMoeSpec, _resolve_receive_capacity
 _GMM_WORKSPACE_BYTES = 512
 _SWIGLU_GRAD_WORKSPACE_BYTES = 512
 _WORKSPACE_ALIGNMENT = 512
+_CHECKPOINT_SAVED_SLOTS = 2  # Retain both expert branches in a paired replay.
 
 
 def _workspace_event_experts(specification: Mapping[str, Any]) -> int:
@@ -176,8 +178,10 @@ class MegaMoeWorkspace:
     lock: Any = field(default_factory=threading.Lock, repr=False)
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
     reuse_bf16_push_scratch: bool = False
+    reuse_bf16_push_saved: bool = False
     _local_scratch: dict[tuple[str, torch.dtype], torch.Tensor] = field(
         default_factory=dict, init=False, repr=False)
+    _saved_scratch: list[torch.Tensor] = field(default_factory=list, init=False, repr=False)
 
     def _allocation_specs(self, spec, dtype, capacity):
         """Derive the symmetric allocations for this workspace layout."""
@@ -211,6 +215,32 @@ class MegaMoeWorkspace:
             # A later capacity increase can drop this storage while a consumer is queued.
             storage.record_stream(self.lease_stream)
         return storage[:size].view(shape)
+
+    def borrow_saved_scratch(
+        self, shapes: tuple[tuple[int, int], ...], reference: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...] | None:
+        """Lease an arena until the last saved Tensor alias is dropped."""
+        if not self.in_use:
+            raise RuntimeError("MegaMoe saved tensors require an active workspace lease")
+        alignment = _WORKSPACE_ALIGNMENT // reference.element_size()
+        lengths = tuple((math.prod(shape) + alignment - 1) // alignment * alignment for shape in shapes)
+        size = sum(lengths)
+        for index, owner in enumerate(self._saved_scratch):
+            if multicore_ops._storage_is_unique(owner):
+                if owner.numel() < size:
+                    owner = reference.new_empty((size,))
+                    self._saved_scratch[index] = owner
+                break
+        else:
+            if len(self._saved_scratch) == _CHECKPOINT_SAVED_SLOTS:
+                return None
+            owner = reference.new_empty((size,))
+            self._saved_scratch.append(owner)
+        if self.lease_stream is not None:
+            owner.record_stream(self.lease_stream)
+        # Returning a view makes every saved or detached alias hold this slot.
+        return tuple(region[:math.prod(shape)].view(shape)
+                     for region, shape in zip(owner[:size].split(lengths), shapes, strict=True))
 
     def probabilities(self, spec: MegaMoeSpec) -> ProbabilityWorkspace:
         """Rebind aliases when heap storage or a retained plan's stride changes."""
@@ -504,6 +534,7 @@ class MegaMoeWorkspace:
     def _free_local_tensors(self) -> None:
         """Release local-only workspaces after all queued kernels complete."""
         self._local_scratch.clear()
+        self._saved_scratch.clear()
         for field_name in ("gmm_workspace", "swiglu_grad_workspace"):
             tensor = getattr(self, field_name)
             if tensor is None:
@@ -524,7 +555,7 @@ class MegaMoeWorkspace:
                 raise RuntimeError("cannot close MegaMoe workspace during an active call.")
             if not self.can_close():
                 raise RuntimeError("cannot close MegaMoe workspace while backward graphs still need its buffers.")
-            empty = not self._local_scratch and all(tensor is None for tensor in (
+            empty = not (self._local_scratch or self._saved_scratch) and all(tensor is None for tensor in (
                 self.source_buffer,
                 self.expert_buffer,
                 self.routed_buffer,

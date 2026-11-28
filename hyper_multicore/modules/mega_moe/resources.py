@@ -85,15 +85,15 @@ class _MegaMoeExecutionResources:
                 if transport == "udma":
                     moe_transport.require_queue_backend()
                 self.plan = self._initial_plan(tensor)
+                reuse_saved = os.environ.get("HYPER_MULTICORE_A3_PUSH_REUSE_SAVED") == "1"
+                reuse_scratch = reuse_saved or os.environ.get("HYPER_MULTICORE_A3_PUSH_REUSE_SCRATCH") == "1"
+                reuse_scratch = (reuse_scratch and bool(placement) and self.spec.precision == "bf16"
+                                 and self.spec.architecture == 2201 and self.spec.dispatch_mode == "push"
+                                 and transport == "mte" and load_torch_npu().__version__ == "2.7.1")
                 self.workspace = MegaMoeWorkspace(
                     shared=shared, event_experts=_workspace_event_experts(specification) if placement else None,
-                    reuse_bf16_push_scratch=(
-                        bool(placement) and self.spec.precision == "bf16"
-                        and self.spec.architecture == 2201 and self.spec.dispatch_mode == "push"
-                        and transport == "mte"
-                        and os.environ.get("HYPER_MULTICORE_A3_PUSH_REUSE_SCRATCH") == "1"
-                        and load_torch_npu().__version__ == "2.7.1"
-                    ),
+                    reuse_bf16_push_scratch=reuse_scratch,
+                    reuse_bf16_push_saved=reuse_scratch and reuse_saved,
                 )
                 self.workspace.transport_engine = self.spec.transport_engine
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
