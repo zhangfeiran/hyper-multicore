@@ -143,6 +143,12 @@ def is_checkpointing() -> bool:
     return _ACTIVE.get() is not None
 
 
+def is_checkpoint_replaying() -> bool:
+    """Report whether the active checkpoint is recomputing its forward."""
+    scope = _ACTIVE.get()
+    return scope is not None and scope.replay
+
+
 def route_record(owner: Any, executor: object | None = None) -> tuple[ReplayRecord | None, bool]:
     """Match the current expert call by checkpoint position and executor identity."""
     scope = _ACTIVE.get()

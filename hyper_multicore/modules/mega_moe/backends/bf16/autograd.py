@@ -30,6 +30,7 @@ from hyper_multicore.torch import ops as multicore_ops
 from ...probability import PROBABILITY_PLANES, probability_stride
 from .plan import MegaMoePlan, record_plan_stream
 from ...route import PreparedTopKRoute, RouteMetadata, restore_topk_output
+from ....hot_replica.checkpoint import is_checkpoint_replaying
 from ...workspace import MegaMoeWorkspace
 
 
@@ -663,6 +664,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         spec = plan.spec
         allow_push = getattr(workspace, "reuse_bf16_push_saved", False) is True
         _validate_forward_probabilities(spec, permutation, topk_weights, allow_push=allow_push)
+        push_saved = (allow_push and spec.dispatch_mode == "push" and topk_weights is not None
+                      and not spec.apply_probs_before_fc2)
+        replay = push_saved and is_checkpoint_replaying()
         metadata = route.for_kernel(spec.hidden_size)
         permutation_inputs = ()
         if permutation is not None:
@@ -685,6 +689,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         owner_weights = weight1, weight2
         acquired = False
         try:
+            if push_saved and not replay:
+                workspace.release_replay_scratch()
             if weight_binding is not None:
                 weight1, weight2 = weight_binding.acquire(owner_weights)
                 acquired = True
@@ -695,8 +701,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 plan,
                 routed_tokens,
                 capacity,
-                save_in_workspace=allow_push and spec.dispatch_mode == "push"
-                and ctx.has_unpermute and not spec.apply_probs_before_fc2,
+                save_in_workspace=replay,
             )
             if spec.apply_probs_before_fc2:
                 probs = topk_weights.float().contiguous()
@@ -918,6 +923,8 @@ def _execute_mega_moe_without_autograd(
         workspace.claim()
     acquired = False
     try:
+        if getattr(workspace, "reuse_bf16_push_saved", False) is True and route.checkpoint_record is not None:
+            workspace.release_replay_scratch()
         # The fused descriptor still reads owner storage after acquire returns
         # guest bank views. Retain any contiguous copies through the launch.
         owner_weights = _native_weight_operand(weight1, plan), _native_weight_operand(weight2, plan)

@@ -181,7 +181,7 @@ class MegaMoeWorkspace:
     reuse_bf16_push_saved: bool = False
     _local_scratch: dict[tuple[str, torch.dtype], torch.Tensor] = field(
         default_factory=dict, init=False, repr=False)
-    _saved_scratch: list[torch.Tensor] = field(default_factory=list, init=False, repr=False)
+    _saved_scratch: list[tuple[torch.Tensor, ...]] = field(default_factory=list, init=False, repr=False)
 
     def _allocation_specs(self, spec, dtype, capacity):
         """Derive the symmetric allocations for this workspace layout."""
@@ -219,28 +219,30 @@ class MegaMoeWorkspace:
     def borrow_saved_scratch(
         self, shapes: tuple[tuple[int, int], ...], reference: torch.Tensor,
     ) -> tuple[torch.Tensor, ...] | None:
-        """Lease an arena until the last saved Tensor alias is dropped."""
+        """Lease a set of buffers until its last saved Tensor alias is dropped."""
         if not self.in_use:
             raise RuntimeError("MegaMoe saved tensors require an active workspace lease")
-        alignment = _WORKSPACE_ALIGNMENT // reference.element_size()
-        lengths = tuple((math.prod(shape) + alignment - 1) // alignment * alignment for shape in shapes)
-        size = sum(lengths)
-        for index, owner in enumerate(self._saved_scratch):
-            if multicore_ops._storage_is_unique(owner):
-                if owner.numel() < size:
-                    owner = reference.new_empty((size,))
-                    self._saved_scratch[index] = owner
-                break
+        index = next((i for i, slot in enumerate(self._saved_scratch)
+                      if multicore_ops._storage_is_unique(slot)), len(self._saved_scratch))
+        if index == _CHECKPOINT_SAVED_SLOTS:
+            return None
+        if index == len(self._saved_scratch):
+            self._saved_scratch.append(tuple(reference.new_empty(shape) for shape in shapes))
         else:
-            if len(self._saved_scratch) == _CHECKPOINT_SAVED_SLOTS:
-                return None
-            owner = reference.new_empty((size,))
-            self._saved_scratch.append(owner)
+            self._saved_scratch[index] = tuple(
+                buffer if buffer.shape[0] >= shape[0] else reference.new_empty(shape)
+                for buffer, shape in zip(self._saved_scratch[index], shapes, strict=True)
+            )
+        buffers = self._saved_scratch[index]
         if self.lease_stream is not None:
-            owner.record_stream(self.lease_stream)
-        # Returning a view makes every saved or detached alias hold this slot.
-        return tuple(region[:math.prod(shape)].view(shape)
-                     for region, shape in zip(owner[:size].split(lengths), shapes, strict=True))
+            for buffer in buffers:
+                buffer.record_stream(self.lease_stream)
+        return tuple(buffer[:shape[0]] for buffer, shape in zip(buffers, shapes, strict=True))
+
+    def release_replay_scratch(self) -> None:
+        """Return R/B allocations to the Torch allocator after their phase."""
+        self._saved_scratch.clear()
+        self._local_scratch.clear()
 
     def probabilities(self, spec: MegaMoeSpec) -> ProbabilityWorkspace:
         """Rebind aliases when heap storage or a retained plan's stride changes."""
@@ -356,6 +358,8 @@ class MegaMoeWorkspace:
             context: Autograd context whose final backward completed.
         """
         self.graphs.discard(context)
+        if self.reuse_bf16_push_saved and not self.graphs:
+            self.release_replay_scratch()
 
     def ensure(self, spec: MegaMoeSpec, dtype: Any, device: Any) -> None:
         """Allocate the fixed configured route capacity once.
@@ -533,8 +537,7 @@ class MegaMoeWorkspace:
 
     def _free_local_tensors(self) -> None:
         """Release local-only workspaces after all queued kernels complete."""
-        self._local_scratch.clear()
-        self._saved_scratch.clear()
+        self.release_replay_scratch()
         for field_name in ("gmm_workspace", "swiglu_grad_workspace"):
             tensor = getattr(self, field_name)
             if tensor is None:

@@ -4,11 +4,16 @@
 #include <torch/library.h>
 
 namespace {
-bool StorageIsUnique(const at::Tensor& owner) {
-  return owner.storage().use_count() == 1;
+bool StorageIsUnique(at::TensorList owners) {
+  for (const auto& owner : owners) {
+    if (owner.storage().use_count() != 1) {
+      return false;
+    }
+  }
+  return true;
 }
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
-  m.def("_storage_is_unique(Tensor owner) -> bool", &StorageIsUnique);
+  m.def("_storage_is_unique(Tensor[] owners) -> bool", &StorageIsUnique);
 }
