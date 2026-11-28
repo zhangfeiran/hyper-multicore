@@ -47,6 +47,12 @@ bash build.sh --jobs 24
 payload 位于 `build/native/payload/hyper_multicore/`。
 生成的 wheel 可安装到运行环境，本地 payload 可直接用于源码验证。
 
+使用官方 TorchNPU 2.7.1 在 Atlas A3 上构建时，激活目标环境后执行
+`bash build.sh --soc-list ascend910_93`。这个发行包缺少 OpPlugin 扩展头，构建会选择 CANN
+公开 ACLNN 桥，使用 Toolkit 的 `aclnnop` 头文件和 `libnnopbase.so`。该桥处理基础格式张量。
+该版本训练使用显式 ACLNN unpermute 反向计算 FP32 Router 概率的梯度，Push 分开执行置换和专家计数。
+使用带 OpPlugin 扩展头的环境构建时，仍通过 OpPlugin 提交算子。
+
 ## 安装与验证
 
 ### 安装已有 wheel
@@ -402,6 +408,10 @@ ops-transformer 的 GMM 和 MHC 共用仓库，按各自锁定提交导出片段
 
 新快照在制品提交成功并复核输入后原子发布。
 `build_info.json` 的 `vendor_sources` 区分原始 vendor 来源和本次组包身份；激活脚本与最终制品每次重新生成。
+
+需要编译 vendor 时，CMake 会自动查找 `ccache`，找到后在日志中打印 `Vendor ccache found` 和工具路径。
+已显式配置的 `CMAKE_C_COMPILER_LAUNCHER` 和 `CMAKE_CXX_COMPILER_LAUNCHER` 优先，空值可关闭对应语言的 launcher。
+`ccache` 缓存编译结果，vendor 快照命中时可以跳过整个 vendor 编译。
 
 ### 并行预算
 

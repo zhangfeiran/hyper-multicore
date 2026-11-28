@@ -69,6 +69,17 @@ class TestMegaMoeRoute(unittest.TestCase):
             with self.subTest(capacity=capacity), patch.object(route_module, "device_ub_bytes", return_value=capacity):
                 self.assertEqual(_packed_route_ub(wire, spec), expected)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_stock_torch_npu_uses_separate_push_counting(self) -> None:
+        """Use the existing histogram and permutation on stock TorchNPU 2.7.1."""
+        hidden = SimpleNamespace(device=SimpleNamespace(type="npu"), shape=(8, 4))
+        spec = replace(self._spec(), dispatch_mode="push")
+        for version, fused in (("2.7.1", False), ("2.7.1.post4", True)):
+            with self.subTest(version=version), patch.object(
+                route_module, "load_torch_npu", return_value=SimpleNamespace(__version__=version),
+            ):
+                self.assertEqual(route_module._can_fuse_count(hidden, spec, None), fused)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -399,10 +410,12 @@ class TestMegaMoeRoute(unittest.TestCase):
         flat_ids = torch.tensor([0, 1, 1, 3], dtype=torch.int32)
         supplied_counts = torch.tensor([4, 0, 0, 0], dtype=torch.int32)
 
-        with patch.object(torch, "bincount") as mock_bincount:
+        with (patch.object(torch, "bincount") as mock_bincount,
+              patch.object(torch, "histc") as mock_histc):
             supplied = _resolve_counts(flat_ids, supplied_counts, spec)
 
         mock_bincount.assert_not_called()
+        mock_histc.assert_not_called()
         self.assertIs(supplied, supplied_counts)
         computed = _resolve_counts(flat_ids, None, spec)
         expected = torch.tensor([1, 2, 0, 1], dtype=torch.int32)
@@ -410,6 +423,38 @@ class TestMegaMoeRoute(unittest.TestCase):
             torch.equal(computed, expected),
             f"computed counts mismatch: expected={expected}, got={computed}",
         )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_dynamic_npu_histogram_excludes_out_of_range_bin(self) -> None:
+        """Check that the NPU histogram retains only the logical expert bins."""
+        spec = replace(self._spec(ep_size=1), auto_tokens=True)
+        flat_ids = Mock(device=SimpleNamespace(type="npu"))
+        flat_ids.numel.return_value = 5
+        with patch.object(torch, "histc", return_value=torch.tensor([1., 2., 0., 1., 1.])) as histc:
+            counts = _resolve_counts(flat_ids, None, spec)
+
+        histc.assert_called_once_with(flat_ids, bins=5, min=0, max=5)
+        torch.testing.assert_close(counts, torch.tensor([1, 2, 0, 1], dtype=torch.int32))
+        self.assertTrue(counts.is_contiguous())
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_large_npu_histogram_accumulates_exact_integer_counts(self) -> None:
+        """Keep the low bit of a large count by casting each chunk before addition."""
+        spec = replace(self._spec(ep_size=1), auto_tokens=True)
+        limit = 2**24
+        flat_ids = Mock(device=SimpleNamespace(type="npu"))
+        flat_ids.numel.return_value = limit + 2
+        flat_ids.split.return_value = (Mock(), Mock())
+        chunks = (torch.tensor([limit, 0, 0, 0, 0], dtype=torch.float32),
+                  torch.tensor([1, 0, 0, 0, 1], dtype=torch.float32))
+        with patch.object(torch, "histc", side_effect=chunks) as histc:
+            counts = _resolve_counts(flat_ids, None, spec)
+
+        flat_ids.split.assert_called_once_with(limit)
+        self.assertEqual(histc.call_count, len(chunks))
+        torch.testing.assert_close(counts, torch.tensor([limit + 1, 0, 0, 0], dtype=torch.int32))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

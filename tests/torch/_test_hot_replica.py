@@ -29,11 +29,10 @@ from torch.utils.checkpoint import checkpoint
 
 from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
 from hyper_multicore.diagnostics import dump, profiler
-from hyper_multicore.experimental import (
-    BasePlanner, HotReplicaPlanner, MegaMoeTuningOptions, ReplayCheckpoint, wrap_checkpoint,
-)
+from hyper_multicore.experimental import BasePlanner, HotReplicaPlanner, MegaMoeTuningOptions
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica._planner.receive import select_replica_plan
+from hyper_multicore.modules.hot_replica.checkpoint import ReplayCheckpoint, wrap_checkpoint
 from hyper_multicore.modules.hot_replica.planner import as_placement
 
 
@@ -393,11 +392,11 @@ def test_wide_placement_and_hard_receive_limit():
 
 def test_paired_routes():
     """Compare serial and staged EOI expert outputs/gradients through a full two-call replay."""
+    import torch_npu
     from torch.utils.checkpoint import set_checkpoint_early_stop
-    from hyper_multicore.experimental import ReplayCheckpoint
 
     rank = int(os.environ["LOCAL_RANK"])
-    torch.npu.set_device(rank)
+    torch_npu.npu.set_device(rank)
     dist.init_process_group("hccl")
     try:
         device = torch.device("npu", rank)
