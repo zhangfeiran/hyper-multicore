@@ -22,7 +22,8 @@ import torch
 from hyper_multicore.diagnostics.api import is_tensor_dump_active
 from .heap_manager import _HeapCapacityError
 from .route import (
-    _INVALID_WEIGHT_MASK, _TENSOR_DUMP_MASK, PreparedTopKRoute, _materialize_route_permutation,
+    _FORWARD_ROUTE_REPLAY_MASK, _INVALID_WEIGHT_MASK, _TENSOR_DUMP_MASK,
+    PreparedTopKRoute, _materialize_route_permutation,
     _prepare_placed_route, prepare_topk_route,
 )
 
@@ -70,25 +71,31 @@ def prepare_expert_invocation(
     record, replay = None, False
     finish_vote, pending = None, None
     if placement is not None:
-        from hyper_multicore.modules.hot_replica.checkpoint import agree_replay, route_record  # pylint: disable=import-outside-toplevel
+        from hyper_multicore.modules.hot_replica.checkpoint import (  # pylint: disable=import-outside-toplevel
+            forward_route_replay_mask, route_record,
+        )
 
         record, replay = route_record(resources)
-    if scheduled:
+        mask = forward_route_replay_mask(record, hidden, ids, probs, counts, mask)
+    direct_replay = replay and bool(mask & _FORWARD_ROUTE_REPLAY_MASK)
+    if scheduled and not direct_replay:
         from hyper_multicore.modules.hot_replica.prefetch import start_replay_vote, start_wire  # pylint: disable=import-outside-toplevel
 
         if replay:
             finish_vote = start_replay_vote(record, hidden, ids, probs, counts, resources, mask)
         else:
             pending = start_wire(hidden, ids, probs, counts, resources, mask)
-    elif replay:
+    elif replay and not direct_replay:
+        from hyper_multicore.modules.hot_replica.checkpoint import agree_replay  # pylint: disable=import-outside-toplevel
+
         finish_vote = partial(agree_replay, record, hidden, ids, probs, counts, resources.spec, mask)
 
     @contextmanager
     def consume() -> Iterator[PreparedTopKRoute]:
+        """Consume an agreed replay or prepare a fresh route under the workspace lease."""
         nonlocal leased_workspace, record
         try:
-            if finish_vote is not None and finish_vote():
-                placement.statistics["route_replays"] += 1
+            if direct_replay or (finish_vote is not None and finish_vote()):
                 yield _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace, tensor_dump)
                 return
             if replay:
@@ -133,6 +140,10 @@ def prepare_expert_invocation(
 
 def _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace, tensor_dump):
     """Reuse agreed descriptors, publishing a fresh permutation if recompute is required."""
+    stats = resources.placement.statistics
+    stats["route_replays"] += 1
+    if record.autograd_mask & _FORWARD_ROUTE_REPLAY_MASK:
+        stats["forward_router_replays"] = stats.get("forward_router_replays", 0) + 1
     route = record.route
     if tensor_dump:
         record.allow_activation = False
@@ -156,6 +167,8 @@ def _record_checkpoint_route(route, record, counts, ids, mask):
     saved_counts = record.supplied_counts if route.tokens_per_expert is counts else route.tokens_per_expert
     record.route = replace(route, routed_tokens=None, unpermute_mapping=None, tokens_per_expert=saved_counts)
     record.ids = ids.detach().clone()
+    if mask & _FORWARD_ROUTE_REPLAY_MASK:
+        record.ids_version = record.ids._version  # pylint: disable=protected-access
     record.stream = torch.npu.current_stream(ids.device)
     record.autograd_mask = mask
     return replace(route, checkpoint_record=record)

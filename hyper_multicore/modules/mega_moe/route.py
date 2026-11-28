@@ -593,7 +593,9 @@ def _validate_dynamic_sizes(rows: list[list[int]], spec: MegaMoeSpec) -> None:
 _INVALID_WEIGHT_MASK = 1 << 5
 _TENSOR_DUMP_MASK = 1 << 6
 _INVALID_COUNTS_MASK = 1 << 9
-_INVALID_ROUTE_INPUT_MASK = _INVALID_WEIGHT_MASK | _INVALID_COUNTS_MASK
+_FORWARD_ROUTE_REPLAY_MASK = 1 << 10
+_INVALID_FORWARD_ROUTE_REPLAY_MASK = 1 << 11
+_INVALID_ROUTE_INPUT_MASK = _INVALID_WEIGHT_MASK | _INVALID_COUNTS_MASK | _INVALID_FORWARD_ROUTE_REPLAY_MASK
 
 
 def _reject_invalid_route_inputs(flags: list[int]) -> None:
@@ -603,6 +605,9 @@ def _reject_invalid_route_inputs(flags: list[int]) -> None:
     if any(flag & _INVALID_COUNTS_MASK for flag in flags):
         raise ValueError("tokens_per_expert must be an int32 or int64 histogram of shape (num_experts,) "
                          "on the route tensor device on all EP ranks")
+    if any(flag & _INVALID_FORWARD_ROUTE_REPLAY_MASK for flag in flags):
+        raise ValueError("Forward router replay requires bound routers and experts, a parameter version, "
+                         "and omitted tokens_per_expert on all EP ranks")
 
 
 def _validate_route_flags(rows: list[list[int]]) -> None:
@@ -612,6 +617,8 @@ def _validate_route_flags(rows: list[list[int]]) -> None:
         _reject_invalid_route_inputs([row[2] for row in rows])
         if any((row[2] ^ flags) & _TENSOR_DUMP_MASK for row in rows):
             raise RuntimeError("MegaMoe Tensor Dump mode differs across EP ranks")
+        if any((row[2] ^ flags) & _FORWARD_ROUTE_REPLAY_MASK for row in rows):
+            raise RuntimeError("MegaMoe forward router replay mode differs across EP ranks")
         raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
 
 
