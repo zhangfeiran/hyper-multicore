@@ -512,7 +512,7 @@ class MegaMoeExperts(MulticoreModule):
         resources = self._get_execution_resources(hidden_flat)
         invocation = prepare_expert_invocation(
             hidden_flat, topk_ids, topk_weights, tokens_per_expert, weights, resources,
-            weight_error=weight_error, planner=self._planner, scheduled=route_schedule is not None,
+            weight_error=weight_error, planner=self._planner, scheduled=route_schedule is not None, executor=self,
         )
 
         def execute():

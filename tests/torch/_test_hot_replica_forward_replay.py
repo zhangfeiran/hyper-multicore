@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""A3 two-rank forward router replay and EP mode agreement."""
+"""A3 two-rank forward plan replay and EP mode agreement."""
 import os
 from unittest.mock import patch
 
@@ -59,14 +59,10 @@ def test_forward_route_replay():
                     hidden, scores, gate_up, down = inputs[4 * branch:4 * branch + 4]
                     expert = experts[branch]
 
-                    def _select():
-                        topk_calls.append(branch)
-                        return (scores.detach() + biases[branch]).topk(2, sorted=False).indices
-
-                    ids = replay.forward_router_indices(biases[branch], _select)
+                    topk_calls.append(branch)
+                    ids = (scores.detach() + biases[branch]).topk(2, sorted=False).indices
                     probs = scores.gather(-1, ids)
-                    expert_ids = replay.forward_expert_indices(expert, ids.view_as(ids))
-                    return expert(hidden, expert_ids, probs, expert_weights=(gate_up, down), **options)
+                    return expert(hidden, ids, probs, expert_weights=(gate_up, down), **options)
 
                 if not staged:
                     return _call(0), _call(1)
@@ -88,19 +84,26 @@ def test_forward_route_replay():
                 return u, generation
 
             leaves = [v.detach().requires_grad_() for v in values]
-            tape = replay.ReplayCheckpoint(lambda: 1, reuse_forward_router=direct or (mixed_mode and rank == 0))
+            tape = replay.ReplayCheckpoint(lambda: 1, reuse_forward_plan=direct or (mixed_mode and rank == 0))
             with set_checkpoint_early_stop(False):
                 if mixed_mode:
-                    with pytest.raises(RuntimeError, match="forward router replay mode differs across EP ranks"):
+                    with pytest.raises(RuntimeError, match="forward plan replay mode differs across EP ranks"):
                         checkpoint(_pair, *leaves, use_reentrant=False, context_fn=tape.contexts)
                     return None
                 out = checkpoint(_pair, *leaves, use_reentrant=False, context_fn=tape.contexts)
+            resources = experts[0]._resource_group.resources  # pylint: disable=protected-access
+            workspace, placement = resources.workspace, resources.placement
             with (patch.object(replay, "agree_replay", wraps=replay.agree_replay) as vote,
-                  patch.object(prefetch, "start_replay_vote", wraps=prefetch.start_replay_vote) as staged_vote):
+                  patch.object(prefetch, "start_replay_vote", wraps=prefetch.start_replay_vote) as staged_vote,
+                  patch.object(placement, "select", wraps=placement.select) as plan,
+                  patch.object(workspace, "wait_for_reuse", wraps=workspace.wait_for_reuse) as wait):
                 sum(x.float().square().mean() for x in out).backward()
             assert vote.call_count + staged_vote.call_count == (0 if direct else 2)
-            assert topk_calls == ([0, 1] if direct else [0, 1, 0, 1])
+            plan.assert_not_called()
+            assert wait.call_count == (0 if direct else 2)
+            assert topk_calls == [0, 1, 0, 1]
             assert len(tape.records) == 2
+            assert all((record.ids is None) == direct for record in tape.records)
             return [v.detach().cpu() for v in (*out, *(leaf.grad for leaf in leaves))]
 
         serial = _run(False)

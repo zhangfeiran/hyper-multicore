@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Launch the A3 HotReplica forward router replay regression."""
+"""Launch the A3 HotReplica forward plan replay regression."""
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark

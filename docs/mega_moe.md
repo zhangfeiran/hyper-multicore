@@ -206,16 +206,14 @@ forward 返回前保持专家权重有效。两组已展开的权重可能同时
 #### 激活重算
 
 同时使用 `expert_placement` 和非重入激活重算时，训练框架需要接入 HotReplica 的布局重放。
-重放时，整个 EP 组必须确认原始布局，否则全组报错。原前向和重算应保持参数逻辑版本、
+默认重放由整个 EP 组确认原始布局，失配时全组报错。原前向和重算应保持参数逻辑版本、
 有序 Top-K IDs、执行流和诊断模式一致，并同时省略 `tokens_per_expert` 或传入相同的计数。
 接入机制见[专家布局重放](design/mega_moe_design.md#专家布局重放)。
 
-固定 Router 与专家调用关系的非重入框架可以选择 `ReplayCheckpoint(..., reuse_forward_router=True)`。
+非重入框架可以选择 `ReplayCheckpoint(..., reuse_forward_plan=True)`，在重算中直接使用对应的正向落位。
+调用方保证每次专家调用在原前向和重算中的逐 token 有序 Top-K IDs 相同。
 每个 rank 需启用相同模式，关闭 checkpoint early stop，并省略 `tokens_per_expert`。
-Router 通过 `forward_router_indices(router, select_topk)` 取得有序 IDs，从当前分数 gather 概率。
-专家调用前用 `forward_expert_indices(experts, ids)` 取得实际传给 `MegaMoeExperts` 的 IDs。
-这个模式在正向计数交换里校验各 rank 配置，在重算中直接使用对应的正向落位。
-框架需要在重放契约失效时终止分布式作业。
+正向计数交换会校验各 rank 的模式。框架需要在重放契约失效时终止分布式作业。
 
 ### 旧 HotReplica 接口退役
 

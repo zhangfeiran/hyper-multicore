@@ -90,7 +90,8 @@ def start_wire(hidden, ids, probs, counts, resources, mask):
     spec = resources.spec
     control = _control_stream(resources, hidden.device)
     with torch.npu.stream(control), torch.inference_mode(False), torch.no_grad():
-        flat = _validate_topk_inputs(hidden, ids, probs)
+        _validate_topk_inputs(hidden, ids, probs)
+        flat = ids.reshape(-1)
         mask = _route_input_mask(counts, spec, flat.device, mask)
         ids.record_stream(control)
         if counts is not None and not mask & _INVALID_COUNTS_MASK:

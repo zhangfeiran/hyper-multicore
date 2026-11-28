@@ -128,7 +128,7 @@ def _validate_topk_inputs(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
-) -> torch.Tensor:
+) -> None:
     """Validate route tensor metadata without synchronizing tensor contents."""
     if topk_ids.dtype not in (torch.int32, torch.int64):
         raise TypeError(f"topk_ids must be int32 or int64, got {topk_ids.dtype}.")
@@ -143,7 +143,6 @@ def _validate_topk_inputs(
         raise ValueError(
             "hidden_states, topk_ids and topk_weights must be on one device."
         )
-    return topk_ids.reshape(-1)
 
 
 def _validate_supplied_counts(
@@ -534,7 +533,8 @@ def prepare_topk_route(
     Returns:
         Permuted tokens and exact native route metadata.
     """
-    flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
+    _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
+    flat_ids = topk_ids.reshape(-1)
     autograd_mask = _route_input_mask(tokens_per_expert, spec, flat_ids.device, autograd_mask)
     if spec.dynamic_tokens:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
@@ -605,7 +605,7 @@ def _reject_invalid_route_inputs(flags: list[int]) -> None:
         raise ValueError("tokens_per_expert must be an int32 or int64 histogram of shape (num_experts,) "
                          "on the route tensor device on all EP ranks")
     if any(flag & _INVALID_FORWARD_ROUTE_REPLAY_MASK for flag in flags):
-        raise ValueError("Forward router replay requires bound routers and experts, a parameter version, "
+        raise ValueError("Forward plan replay requires a bound expert executor, a parameter version, "
                          "and omitted tokens_per_expert on all EP ranks")
 
 
@@ -617,7 +617,7 @@ def _validate_route_flags(rows: list[list[int]]) -> None:
         if any((row[2] ^ flags) & _TENSOR_DUMP_MASK for row in rows):
             raise RuntimeError("MegaMoe Tensor Dump mode differs across EP ranks")
         if any((row[2] ^ flags) & _FORWARD_ROUTE_REPLAY_MASK for row in rows):
-            raise RuntimeError("MegaMoe forward router replay mode differs across EP ranks")
+            raise RuntimeError("MegaMoe forward plan replay mode differs across EP ranks")
         raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
 
 

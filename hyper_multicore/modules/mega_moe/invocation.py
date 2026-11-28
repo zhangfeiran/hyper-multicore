@@ -36,7 +36,7 @@ def prepare_expert_invocation(
     hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
     counts: torch.Tensor | None, weights: tuple[torch.Tensor, torch.Tensor],
     resources: "_MegaMoeExecutionResources", *, weight_error: bool = False,
-    planner: "BasePlanner | None" = None, scheduled: bool = False,
+    planner: "BasePlanner | None" = None, scheduled: bool = False, executor: object | None = None,
 ) -> AbstractContextManager[PreparedTopKRoute]:
     """Converge input errors on the existing route collective before physical binding.
 
@@ -72,11 +72,11 @@ def prepare_expert_invocation(
     finish_vote, pending = None, None
     if placement is not None:
         from hyper_multicore.modules.hot_replica.checkpoint import (  # pylint: disable=import-outside-toplevel
-            forward_route_replay_mask, route_record,
+            forward_plan_replay_mask, route_record,
         )
 
-        record, replay = route_record(resources)
-        mask = forward_route_replay_mask(record, hidden, ids, probs, counts, mask)
+        record, replay = route_record(resources, executor)
+        mask = forward_plan_replay_mask(record, hidden, ids, probs, counts, mask)
     direct_replay = replay and bool(mask & _FORWARD_ROUTE_REPLAY_MASK)
     if scheduled and not direct_replay:
         from hyper_multicore.modules.hot_replica.prefetch import start_replay_vote, start_wire  # pylint: disable=import-outside-toplevel
@@ -142,20 +142,25 @@ def _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace,
     """Reuse agreed descriptors, publishing a fresh permutation if recompute is required."""
     stats = resources.placement.statistics
     stats["route_replays"] += 1
-    if record.autograd_mask & _FORWARD_ROUTE_REPLAY_MASK:
-        stats["forward_router_replays"] = stats.get("forward_router_replays", 0) + 1
+    direct_replay = bool(record.autograd_mask & _FORWARD_ROUTE_REPLAY_MASK)
+    if direct_replay:
+        stats["forward_plan_replays"] = stats.get("forward_plan_replays", 0) + 1
     route = record.route
     if tensor_dump:
         record.allow_activation = False
-    resources.workspace.wait_for_reuse()
+    pull = resources.spec.dispatch_mode == "pull"
+    # Direct Push permutation owns its buffers until the expert claims the workspace.
+    if not direct_replay or pull:
+        resources.workspace.wait_for_reuse()
     if not record.allow_activation:
         with torch.inference_mode(False), torch.no_grad():
-            if resources.spec.dispatch_mode == "pull":
+            if pull:
                 prepare_workspace(route.metadata.plan_tokens, route.maximum_received_slots)
             binding = route.weight_binding
             virtual_ids = binding.placement.virtual_ids if binding is not None else ids
             rows, mapping = _materialize_route_permutation(hidden, virtual_ids, resources.spec, resources.workspace)
-        route = replace(route, routed_tokens=rows, unpermute_mapping=mapping)
+        return replace(route, routed_tokens=rows, unpermute_mapping=mapping,
+                       checkpoint_record=record, tensor_dump=tensor_dump)
     return replace(route, checkpoint_record=record, tensor_dump=tensor_dump)
 
 
@@ -166,9 +171,10 @@ def _record_checkpoint_route(route, record, counts, ids, mask):
     record.supplied_counts = counts.detach().clone() if counts is not None else None
     saved_counts = record.supplied_counts if route.tokens_per_expert is counts else route.tokens_per_expert
     record.route = replace(route, routed_tokens=None, unpermute_mapping=None, tokens_per_expert=saved_counts)
-    record.ids = ids.detach().clone()
     if mask & _FORWARD_ROUTE_REPLAY_MASK:
-        record.ids_version = record.ids._version  # pylint: disable=protected-access
+        record.source_rows = ids.shape[0]
+    else:
+        record.ids = ids.detach().clone()
     record.stream = torch.npu.current_stream(ids.device)
     record.autograd_mask = mask
     return replace(route, checkpoint_record=record)

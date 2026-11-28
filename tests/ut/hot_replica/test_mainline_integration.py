@@ -423,18 +423,20 @@ def test_nonreentrant_checkpoint_context_can_replay_a_retained_graph():
     assert phases == [False, True, True] and not replay.is_checkpointing()
 
 
-def test_forward_router_replay_preserves_interleaved_checkpoints_and_gradients(monkeypatch):
-    """Keep the router decision and plan with each call while deriving new probabilities."""
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_forward_plan_replay_preserves_interleaved_checkpoints_and_gradients(monkeypatch, dispatch_mode):
+    """Recompute the router and reuse each invocation's plan without voting or retaining IDs."""
     monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "stream")
     monkeypatch.setattr(invocation, "_materialize_route_permutation", lambda hidden, ids, *_: (hidden, ids))
-    spec = SimpleNamespace(ep_size=2, ep_group=None, num_experts=4, dispatch_mode="push", auto_tokens=True)
-    resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=SimpleNamespace(statistics={"route_replays": 0}))
+    spec = SimpleNamespace(ep_size=2, ep_group=None, num_experts=4, dispatch_mode=dispatch_mode, auto_tokens=True)
+    resources = SimpleNamespace(spec=spec, workspace=Mock(), prepare_auto_workspace=Mock(),
+                                placement=SimpleNamespace(statistics={"route_replays": 0}))
     prepare = Mock(side_effect=lambda hidden, ids, *_args, **_kwargs:
-                   route.PreparedTopKRoute(hidden, ids, None, None, object()))
+                   route.PreparedTopKRoute(hidden, ids, None, None, SimpleNamespace(plan_tokens=128)))
     gather = Mock(side_effect=lambda output, flag, **_kwargs: output.copy_(flag.expand_as(output)))
     monkeypatch.setattr(invocation, "prepare_topk_route", prepare)
     monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
-    routers = object(), object()
+    executors = object(), object()
     inputs = tuple(torch.randn(shape, generator=torch.Generator().manual_seed(seed))
                    for seed, shape in enumerate(((5, 3), (4, 3), (4, 3))))
 
@@ -442,78 +444,91 @@ def test_forward_router_replay_preserves_interleaved_checkpoints_and_gradients(m
         topk_calls = []
 
         def _layer(hidden, router_weight, expert_weight):
-            for router in routers:
+            for executor in executors:
                 scores = (hidden @ router_weight.T).sigmoid()
-
-                def _select():
-                    topk_calls.append(router)
-                    return scores.detach().topk(2, sorted=False).indices
-
-                ids = replay.forward_router_indices(router, _select)
+                topk_calls.append(executor)
+                ids = scores.detach().topk(2, sorted=False).indices
                 probs = scores.gather(-1, ids)
-                ids = replay.forward_expert_indices(router, ids.view_as(ids))
                 with invocation.prepare_expert_invocation(
                     hidden, ids, probs, None, (expert_weight, expert_weight), resources,
+                    executor=executor,
                 ) as plan:
                     hidden = plan.routed_tokens + (expert_weight[plan.unpermute_mapping] * probs.unsqueeze(-1)).sum(1)
             return hidden.square().sum()
 
         leaves = tuple(value.clone().requires_grad_() for value in inputs)
-        tapes = [replay.ReplayCheckpoint(lambda: 3, reuse_forward_router=direct) for _ in range(2)]
+        tapes = [replay.ReplayCheckpoint(lambda: 3, reuse_forward_plan=direct) for _ in range(2)]
         with patch.object(DefaultDeviceType, "get_device_type", return_value="cpu"), set_checkpoint_early_stop(False):
             outputs = tuple(checkpoint(_layer, *leaves, use_reentrant=False, context_fn=tape.contexts)
                             for tape in tapes)
         assert all(len(tape.records) == 2 for tape in tapes)
         assert tapes[0].records[0].route.metadata is not tapes[1].records[0].route.metadata
+        assert all((record.ids is None) == direct for tape in tapes for record in tape.records)
         for result in reversed(outputs):
             result.backward()
-        assert len(topk_calls) == (4 if direct else 8)
+        assert topk_calls == list(executors) * 4
         return (*outputs, *(leaf.grad for leaf in leaves))
 
     expected = _run(False)
     assert gather.call_count == 4
     gather.reset_mock()
+    assert resources.workspace.wait_for_reuse.call_count == 4
+    resources.workspace.wait_for_reuse.reset_mock()
     actual = _run(True)
     gather.assert_not_called()
+    assert resources.workspace.wait_for_reuse.call_count == (4 if dispatch_mode == "pull" else 0)
     for received, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(received, reference, rtol=0, atol=0)
     assert prepare.call_count == 8
-    assert resources.placement.statistics["forward_router_replays"] == 4
+    assert resources.placement.statistics["forward_plan_replays"] == 4
     assert all(call.kwargs["autograd_mask"] & route._FORWARD_ROUTE_REPLAY_MASK
                for call in prepare.call_args_list[4:])
 
 
-@pytest.mark.parametrize("change", ["parameter", "router", "expert", "router_ids", "expert_ids"])
-def test_forward_router_replay_rejects_a_changed_record(change):
-    """A direct replay mismatch fails before the invocation can select another route."""
+@pytest.mark.parametrize("change", ["parameter", "executor", "resources", "stream", "shape", "counts"])
+def test_forward_plan_replay_rejects_a_changed_invocation(monkeypatch, change):
+    """Reject changed resources or invocation metadata without a local route fallback."""
     version = 0
-    tape = replay.ReplayCheckpoint(lambda: version, reuse_forward_router=True)
+    stream = "forward"
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _device: stream)
+    hidden = torch.ones(1, 4)
+    ids = torch.tensor([[2, 0]])
+    probs = torch.ones(1, 2)
+    spec = SimpleNamespace(dispatch_mode="push", auto_tokens=True)
+    resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=Mock())
+    executor = object()
+    prepare = Mock(return_value=route.PreparedTopKRoute(hidden, ids, None, None, object()))
+    vote = Mock()
+    monkeypatch.setattr(invocation, "prepare_topk_route", prepare)
+    monkeypatch.setattr(replay, "agree_replay", vote)
+    tape = replay.ReplayCheckpoint(lambda: version, reuse_forward_plan=True)
     fwd, recompute = tape.contexts()
-    router, expert = object(), object()
-    indices = torch.tensor([[2, 0]])
-    with fwd:
-        replay.forward_router_indices(router, lambda: indices)
-        ids = replay.forward_expert_indices(expert, indices.view_as(indices))
-        record, _ = replay.route_record(expert)
-        record.ids = ids.clone()
-        record.ids_version = record.ids._version
 
-    if change == "parameter":
-        version += 1
-    elif change == "router_ids":
-        indices.add_(1)
-    elif change == "expert_ids":
-        record.ids.add_(1)
-    with pytest.raises(RuntimeError, match="Cannot consume the recorded forward"), recompute:
-        ids = replay.forward_router_indices(object() if change == "router" else router, lambda: indices)
-        replay.forward_expert_indices(object() if change == "expert" else expert, ids.view_as(ids))
+    with fwd, invocation.prepare_expert_invocation(
+        hidden, ids, probs, None, (hidden, hidden), resources, executor=executor,
+    ):
+        pass
+    version += int(change == "parameter")
+    stream = "other" if change == "stream" else stream
+    replay_executor = object() if change == "executor" else executor
+    replay_resources = SimpleNamespace(**vars(resources)) if change == "resources" else resources
+    rows = 2 if change == "shape" else 1
+    counts = torch.ones(4, dtype=torch.int32) if change == "counts" else None
+    with pytest.raises(RuntimeError, match="[Rr]ecorded.*expert (executor|plan)"), recompute:
+        with invocation.prepare_expert_invocation(
+            hidden.expand(rows, -1), ids.expand(rows, -1), probs.expand(rows, -1),
+            counts, (hidden, hidden), replay_resources, executor=replay_executor,
+        ):
+            pytest.fail("Replay should reject the invocation before consuming its route")
+    prepare.assert_called_once()
+    vote.assert_not_called()
     assert not replay.is_checkpointing()
 
 
-def test_forward_router_replay_modes_use_the_existing_forward_header():
+def test_forward_plan_replay_modes_use_the_existing_forward_header():
     """Report the same protocol setup error using the flags already exchanged in forward."""
     mask = route._FORWARD_ROUTE_REPLAY_MASK
-    with pytest.raises(RuntimeError, match="forward router replay mode differs across EP ranks"):
+    with pytest.raises(RuntimeError, match="forward plan replay mode differs across EP ranks"):
         route._validate_route_flags([[0, 1, mask], [0, 1, 0]])
     with pytest.raises(ValueError, match="omitted tokens_per_expert on all EP ranks"):
         route._validate_route_flags([[0, 1, mask], [0, 1, mask | route._INVALID_FORWARD_ROUTE_REPLAY_MASK]])
