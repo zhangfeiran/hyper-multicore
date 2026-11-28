@@ -12,42 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Checkpoint-owned routing and replica state for reentrant BF16 Push and Pull."""
+"""Checkpoint-owned routing and replica state for BF16 Push and Pull."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import wraps
-import os
-from threading import Lock
 from types import TracebackType
-from typing import Any, ClassVar
+from typing import Any, TYPE_CHECKING
 
 import torch
-import torch.distributed as dist
 
 from hyper_multicore.modules.mega_moe.route import (
-    _INVALID_COUNTS_MASK, _INVALID_ROUTE_INPUT_MASK, _reject_invalid_route_inputs, _validate_supplied_counts,
+    _FORWARD_PLAN_REPLAY_MASK, _INVALID_CHECKPOINT_VERSION_MASK, _INVALID_WEIGHT_MASK,
+    _TENSOR_DUMP_MASK, PreparedTopKRoute, _validate_supplied_counts, _validate_topk_inputs,
 )
+
+
+if TYPE_CHECKING:
+    from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 
 
 @dataclass
 class ReplayRecord:
-    """Save one forward's immutable route and optionally its owned activations."""
+    """Hold the forward placement and invocation metadata without saving Router tensors."""
 
     owner: Any
-    ids: torch.Tensor | None = None
-    supplied_counts: torch.Tensor | None = None
-    route: Any = None
+    executor: object | None = None
+    route: PreparedTopKRoute | None = None
+    route_inputs: tuple[torch.Size, torch.dtype, torch.device, bool, bool] | None = None
     stream: Any = None
     autograd_mask: int = 0
-    inputs: tuple[torch.Tensor, torch.Tensor] | None = None
-    input_versions: tuple[int, int] | None = None
-    activation: Any = None
-    allow_activation: bool = False
 
 
 @dataclass
@@ -55,12 +53,11 @@ class _CheckpointScope:
     records: list[ReplayRecord]
     replay: bool
     same_parameters: bool
-    non_reentrant: bool = False
+    non_reentrant: bool
     cursor: int = 0
 
 
 _ACTIVE: ContextVar[_CheckpointScope | None] = ContextVar("hmc_hot_replica_checkpoint", default=None)
-_REPLAY_ACTIVATION_MASK = 1 << 7
 _REPLAY_SCOPES: ContextVar[tuple[AbstractContextManager, ...]] = ContextVar("hmc_replay_scopes", default=())
 
 
@@ -87,7 +84,7 @@ class _ReplayContext(AbstractContextManager):
 
 
 class ReplayCheckpoint:
-    """Hold one checkpoint invocation's tape across original and replay contexts."""
+    """Record the original placement of each expert call for one checkpoint."""
 
     def __init__(self, parameter_version: Callable[[], Any]) -> None:
         """Register the caller's logical parameter version lookup."""
@@ -109,13 +106,13 @@ class ReplayCheckpoint:
                 raise RuntimeError("Create a separate wrap_checkpoint wrapper or ReplayCheckpoint for each forward")
             self.started = True
             self.forward_version = version
-        state = _CheckpointScope(
-            self.records, replay, version is not None and version == self.forward_version,
-            non_reentrant=non_reentrant,
-        )
+        state = _CheckpointScope(self.records, replay, version is not None and version == self.forward_version,
+                                 non_reentrant)
         token = _ACTIVE.set(state)
         try:
             yield
+            if replay and state.cursor != len(state.records):
+                raise RuntimeError("Checkpoint replay did not reach all of its recorded forward expert calls")
         finally:
             _ACTIVE.reset(token)
 
@@ -123,12 +120,11 @@ class ReplayCheckpoint:
 def wrap_checkpoint(
     function: Callable[..., Any], parameter_version: Callable[[], Any], *, prepare_replay: bool = False,
 ) -> Callable[..., Any]:
-    """Wrap one checkpoint call with state scoped to its original and replay forwards.
+    """Wrap one reentrant checkpoint call with its forward expert plans.
 
-    The framework supplies a lightweight logical parameter version for its
-    sharded module. A changed version disables weight and activation reuse.
-    The consumer restores saved guest weights after route agreement.
-    The legacy ``prepare_replay`` argument is accepted for compatibility.
+    The parameter version and ordered Top-K routes must match in the original
+    forward and recompute. The legacy prepare_replay argument is accepted
+    for compatibility.
     """
     del prepare_replay
     tape = ReplayCheckpoint(parameter_version)
@@ -147,168 +143,54 @@ def is_checkpointing() -> bool:
     return _ACTIVE.get() is not None
 
 
-def route_record(owner: Any) -> tuple[ReplayRecord | None, bool]:
-    """Get the record corresponding to the current invocation in this checkpoint."""
+def is_checkpoint_replaying() -> bool:
+    """Report whether the active checkpoint is recomputing its forward."""
+    scope = _ACTIVE.get()
+    return scope is not None and scope.replay
+
+
+def route_record(owner: Any, executor: object | None = None) -> tuple[ReplayRecord | None, bool]:
+    """Match the current expert call by checkpoint position and executor identity."""
     scope = _ACTIVE.get()
     if scope is None:
         return None, False
     if not scope.replay:
-        record = ReplayRecord(owner)
+        record = ReplayRecord(owner, executor)
         scope.records.append(record)
         return record, False
-    index = scope.cursor
+    if not scope.same_parameters:
+        raise RuntimeError("HotReplica checkpoint replay requires the original logical parameter version")
+    if scope.cursor >= len(scope.records):
+        raise RuntimeError("Checkpoint replay reached an expert call absent from the original forward")
+    record = scope.records[scope.cursor]
+    if record.owner is not owner or record.executor is not executor:
+        raise RuntimeError("Checkpoint replay did not reach the recorded forward expert executor and resources")
     scope.cursor += 1
-    if index < len(scope.records) and scope.records[index].owner is owner:
-        # Reuse the saved tensors while keeping each replay's agreement local to that invocation.
-        return replace(scope.records[index]), True
-    return None, True
+    return record, True
 
 
-def agree_replay(
-    record: ReplayRecord | None, hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
-    counts: torch.Tensor | None, spec: Any, mask: int,
-) -> bool:
-    """Agree across EP on exact routing and activation validity."""
-    flag = local_replay_vote(record, hidden, ids, probs, counts, spec, mask)
-    gathered = flag.new_empty(spec.ep_size)
-    dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
-    return resolve_replay_vote(record, gathered.tolist())
-
-
-def local_replay_vote(record, hidden, ids, probs, counts, spec, mask):
-    """Compute the existing vote on the caller's computation stream."""
+def forward_plan_replay_mask(
+    record: ReplayRecord, hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
+    counts: torch.Tensor | None, spec: MegaMoeSpec, mask: int, *, scheduled: bool,
+) -> int:
+    """Validate the replay contract using Host metadata and the original forward exchange."""
     scope = _ACTIVE.get()
     assert scope is not None
+    mask |= _FORWARD_PLAN_REPLAY_MASK
+    if scope.replay and mask & _INVALID_WEIGHT_MASK:
+        raise ValueError("expert weights do not match the recorded forward layout")
+    inputs = (ids.shape, ids.dtype, ids.device, counts is not None, scheduled)
+    stream = torch.npu.current_stream(hidden.device)
+    if not scope.replay:
+        record.route_inputs, record.stream, record.autograd_mask = inputs, stream, mask
+        return mask if scope.same_parameters else mask | _INVALID_CHECKPOINT_VERSION_MASK
+
+    _validate_topk_inputs(hidden, ids, probs)
     if counts is not None:
-        try:
-            _validate_supplied_counts(counts, spec.num_experts, hidden.device)
-        except (TypeError, ValueError):
-            mask |= _INVALID_COUNTS_MASK
-    invalid = mask & _INVALID_ROUTE_INPUT_MASK
-    with torch.no_grad():
-        if not invalid and _can_replay(record, ids, counts, mask, scope):
-            return _replay_vote(record, hidden, ids, probs, counts, mask)
-        return torch.full((1,), invalid, dtype=torch.int32, device=hidden.device)
-
-
-def resolve_replay_vote(record, flags):
-    """Apply the same replay decision for immediate and scheduled consumption."""
-    scope = _ACTIVE.get()
-    assert scope is not None
-    route_mask = ~_REPLAY_ACTIVATION_MASK
-    first = flags[0] & route_mask
-    reuse = first != 0 and not first & _INVALID_ROUTE_INPUT_MASK and all(
-        (value & route_mask) == first for value in flags)
-    if not reuse:
-        _reject_invalid_route_inputs(flags)
-        if scope.non_reentrant:
-            raise RuntimeError("Non-reentrant MegaMoe checkpoint could not replay its original expert layout "
-                               "on all EP ranks")
-    if record is not None:
-        record.allow_activation = reuse and all(value & _REPLAY_ACTIVATION_MASK for value in flags)
-    return reuse
-
-
-def _can_replay(
-    record: ReplayRecord | None, ids: torch.Tensor, counts: torch.Tensor | None,
-    mask: int, scope: _CheckpointScope,
-) -> bool:
-    """Check the saved metadata and execution mode before comparing tensors."""
-    if not scope.same_parameters or record is None:
-        return False
-    return (
-        record.route is not None and record.ids is not None
-        and record.ids.shape == ids.shape and record.ids.dtype == ids.dtype and record.ids.device == ids.device
-        and (counts is None) == (record.supplied_counts is None)
-        and record.stream == torch.npu.current_stream(ids.device)
-        and (not scope.non_reentrant or record.autograd_mask == mask)
-    )
-
-
-def _replay_vote(record: ReplayRecord, hidden, ids, probs, counts, mask):
-    """Vote on exact route identity and whether saved activations still match."""
-    same_route = (ids == record.ids).all()
-    if counts is not None:
-        same_route = same_route & (counts == record.supplied_counts).all()
-    flag = same_route.to(torch.int32).reshape(1) * mask
-    if record.activation is not None and record.inputs is not None:
-        value, score = record.inputs
-        if value.shape != hidden.shape or score.shape != probs.shape:
-            return flag
-        # The tensor version counters detect writes through aliases to the saved inputs.
-        versions = value._version, score._version  # pylint: disable=protected-access
-        if record.input_versions == versions:
-            same_values = same_route & (value == hidden).all() & (score == probs).all()
-            flag += same_values.to(torch.int32).reshape(1) * _REPLAY_ACTIVATION_MASK
-    return flag
-
-
-class ActivationReservation:
-    """A per-device, process-wide limit on additional checkpoint activations."""
-
-    __slots__ = ("device", "required")
-    used: ClassVar[dict] = {}
-    lock = Lock()
-    counters: ClassVar[dict] = {}
-    limits: ClassVar[dict] = {}
-
-    @classmethod
-    def reserve(
-        cls, flat: torch.Tensor, required: int, group: dist.ProcessGroup,
-    ) -> ActivationReservation | None:
-        """Charge a local snapshot while retaining headroom for FSDP."""
-        device = flat.device
-        key = (device, id(group))
-        with cls.lock:
-            if key not in cls.limits:
-                total = torch.npu.get_device_properties(device).total_memory
-                free = torch.npu.mem_get_info(device)[0]
-                configured = os.getenv("HYPER_MULTICORE_HOT_REPLICA_CHECKPOINT_BYTES")
-                # Optional activations share HBM with FSDP and the symmetric
-                # heap. Leave headroom for transient allocations. Admission can
-                # differ by rank, and the existing replay consensus handles
-                # a local miss without introducing a conditional collective.
-                default_limit = total // 6
-                limit = default_limit if configured is None else max(0, int(configured))
-                local_limit = min(limit, max(0, free - total // 3))
-                cls.limits[key] = local_limit, free
-            limit, free = cls.limits[key]
-            used = cls.used.get(device, 0)
-            counts = cls.counters.get(device)
-            if counts is None:
-                counts = {
-                    "initial_free": free, "attempts": 0, "budget_rejections": 0,
-                    "memory_rejections": 0, "reservations": 0, "releases": 0, "peak_reserved": 0,
-                    "pressure_events": 0, "allowed_bytes": limit, "allocator_retries": 0,
-                }
-                cls.counters[device] = counts
-            if used == 0 and counts["attempts"] and limit:
-                retries = torch.npu.memory_stats(device).get("num_alloc_retries", 0)
-                if retries > counts["allocator_retries"]:
-                    # A retry during previous work is evidence that the cached
-                    # bytes competed with a required allocation. Back off at
-                    # the next empty reservation boundary without freeing any
-                    # live tensor or changing the collective execution order.
-                    limit //= 2
-                    cls.limits[key] = limit, free
-                    counts["pressure_events"] += 1
-                    counts["allowed_bytes"] = limit
-                counts["allocator_retries"] = max(retries, counts["allocator_retries"])
-            counts["attempts"] += 1
-            if required > limit - used:
-                counts["budget_rejections"] += 1
-                return None
-            obj = cls()
-            cls.used[device] = used + required
-            counts["reservations"] += 1
-            counts["peak_reserved"] = max(counts["peak_reserved"], cls.used[device])
-            obj.device = device
-            obj.required = required
-            return obj
-
-    def __del__(self):
-        # This charge owns no tensors and has no reference back to a graph.
-        cls = type(self)
-        with cls.lock:
-            cls.used[self.device] -= self.required
-            cls.counters[self.device]["releases"] += 1
+        _validate_supplied_counts(counts, spec.num_experts, hidden.device)
+    # Reentrant recompute enables autograd after its no-grad original forward.
+    mode_mask = -1 if scope.non_reentrant else _TENSOR_DUMP_MASK
+    if (record.route is None or record.route_inputs != inputs or record.stream != stream
+            or (record.autograd_mask ^ mask) & mode_mask):
+        raise RuntimeError("Recorded forward expert plan does not match the replay invocation")
+    return mask

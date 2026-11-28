@@ -13,12 +13,14 @@
 # limitations under the License.
 # ============================================================================
 """Precision-independent workspace, lease and distributed resource ownership."""
+import os
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 import torch
 import torch.distributed as dist
 from hyper_multicore import _collective, shmem
+from hyper_multicore._loader import load_torch_npu
 from . import transport as moe_transport
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .spec import MegaMoeSpec, bind_mega_moe_spec
@@ -83,8 +85,17 @@ class _MegaMoeExecutionResources:
                 if transport == "udma":
                     moe_transport.require_queue_backend()
                 self.plan = self._initial_plan(tensor)
+                reuse_saved = os.environ.get("HYPER_MULTICORE_A3_PUSH_REUSE_SAVED") == "1"
+                reuse_scratch = reuse_saved or os.environ.get("HYPER_MULTICORE_A3_PUSH_REUSE_SCRATCH") == "1"
+                compact_wire = os.environ.get("HYPER_MULTICORE_A3_PUSH_COMPACT_ROUTE_WIRE") == "1"
+                eligible = ((reuse_scratch or compact_wire) and bool(placement) and self.spec.precision == "bf16"
+                            and self.spec.architecture == 2201 and self.spec.dispatch_mode == "push"
+                            and transport == "mte" and load_torch_npu().__version__ == "2.7.1")
                 self.workspace = MegaMoeWorkspace(
                     shared=shared, event_experts=_workspace_event_experts(specification) if placement else None,
+                    reuse_bf16_push_scratch=eligible and reuse_scratch,
+                    reuse_bf16_push_saved=eligible and reuse_saved,
+                    compact_push_route_wire=eligible and compact_wire,
                 )
                 self.workspace.transport_engine = self.spec.transport_engine
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)

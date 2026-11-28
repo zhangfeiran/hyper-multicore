@@ -194,7 +194,7 @@ def test_tensor_dump_preserves_the_original_replay_binding():
     assert binding.mode is ReplicaExecutionMode.FP32_BAND
 
 
-def test_submission_counts_the_executed_protocol_and_skips_activation_reuse():
+def test_submission_counts_the_executed_protocol():
     """A staged diagnostic launch and a fused launch each count once."""
     spec = SimpleNamespace(dispatch_mode="push", apply_probs_before_fc2=True, num_experts=2, architecture=0)
     resources = SimpleNamespace(spec=spec, workspace=Mock(), plan_for_tokens=Mock())
@@ -210,22 +210,17 @@ def test_submission_counts_the_executed_protocol_and_skips_activation_reuse():
     def _forward(current):
         return execution.forward(None, hidden, hidden, ids, hidden, (hidden, hidden), resources, current)
 
-    with (
-        patch.object(execution, "execute_mega_moe_with_permutation", return_value=hidden) as launch,
-        patch.object(execution, "_CheckpointedMegaMoeFunction") as retained,
-    ):
+    with patch.object(execution, "execute_mega_moe_with_permutation", return_value=hidden) as launch:
         _forward(replace(prepared, tensor_dump=True))
         assert launch.call_args.kwargs["weight_binding"].mode is ReplicaExecutionMode.STAGED
         _forward(prepared)
         assert launch.call_args.kwargs["weight_binding"] is binding
-        _forward(replace(prepared, checkpoint_record=SimpleNamespace(allow_activation=True, activation=())))
-        retained.apply.assert_called_once()
         launch.side_effect = RuntimeError("launch failed")
         with pytest.raises(RuntimeError, match="launch failed"):
             _forward(prepared)
     stats = resources.placement.statistics
     assert stats["placements"] == 2
-    assert stats["staged_bindings"] == stats["fp32_band_bindings"] == stats["skipped_recomputes"] == 1
+    assert stats["staged_bindings"] == stats["fp32_band_bindings"] == 1
 
 
 def test_successful_fused_weight_acquire_records_prefetch_and_returns_operands():

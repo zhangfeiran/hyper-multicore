@@ -22,8 +22,9 @@ import torch
 from hyper_multicore.diagnostics.api import is_tensor_dump_active
 from .heap_manager import _HeapCapacityError
 from .route import (
-    _INVALID_WEIGHT_MASK, _TENSOR_DUMP_MASK, PreparedTopKRoute, _materialize_route_permutation,
-    _prepare_placed_route, prepare_topk_route,
+    _INVALID_WEIGHT_MASK, _TENSOR_DUMP_MASK,
+    PreparedTopKRoute, _materialize_route_permutation,
+    _permute_topk_input_out, _prepare_placed_route, prepare_topk_route,
 )
 
 if TYPE_CHECKING:
@@ -35,7 +36,7 @@ def prepare_expert_invocation(
     hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
     counts: torch.Tensor | None, weights: tuple[torch.Tensor, torch.Tensor],
     resources: "_MegaMoeExecutionResources", *, weight_error: bool = False,
-    planner: "BasePlanner | None" = None, scheduled: bool = False,
+    planner: "BasePlanner | None" = None, scheduled: bool = False, executor: object | None = None,
 ) -> AbstractContextManager[PreparedTopKRoute]:
     """Converge input errors on the existing route collective before physical binding.
 
@@ -52,6 +53,24 @@ def prepare_expert_invocation(
         | (int(probs.requires_grad) << 4))
     if tensor_dump:
         mask |= _TENSOR_DUMP_MASK
+    record, pending = None, None
+    if placement is not None:
+        from hyper_multicore.modules.hot_replica.checkpoint import (  # pylint: disable=import-outside-toplevel
+            forward_plan_replay_mask, route_record,
+        )
+
+        record, replay = route_record(resources, executor)
+        if record is not None:
+            mask = forward_plan_replay_mask(
+                record, hidden, ids, probs, counts, resources.spec, mask, scheduled=scheduled,
+            )
+            if replay:
+                return _restore_checkpoint_route(record.route, hidden, ids, resources, tensor_dump)
+
+    if scheduled:
+        from hyper_multicore.modules.hot_replica.prefetch import start_wire  # pylint: disable=import-outside-toplevel
+
+        pending = start_wire(hidden, ids, probs, counts, resources, mask)
     pull = resources.spec.dispatch_mode == "pull"
     leased_workspace = None
 
@@ -67,33 +86,11 @@ def prepare_expert_invocation(
         if pull:
             leased_workspace = resources.workspace
 
-    record, replay = None, False
-    finish_vote, pending = None, None
-    if placement is not None:
-        from hyper_multicore.modules.hot_replica.checkpoint import agree_replay, route_record  # pylint: disable=import-outside-toplevel
-
-        record, replay = route_record(resources)
-    if scheduled:
-        from hyper_multicore.modules.hot_replica.prefetch import start_replay_vote, start_wire  # pylint: disable=import-outside-toplevel
-
-        if replay:
-            finish_vote = start_replay_vote(record, hidden, ids, probs, counts, resources, mask)
-        else:
-            pending = start_wire(hidden, ids, probs, counts, resources, mask)
-    elif replay:
-        finish_vote = partial(agree_replay, record, hidden, ids, probs, counts, resources.spec, mask)
-
     @contextmanager
     def consume() -> Iterator[PreparedTopKRoute]:
-        nonlocal leased_workspace, record
+        """Prepare a fresh route under the workspace lease."""
+        nonlocal leased_workspace
         try:
-            if finish_vote is not None and finish_vote():
-                placement.statistics["route_replays"] += 1
-                yield _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace, tensor_dump)
-                return
-            if replay:
-                placement.statistics["route_replay_misses"] += 1
-                record = None
             options = {"autograd_mask": mask}
             if planner is not None:
                 options["select_placement"] = partial(placement.select, planner=planner)
@@ -118,12 +115,12 @@ def prepare_expert_invocation(
                     route = _prepare_placed_route(
                         hidden, ids, resources.spec, resources.workspace, pending.permuted, pending.payload[3:],
                         pending.gathered, None, stream, prepare_workspace, options["select_placement"], mask,
-                        reuse_placement_geometry=True, snapshot=snapshot,
+                        reuse_placement_geometry=True, snapshot=snapshot, inverse_only=pending.inverse_only,
                     )
             if not pull and not resources.spec.auto_tokens:
                 with torch.inference_mode(False):
                     resources.ensure_capacity(route.maximum_received_slots)
-            yield _record_checkpoint_route(route, record, counts, ids, mask)
+            yield _record_checkpoint_route(route, record, counts)
         finally:
             if leased_workspace is not None:
                 leased_workspace.release()
@@ -131,31 +128,45 @@ def prepare_expert_invocation(
     return consume()
 
 
-def _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace, tensor_dump):
-    """Reuse agreed descriptors, publishing a fresh permutation if recompute is required."""
-    route = record.route
-    if tensor_dump:
-        record.allow_activation = False
-    resources.workspace.wait_for_reuse()
-    if not record.allow_activation:
+@contextmanager
+def _restore_checkpoint_route(
+    route: PreparedTopKRoute, hidden: torch.Tensor, ids: torch.Tensor,
+    resources: "_MegaMoeExecutionResources", tensor_dump: bool,
+) -> Iterator[PreparedTopKRoute]:
+    """Permute current inputs with the exact descriptors selected in forward."""
+    workspace = resources.workspace
+    reuse_source = (getattr(workspace, "reuse_bf16_push_scratch", False) is True
+                    and not tensor_dump and bool(hidden.shape[0]))
+    claimed = resources.spec.dispatch_mode == "pull" or reuse_source
+    if claimed:
+        # Forward committed this capacity. A restart only grows or rebinds it.
+        workspace.claim()
+    try:
         with torch.inference_mode(False), torch.no_grad():
-            if resources.spec.dispatch_mode == "pull":
-                prepare_workspace(route.metadata.plan_tokens, route.maximum_received_slots)
             binding = route.weight_binding
             virtual_ids = binding.placement.virtual_ids if binding is not None else ids
-            rows, mapping = _materialize_route_permutation(hidden, virtual_ids, resources.spec, resources.workspace)
-        route = replace(route, routed_tokens=rows, unpermute_mapping=mapping)
-    return replace(route, checkpoint_record=record, tensor_dump=tensor_dump)
+            if reuse_source:
+                shape = (virtual_ids.numel(), hidden.shape[1])
+                source = workspace.borrow_local_scratch("push_source_rows", shape, hidden)
+                rows, mapping = _permute_topk_input_out(hidden, virtual_ids, source)
+            else:
+                rows, mapping = _materialize_route_permutation(hidden, virtual_ids, resources.spec, workspace)
+        resources.placement.statistics["route_replays"] += 1
+        yield replace(
+            route, routed_tokens=rows, unpermute_mapping=mapping, tensor_dump=tensor_dump,
+            workspace_claimed=claimed,
+        )
+    finally:
+        if claimed:
+            workspace.release(stream=workspace.lease_stream)
 
 
-def _record_checkpoint_route(route, record, counts, ids, mask):
+def _record_checkpoint_route(route, record, counts):
     """Keep the route descriptors and placement with the checkpoint invocation."""
     if record is None:
         return route
-    record.supplied_counts = counts.detach().clone() if counts is not None else None
-    saved_counts = record.supplied_counts if route.tokens_per_expert is counts else route.tokens_per_expert
+    saved_counts = route.tokens_per_expert
+    if counts is not None and saved_counts is counts:
+        saved_counts = counts.detach().clone()
     record.route = replace(route, routed_tokens=None, unpermute_mapping=None, tokens_per_expert=saved_counts)
-    record.ids = ids.detach().clone()
-    record.stream = torch.npu.current_stream(ids.device)
-    record.autograd_mask = mask
     return replace(route, checkpoint_record=record)

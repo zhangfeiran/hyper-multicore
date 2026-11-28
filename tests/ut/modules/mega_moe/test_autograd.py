@@ -188,30 +188,6 @@ class TestMegaMoeFunction(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_cached_activations_use_the_shared_backward_save_contract(self) -> None:
-        """Pass retained rows to the shared backward without requiring deferred saves."""
-        rows = torch.ones(1, 2, dtype=torch.bfloat16)
-        mapping = torch.zeros(1, dtype=torch.int32)
-        activations = rows, rows, rows, rows, mapping, None
-        plan = SimpleNamespace(spec=SimpleNamespace(expert_weight_layout="EOI", hidden_size=2))
-        context = SimpleNamespace(save_for_backward=Mock())
-        offsets = torch.zeros(1, dtype=torch.int64)
-        groups = torch.ones(1, dtype=torch.int64)
-        route = function_module.RouteMetadata(
-            offsets, offsets, groups, offsets, offsets, groups, groups, 1, all_experts_active=True,
-        )
-        output = function_module._CheckpointedMegaMoeFunction.forward(
-            context, rows, rows, rows, route, plan, Mock(), activations, torch.ones(1, 1), None,
-        )
-        self.assertIs(output, rows)
-        self.assertIs(context.save_for_backward.call_args.args[0], rows)
-        saved, _ = function_module._saved_backward_state(context.save_for_backward.call_args.args)
-        self.assertIs(saved.group_list, groups)
-        self.assertEqual(saved.all_experts_active.device.type, "cpu")
-        self.assertTrue(saved.all_experts_active.item())
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_deferred_backward_keeps_local_owned_storage_after_workspace_reuse(self) -> None:
         """Feature: Deferred backward storage.
         Description: Reuse the workspace between deferred forward and backward.

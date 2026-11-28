@@ -85,6 +85,7 @@ foreach(utility_arch IN LISTS HP_MULTICORE_NPU_ARCHS)
 endforeach()
 
 add_library(hyper_multicore_torch SHARED
+    csrc/storage_ownership.cpp
     csrc/mega_moe_utilities.cpp
     ${UTILITY_OBJECTS}
     csrc/registration.cpp

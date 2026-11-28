@@ -493,6 +493,12 @@ def hyper_mega_mhc_grad(
     )
 
 
+def _storage_is_unique(owners: tuple[torch.Tensor, ...]) -> bool:
+    """Check that no other Tensor or saved-tensor holder shares these buffers."""
+    _load_native()
+    return torch.ops.hyper_multicore._storage_is_unique(owners)
+
+
 def moe_token_permute_out(
     tokens: torch.Tensor,
     indices: torch.Tensor,

@@ -63,6 +63,7 @@ class PreparedTopKRoute:
     weight_binding: Any = field(default=None, repr=False, compare=False)
     checkpoint_record: Any = field(default=None, repr=False, compare=False)
     tensor_dump: bool = False
+    workspace_claimed: bool = False
 
 
 _record_metadata_stream = RouteMetadata.record_stream
@@ -128,7 +129,7 @@ def _validate_topk_inputs(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
-) -> torch.Tensor:
+) -> None:
     """Validate route tensor metadata without synchronizing tensor contents."""
     if topk_ids.dtype not in (torch.int32, torch.int64):
         raise TypeError(f"topk_ids must be int32 or int64, got {topk_ids.dtype}.")
@@ -143,7 +144,6 @@ def _validate_topk_inputs(
         raise ValueError(
             "hidden_states, topk_ids and topk_weights must be on one device."
         )
-    return topk_ids.reshape(-1)
 
 
 def _validate_supplied_counts(
@@ -297,7 +297,7 @@ def _permute_topk_input_out(
     topk_ids: torch.Tensor,
     output: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Keep the inverse mapping owned while writing rows into leased SHMEM."""
+    """Keep the inverse mapping owned while writing into caller-provided storage."""
     mapping = torch.empty(topk_ids.numel(), dtype=torch.int32, device=topk_ids.device)
     multicore_ops.moe_token_permute_out(hidden_states.contiguous(), topk_ids.contiguous(), output, mapping)
     return output, mapping
@@ -534,7 +534,8 @@ def prepare_topk_route(
     Returns:
         Permuted tokens and exact native route metadata.
     """
-    flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
+    _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
+    flat_ids = topk_ids.reshape(-1)
     autograd_mask = _route_input_mask(tokens_per_expert, spec, flat_ids.device, autograd_mask)
     if spec.dynamic_tokens:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
@@ -592,7 +593,9 @@ def _validate_dynamic_sizes(rows: list[list[int]], spec: MegaMoeSpec) -> None:
 _INVALID_WEIGHT_MASK = 1 << 5
 _TENSOR_DUMP_MASK = 1 << 6
 _INVALID_COUNTS_MASK = 1 << 9
-_INVALID_ROUTE_INPUT_MASK = _INVALID_WEIGHT_MASK | _INVALID_COUNTS_MASK
+_FORWARD_PLAN_REPLAY_MASK = 1 << 10
+_INVALID_CHECKPOINT_VERSION_MASK = 1 << 11
+_INVALID_ROUTE_INPUT_MASK = _INVALID_WEIGHT_MASK | _INVALID_COUNTS_MASK | _INVALID_CHECKPOINT_VERSION_MASK
 
 
 def _reject_invalid_route_inputs(flags: list[int]) -> None:
@@ -602,6 +605,8 @@ def _reject_invalid_route_inputs(flags: list[int]) -> None:
     if any(flag & _INVALID_COUNTS_MASK for flag in flags):
         raise ValueError("tokens_per_expert must be an int32 or int64 histogram of shape (num_experts,) "
                          "on the route tensor device on all EP ranks")
+    if any(flag & _INVALID_CHECKPOINT_VERSION_MASK for flag in flags):
+        raise ValueError("HotReplica checkpoint requires a logical parameter version on all EP ranks")
 
 
 def _validate_route_flags(rows: list[list[int]]) -> None:
@@ -611,6 +616,8 @@ def _validate_route_flags(rows: list[list[int]]) -> None:
         _reject_invalid_route_inputs([row[2] for row in rows])
         if any((row[2] ^ flags) & _TENSOR_DUMP_MASK for row in rows):
             raise RuntimeError("MegaMoe Tensor Dump mode differs across EP ranks")
+        if any((row[2] ^ flags) & _FORWARD_PLAN_REPLAY_MASK for row in rows):
+            raise RuntimeError("MegaMoe checkpoint participation differs across EP ranks")
         raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
 
 
@@ -1003,11 +1010,11 @@ def _prepare_dynamic_route(
 
 def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gathered,
                           work, stream, prepare_workspace, select_placement, autograd_mask=0,
-                          reuse_placement_geometry=False, snapshot=None):
+                          reuse_placement_geometry=False, snapshot=None, *, inverse_only=None):
     """Select a per-call route between count validation and capacity commitment."""
     if work is not None:
         work.wait()
-    inverse = None if permuted is None else permuted[1]
+    inverse = inverse_only if permuted is None else permuted[1]
     if reuse_placement_geometry:
         from ..hot_replica.bounded_placement import read_placement_wire  # pylint: disable=import-outside-toplevel
 
@@ -1036,6 +1043,9 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
         if reuse_placement_geometry:
             metadata = snapshot.ordinary_metadata(spec, hidden)
         prepare_workspace(summary.plan_tokens, summary.maximum)
+        if inverse_only is not None:
+            # The ordinary path keeps the exact permutation used by the fused route.
+            permuted, _ = _permute_and_count(hidden, ids, spec)
         permuted = _materialize_route_permutation(hidden, ids, spec, workspace, permuted)
         return _finalize_dynamic_route(
             permuted, counts, summary, host_rows, metadata, None, gathered, spec,

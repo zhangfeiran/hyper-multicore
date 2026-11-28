@@ -17,10 +17,11 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from hyper_multicore.modules.hot_replica.shmem_transfer import ReplicaExecutionMode
+from hyper_multicore.modules.hot_replica.checkpoint import is_checkpointing
 
 from ...route import PreparedTopKRoute, restore_topk_output
 
-from .autograd import _CheckpointedMegaMoeFunction, execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
+from .autograd import execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
 
 if TYPE_CHECKING:
     from .resources import BF16Resources
@@ -36,6 +37,8 @@ def forward(
     del module
     pull = resources.spec.dispatch_mode == "pull"
     before_fc2 = resources.spec.apply_probs_before_fc2
+    workspace = resources.workspace
+    workspace_claimed = pull or getattr(route, "workspace_claimed", False)
     binding = route.weight_binding
     plan_options = {}
     if binding is not None:
@@ -44,28 +47,21 @@ def forward(
     options = {} if binding is None else {"weight_binding": binding}
     record = route.checkpoint_record
     if not torch.is_grad_enabled():
-        save = None
-        if record is not None and before_fc2 and hidden_flat.shape[0]:
-            save = _save_replay_activations(record, plan.spec, route, hidden_flat, topk_weights)
         output = _execute_mega_moe_without_autograd(
-            topk_weights, *weights, route, plan, resources.workspace,
-            workspace_claimed=pull, save_activation=save, **options)
+            topk_weights, *weights, route, plan, workspace,
+            workspace_claimed=workspace_claimed, **options)
         if record is not None and binding is not route.weight_binding:
             # Both bank layouts save the same owned guest records. The
             # original binding still selects its own replay protocol.
             route.weight_binding.snapshot = binding.snapshot
-    elif record is not None and record.allow_activation:
-        resources.placement.statistics["skipped_recomputes"] += 1
-        return _CheckpointedMegaMoeFunction.apply(
-            hidden_flat, *weights, route.metadata, plan, resources.workspace,
-            record.activation, topk_weights, binding,
-        ).reshape_as(hidden_states)
     else:
-        integrated_unpermute = pull or before_fc2
+        integrated_unpermute = (pull or before_fc2 or (
+            getattr(workspace, "reuse_bf16_push_saved", False) is True and not route.tensor_dump and is_checkpointing()
+        ))
         output = execute_mega_moe_with_permutation(
-            hidden_flat, topk_ids, *weights, route, plan, resources.workspace,
+            hidden_flat, topk_ids, *weights, route, plan, workspace,
             topk_weights=topk_weights if integrated_unpermute else None,
-            workspace_claimed=pull, **options)
+            workspace_claimed=workspace_claimed, **options)
         if not integrated_unpermute:
             output = restore_topk_output(output, route.unpermute_mapping, topk_weights)
     if binding is not None:
@@ -86,28 +82,3 @@ def _prepare_replica_binding(binding, tensor_dump, num_experts):
     if binding.fused:
         options.update(replica_pipeline=True, reserve_merge_workers=binding.owns_returns)
     return binding, options
-
-
-def _save_replay_activations(record, spec, route, hidden: torch.Tensor, probs: torch.Tensor):
-    """Reserve optional copies within the same per-device checkpoint budget."""
-    from hyper_multicore.modules.hot_replica.checkpoint import ActivationReservation  # pylint: disable=import-outside-toplevel
-
-    rows, hidden_size = hidden.shape
-    required = (
-        (route.metadata.expert_capacity * (hidden_size + 3 * spec.intermediate_size) + 2 * rows * hidden_size)
-        * hidden.element_size() + rows * spec.top_k * (4 + probs.element_size())
-    )
-    reservation = ActivationReservation.reserve(hidden, required, spec.ep_group)
-    if reservation is None:
-        return None
-
-    def save(
-        output: torch.Tensor, dispatch: torch.Tensor, up: torch.Tensor,
-        activation: torch.Tensor, mapping: torch.Tensor,
-    ) -> None:
-        """Retain owned tensors beyond the forward workspace lease."""
-        record.inputs = hidden.detach(), probs.detach()
-        record.input_versions = hidden._version, probs._version  # pylint: disable=protected-access
-        record.activation = output.detach().clone(), dispatch, up, activation, mapping, reservation
-
-    return save

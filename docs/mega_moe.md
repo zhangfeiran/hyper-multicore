@@ -199,15 +199,17 @@ tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
 两个分支可以同时等待计数，依次执行专家，共用 workspace 和副本 bank。外部 FSDP 模块在自己的
 forward 返回前保持专家权重有效。两组已展开的权重可能同时驻留，应实测峰值显存。
 
-启用 HotReplica 布局重放时，重算也会提前提交两支的 Top-K 和参数版本校验投票。全组同意后复用已有路由。
-非重入重算要求所有 rank 保持原布局，校验失败时按原有约定报错。双卡前反向回归入口为
-`python -m pytest -q tests/torch/test_hot_replica.py::test_paired_routes`。
+重算时两个 router 仍按原来的顺序执行，专家调用直接消费同次前向的落位。
+双卡前反向回归入口为
+`python -m pytest -q tests/torch/test_hot_replica_forward_replay.py`。
 
 #### 激活重算
 
-同时使用 `expert_placement` 和非重入激活重算时，训练框架需要接入 HotReplica 的布局重放。
-重放时，整个 EP 组必须确认原始布局，否则全组报错。原前向和重算应保持参数逻辑版本、
-有序 Top-K IDs、执行流和诊断模式一致，并同时省略 `tokens_per_expert` 或传入相同的计数。
+训练框架使用 `ReplayCheckpoint.contexts` 接入非重入 checkpoint，使用 `wrap_checkpoint` 接入重入 checkpoint。
+两种入口都按专家调用顺序复用原前向落位。重算正常运行 Router，包括有序 Top-K 和可微的路由概率。
+前向与重算须保持参数逻辑版本、专家执行器、调用顺序、有序 Top-K IDs、执行流和诊断模式一致，
+并同时省略 `tokens_per_expert` 或传入与路由相符的计数。
+前向计数交换检查整个 EP 组的 checkpoint 接入。重算在本地检查调用元数据，失配时由训练启动器终止分布式作业。
 接入机制见[专家布局重放](design/mega_moe_design.md#专家布局重放)。
 
 ### 旧 HotReplica 接口退役
