@@ -393,7 +393,10 @@ def test_wide_placement_and_hard_receive_limit():
 def test_paired_routes():
     """Compare serial and staged EOI expert outputs/gradients through a full two-call replay."""
     import torch_npu
+    from contextlib import nullcontext
     from torch.utils.checkpoint import set_checkpoint_early_stop
+
+    from hyper_multicore.modules.hot_replica import prefetch
 
     rank = int(os.environ["LOCAL_RANK"])
     torch_npu.npu.set_device(rank)
@@ -415,7 +418,16 @@ def test_paired_routes():
                            torch.randn(4, 256, 512, device=device, dtype=torch.bfloat16) * .02,
                            torch.randn(4, 512, 128, device=device, dtype=torch.bfloat16) * .02))
 
-        def run(staged):
+        staged_widths = []
+        gather_to_host = prefetch._gather_to_host
+
+        def track_gather(payload, spec, control):
+            staged_widths.append(payload.numel())
+            return gather_to_host(payload, spec, control)
+
+        prefetch._gather_to_host = track_gather
+
+        def run(staged, pair_votes=False):
             def pair(*inputs):
                 def call(branch, **options):
                     h, p, gate_up, down = inputs[4 * branch:4 * branch + 4]
@@ -437,7 +449,9 @@ def test_paired_routes():
                     generation = call(1, route_schedule=second)
                     return result
 
-                u = call(0, route_schedule=first)
+                context = prefetch.pair_replay_votes() if pair_votes else nullcontext()
+                with context:
+                    u = call(0, route_schedule=first)
                 return u, generation
 
             leaves = [v.detach().requires_grad_() for v in values]
@@ -448,9 +462,13 @@ def test_paired_routes():
             assert len(tape.records) == 2
             return [v.detach().cpu() for v in (*out, *(leaf.grad for leaf in leaves))]
 
-        serial, staged = run(False), run(True)
-        for actual, expected in zip(staged, serial, strict=True):
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        serial = run(False)
+        for pair_votes, widths in ((False, [1, 1]), (True, [2])):
+            staged_widths.clear()
+            staged = run(True, pair_votes)
+            assert [width for width in staged_widths if width <= 2] == widths
+            for actual, expected in zip(staged, serial, strict=True):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         for expert in experts:
             expert.close()
     finally:

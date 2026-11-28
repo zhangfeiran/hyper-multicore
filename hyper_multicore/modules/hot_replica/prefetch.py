@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Stage one HotReplica invocation's count agreement outside the expert workspace."""
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,15 +70,68 @@ def _gather_to_host(payload, spec, control):
     return PendingWire(payload, gathered, work, host, ready)
 
 
+class _ReplayVotePair:
+    """Share one Host completion between two consecutive replay validations."""
+
+    def __init__(self):
+        self.flags = []
+        self.resources = None
+        self.pending = None
+        self.rows = None
+
+    def stage(self, flag, resources):
+        index = len(self.flags)
+        if index == 0:
+            self.resources = resources
+        elif index != 1 or self.resources is not resources:
+            raise ValueError("Paired replay votes require two calls sharing execution resources")
+        self.flags.append(flag)
+        if index == 1:
+            self.pending = _stage_votes(self.flags, resources)
+        return index
+
+    def read(self, index):
+        if self.pending is None:
+            raise RuntimeError("Stage both paired replay votes before executing either expert")
+        if self.rows is None:
+            self.pending.ready.synchronize()
+            self.rows = self.pending.host.reshape(-1, 2).transpose(0, 1).tolist()
+        return self.rows[index]
+
+
+_VOTE_PAIR: ContextVar[_ReplayVotePair | None] = ContextVar("hmc_replay_vote_pair", default=None)
+
+
+@contextmanager
+def pair_replay_votes():
+    """Allow the two staged invocations of one decoder pair to share a replay gather."""
+    token = _VOTE_PAIR.set(_ReplayVotePair())
+    try:
+        yield
+    finally:
+        _VOTE_PAIR.reset(token)
+
+
+def _stage_votes(flags, resources):
+    control = _control_stream(resources, flags[0].device)
+    with torch.npu.stream(control):
+        for flag in flags:
+            flag.record_stream(control)
+        payload = flags[0] if len(flags) == 1 else torch.cat(flags)
+        return _gather_to_host(payload, resources.spec, control)
+
+
 def start_replay_vote(record, hidden, ids, probs, counts, resources, mask):
     """Stage the existing vote and preserve the checkpoint mode's replay contract."""
     from .checkpoint import local_replay_vote, resolve_replay_vote
 
     flag = local_replay_vote(record, hidden, ids, probs, counts, resources.spec, mask)
-    control = _control_stream(resources, hidden.device)
-    with torch.npu.stream(control):
-        flag.record_stream(control)
-        pending = _gather_to_host(flag, resources.spec, control)
+    pair = _VOTE_PAIR.get()
+    if pair is not None:
+        index = pair.stage(flag, resources)
+        return lambda: resolve_replay_vote(record, pair.read(index))
+
+    pending = _stage_votes([flag], resources)
 
     def finish():
         pending.ready.synchronize()
