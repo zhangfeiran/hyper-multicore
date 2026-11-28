@@ -71,15 +71,29 @@ class TestMegaMoeRoute(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_stock_torch_npu_uses_separate_push_counting(self) -> None:
-        """Use the existing histogram and permutation on stock TorchNPU 2.7.1."""
-        hidden = SimpleNamespace(device=SimpleNamespace(type="npu"), shape=(8, 4))
+    def test_stock_torch_npu_uses_unquantized_fused_push_counting(self) -> None:
+        """Use the fused routing operator with quantization explicitly disabled."""
+        hidden = SimpleNamespace(device=SimpleNamespace(type="npu"), shape=(2, 4))
         spec = replace(self._spec(), dispatch_mode="push")
-        for version, fused in (("2.7.1", False), ("2.7.1.post4", True)):
+        ids = torch.tensor([[0, 1], [0, 2]], dtype=torch.int64)
+        rows = torch.ones(4, 4)
+        inverse = torch.tensor([[0, 2], [1, 3]])
+        counts = torch.tensor([2, 1, 1, 0])
+        for version in ("2.7.1", "2.7.1.post4"):
+            operator = Mock(return_value=(rows, inverse, counts, None))
+            torch_npu = SimpleNamespace(__version__=version, npu_moe_init_routing_v2=operator)
             with self.subTest(version=version), patch.object(
-                route_module, "load_torch_npu", return_value=SimpleNamespace(__version__=version),
+                route_module, "load_torch_npu", return_value=torch_npu,
             ):
-                self.assertEqual(route_module._can_fuse_count(hidden, spec, None), fused)
+                self.assertTrue(route_module._can_fuse_count(hidden, spec, None))
+                self.assertFalse(route_module._can_fuse_count(hidden, spec, counts))
+                self.assertFalse(route_module._can_fuse_count(hidden, replace(spec, dispatch_mode="pull"), None))
+                (routed, mapping), histogram = route_module._permute_and_count(hidden, ids, spec)
+                operator.assert_called_once()
+                self.assertEqual(operator.call_args.kwargs["quant_mode"], -1)
+                self.assertIs(routed, rows)
+                torch.testing.assert_close(mapping, inverse.flatten().int())
+                torch.testing.assert_close(histogram, counts.int())
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
