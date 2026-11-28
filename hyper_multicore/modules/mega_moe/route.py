@@ -163,6 +163,18 @@ def _validate_supplied_counts(
         )
 
 
+def _route_input_mask(tokens_per_expert, spec, device, autograd_mask):
+    """Carry invalid supplied counts through the dynamic EP agreement."""
+    if tokens_per_expert is not None:
+        try:
+            _validate_supplied_counts(tokens_per_expert, spec.num_experts, device)
+        except (TypeError, ValueError):
+            if not spec.dynamic_tokens or spec.ep_size == 1:
+                raise
+            autograd_mask |= _INVALID_COUNTS_MASK
+    return autograd_mask
+
+
 def _resolve_counts(
     flat_ids: torch.Tensor,
     supplied_counts: torch.Tensor | None,
@@ -507,13 +519,7 @@ def prepare_topk_route(
         Permuted tokens and exact native route metadata.
     """
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
-    if tokens_per_expert is not None:
-        try:
-            _validate_supplied_counts(tokens_per_expert, spec.num_experts, flat_ids.device)
-        except (TypeError, ValueError):
-            if not spec.dynamic_tokens or spec.ep_size == 1:
-                raise
-            autograd_mask |= _INVALID_COUNTS_MASK
+    autograd_mask = _route_input_mask(tokens_per_expert, spec, flat_ids.device, autograd_mask)
     if spec.dynamic_tokens:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
                                       workspace, autograd_mask, prepare_workspace, select_placement,
@@ -981,7 +987,7 @@ def _prepare_dynamic_route(
 
 def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gathered,
                           work, stream, prepare_workspace, select_placement, autograd_mask=0,
-                          reuse_placement_geometry=False):
+                          reuse_placement_geometry=False, snapshot=None):
     """Select a per-call route between count validation and capacity commitment."""
     if work is not None:
         work.wait()
@@ -989,7 +995,8 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
     if reuse_placement_geometry:
         from ..hot_replica.bounded_placement import read_placement_wire  # pylint: disable=import-outside-toplevel
 
-        snapshot = read_placement_wire(gathered, spec, workspace, stream)
+        if snapshot is None:
+            snapshot = read_placement_wire(gathered, spec, workspace, stream)
         summary = snapshot.summary
         host_rows = None
         metadata = None

@@ -15,6 +15,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 """Shared error convergence, source leases and dynamic MX plan bounds."""
 from collections import OrderedDict
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -22,7 +23,7 @@ import pytest
 import torch
 
 from hyper_multicore.modules.mega_moe import invocation
-from hyper_multicore.modules.mega_moe.route import _INVALID_WEIGHT_MASK
+from hyper_multicore.modules.mega_moe.route import _INVALID_COUNTS_MASK, _INVALID_WEIGHT_MASK
 from hyper_multicore.modules.mega_moe.backends.mxfp8 import backend
 from hyper_multicore.modules.mega_moe.backends.mxfp8.graph import build_mxfp8_runtime
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -80,3 +81,68 @@ def test_mx_plan_cache_distinguishes_committed_token_coverage():
         assert small.forward.graph.get_op('dispatch').task_num < large.forward.graph.get_op('dispatch').task_num
         with pytest.raises(ValueError, match='committed'):
             resources.plan_for_capacity(8192, 'cpu', tokens=2048)
+
+
+def test_scheduled_routes_start_before_either_workspace_is_used(monkeypatch):
+    """Stage both masks and retain separate receipts, including a failing second read."""
+    from hyper_multicore.modules.hot_replica import prefetch
+
+    spec = SimpleNamespace(auto_tokens=True, dispatch_mode="push", ep_size=2, num_experts=4)
+    resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=Mock())
+    resources.placement.uses_placement_wire.return_value = True
+    first, second = Mock(), Mock()
+    first.permuted = second.permuted = None
+    first.payload = second.payload = torch.zeros(7)
+    second.snapshot.side_effect = ValueError("bad peer weight")
+    start = Mock(side_effect=[first, second])
+    monkeypatch.setattr(prefetch, "start_wire", start)
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _: "compute")
+    finish = Mock(return_value=object())
+    monkeypatch.setattr(invocation, "_prepare_placed_route", finish)
+    h = torch.ones(1, 2, requires_grad=True)
+    ids, probs = torch.zeros(1, 1, dtype=torch.int32), torch.ones(1, 1, requires_grad=True)
+    args = (h, ids, probs, None, (h, h), resources)
+    u = invocation.prepare_expert_invocation(*args, planner=object(), scheduled=True)
+    g = invocation.prepare_expert_invocation(*args, planner=object(), scheduled=True, weight_error=True)
+    assert [call.args[-1] for call in start.call_args_list] == [31, _INVALID_WEIGHT_MASK]
+    resources.workspace.wait_for_reuse.assert_not_called()
+    first.snapshot.assert_not_called()
+    second.snapshot.assert_not_called()
+    with u as routed:
+        assert routed is finish.return_value
+        assert finish.call_args.kwargs["snapshot"] is first.snapshot.return_value
+    with pytest.raises(ValueError, match="bad peer weight"), g:
+        pytest.fail("a rejected route may not start the expert kernel")
+    finish.assert_called_once()
+
+
+@pytest.mark.parametrize("invalid_counts", [False, True])
+def test_staged_route_submits_shared_counts_and_propagates_invalid_input(monkeypatch, invalid_counts):
+    """A staged Push reuses the native permutation and joins EP even with bad local counts."""
+    from hyper_multicore.modules.hot_replica import prefetch
+
+    spec = SimpleNamespace(dynamic_tokens=True, auto_tokens=True, ep_size=2, num_experts=2, top_k=1, hidden_size=2)
+    resources = SimpleNamespace(spec=spec)
+    hidden, ids, probs = torch.ones(2, 2), torch.zeros(2, 1, dtype=torch.int32), torch.ones(2, 1)
+    counts = torch.tensor([2, 0], dtype=torch.int32)
+    permuted = hidden, ids.flatten()
+    fused = Mock(return_value=(permuted, counts))
+    monkeypatch.setattr(prefetch, "_control_stream", lambda *_: object())
+    monkeypatch.setattr(torch.npu, "stream", lambda _: nullcontext())
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda *_: None)
+    monkeypatch.setattr(prefetch, "_can_fuse_count", lambda _hidden, _spec, supplied: supplied is None)
+    monkeypatch.setattr(prefetch, "_permute_and_count", fused)
+    gather = Mock(return_value=SimpleNamespace())
+    monkeypatch.setattr(prefetch, "_gather_to_host", gather)
+
+    pending = prefetch.start_wire(hidden, ids, probs, counts.float() if invalid_counts else None, resources, 1)
+    gather.assert_called_once()
+    payload = gather.call_args.args[0]
+    if invalid_counts:
+        fused.assert_not_called()
+        assert pending.permuted is None
+        assert payload.tolist() == [0, 2, 1 | _INVALID_COUNTS_MASK, 0, 0]
+    else:
+        fused.assert_called_once_with(hidden, ids, spec)
+        assert pending.permuted is permuted
+        assert payload.tolist() == [0, 2, 1, 2, 0]
