@@ -264,16 +264,15 @@ def _permute_and_count(hidden: torch.Tensor, ids: torch.Tensor, spec: MegaMoeSpe
     """Produce the ordinary push buffer, inverse map and histogram in one NPU launch."""
     rows, inverse, counts, _ = load_torch_npu().npu_moe_init_routing_v2(
         hidden, ids.int(), active_num=ids.numel(), expert_num=spec.num_experts,
-        expert_tokens_num_type=1, expert_tokens_num_flag=True,
+        expert_tokens_num_type=1, expert_tokens_num_flag=True, quant_mode=-1,
         active_expert_range=[0, spec.num_experts], row_idx_type=0,
     )
     return (rows, inverse.reshape(-1).int().contiguous()), counts.int().contiguous()
 
 
 def _can_fuse_count(hidden: torch.Tensor, spec: MegaMoeSpec, supplied_counts) -> bool:
-    # Stock 2.7.1 can call MoeInitRoutingV3 without the required scale tensor.
     return (hidden.device.type == "npu" and spec.dispatch_mode == "push" and
-            supplied_counts is None and hidden.shape[0] > 0 and load_torch_npu().__version__ != "2.7.1")
+            supplied_counts is None and hidden.shape[0] > 0)
 
 
 def _permute_topk_input(
