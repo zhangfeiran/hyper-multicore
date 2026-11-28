@@ -13,12 +13,14 @@
 # limitations under the License.
 # ============================================================================
 """Precision-independent workspace, lease and distributed resource ownership."""
+import os
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 import torch
 import torch.distributed as dist
 from hyper_multicore import _collective, shmem
+from hyper_multicore._loader import load_torch_npu
 from . import transport as moe_transport
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .spec import MegaMoeSpec, bind_mega_moe_spec
@@ -85,6 +87,13 @@ class _MegaMoeExecutionResources:
                 self.plan = self._initial_plan(tensor)
                 self.workspace = MegaMoeWorkspace(
                     shared=shared, event_experts=_workspace_event_experts(specification) if placement else None,
+                    reuse_bf16_push_scratch=(
+                        bool(placement) and self.spec.precision == "bf16"
+                        and self.spec.architecture == 2201 and self.spec.dispatch_mode == "push"
+                        and transport == "mte"
+                        and os.environ.get("HYPER_MULTICORE_A3_PUSH_REUSE_SCRATCH") == "1"
+                        and load_torch_npu().__version__ == "2.7.1"
+                    ),
                 )
                 self.workspace.transport_engine = self.spec.transport_engine
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)

@@ -175,6 +175,9 @@ class MegaMoeWorkspace:
     route_cache_probe_after: int = field(default=0, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
+    reuse_bf16_push_scratch: bool = False
+    _local_scratch: dict[tuple[str, torch.dtype], torch.Tensor] = field(
+        default_factory=dict, init=False, repr=False)
 
     def _allocation_specs(self, spec, dtype, capacity):
         """Derive the symmetric allocations for this workspace layout."""
@@ -191,6 +194,23 @@ class MegaMoeWorkspace:
             apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
         return allocations
+
+    def borrow_local_scratch(
+        self, role: str, shape: tuple[int, ...], reference: torch.Tensor,
+    ) -> torch.Tensor:
+        """Borrow ordinary storage whose final consumer runs during this lease."""
+        if not self.in_use:
+            raise RuntimeError("MegaMoe scratch requires an active workspace lease")
+        size = math.prod(shape)
+        key = role, reference.dtype
+        storage = self._local_scratch.get(key)
+        if storage is None or storage.numel() < size:
+            storage = reference.new_empty((size,))
+            self._local_scratch[key] = storage
+        if self.lease_stream is not None:
+            # A later capacity increase can drop this storage while a consumer is queued.
+            storage.record_stream(self.lease_stream)
+        return storage[:size].view(shape)
 
     def probabilities(self, spec: MegaMoeSpec) -> ProbabilityWorkspace:
         """Rebind aliases when heap storage or a retained plan's stride changes."""
@@ -483,6 +503,7 @@ class MegaMoeWorkspace:
 
     def _free_local_tensors(self) -> None:
         """Release local-only workspaces after all queued kernels complete."""
+        self._local_scratch.clear()
         for field_name in ("gmm_workspace", "swiglu_grad_workspace"):
             tensor = getattr(self, field_name)
             if tensor is None:
@@ -503,7 +524,7 @@ class MegaMoeWorkspace:
                 raise RuntimeError("cannot close MegaMoe workspace during an active call.")
             if not self.can_close():
                 raise RuntimeError("cannot close MegaMoe workspace while backward graphs still need its buffers.")
-            empty = all(tensor is None for tensor in (
+            empty = not self._local_scratch and all(tensor is None for tensor in (
                 self.source_buffer,
                 self.expert_buffer,
                 self.routed_buffer,

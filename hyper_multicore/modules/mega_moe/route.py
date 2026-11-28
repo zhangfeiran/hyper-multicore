@@ -63,6 +63,7 @@ class PreparedTopKRoute:
     weight_binding: Any = field(default=None, repr=False, compare=False)
     checkpoint_record: Any = field(default=None, repr=False, compare=False)
     tensor_dump: bool = False
+    workspace_claimed: bool = False
 
 
 _record_metadata_stream = RouteMetadata.record_stream
@@ -296,7 +297,7 @@ def _permute_topk_input_out(
     topk_ids: torch.Tensor,
     output: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Keep the inverse mapping owned while writing rows into leased SHMEM."""
+    """Keep the inverse mapping owned while writing into caller-provided storage."""
     mapping = torch.empty(topk_ids.numel(), dtype=torch.int32, device=topk_ids.device)
     multicore_ops.moe_token_permute_out(hidden_states.contiguous(), topk_ids.contiguous(), output, mapping)
     return output, mapping

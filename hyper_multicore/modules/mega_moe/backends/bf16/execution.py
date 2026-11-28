@@ -36,6 +36,8 @@ def forward(
     del module
     pull = resources.spec.dispatch_mode == "pull"
     before_fc2 = resources.spec.apply_probs_before_fc2
+    workspace = resources.workspace
+    workspace_claimed = pull or getattr(route, "workspace_claimed", False)
     binding = route.weight_binding
     plan_options = {}
     if binding is not None:
@@ -45,8 +47,8 @@ def forward(
     record = route.checkpoint_record
     if not torch.is_grad_enabled():
         output = _execute_mega_moe_without_autograd(
-            topk_weights, *weights, route, plan, resources.workspace,
-            workspace_claimed=pull, **options)
+            topk_weights, *weights, route, plan, workspace,
+            workspace_claimed=workspace_claimed, **options)
         if record is not None and binding is not route.weight_binding:
             # Both bank layouts save the same owned guest records. The
             # original binding still selects its own replay protocol.
@@ -54,9 +56,9 @@ def forward(
     else:
         integrated_unpermute = pull or before_fc2
         output = execute_mega_moe_with_permutation(
-            hidden_flat, topk_ids, *weights, route, plan, resources.workspace,
+            hidden_flat, topk_ids, *weights, route, plan, workspace,
             topk_weights=topk_weights if integrated_unpermute else None,
-            workspace_claimed=pull, **options)
+            workspace_claimed=workspace_claimed, **options)
         if not integrated_unpermute:
             output = restore_topk_output(output, route.unpermute_mapping, topk_weights)
     if binding is not None:

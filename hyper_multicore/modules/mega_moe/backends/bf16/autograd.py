@@ -137,6 +137,13 @@ def _restore_unweighted_output(rows: torch.Tensor, mapping: torch.Tensor, top_k:
     return multicore_ops.moe_token_permute_grad(rows, mapping, rows.shape[0] // top_k, top_k)
 
 
+def _backward_scratch(workspace: MegaMoeWorkspace | None, role: str, shape: tuple[int, int],
+                      reference: torch.Tensor) -> torch.Tensor:
+    if workspace is None:
+        return torch.empty(shape, dtype=reference.dtype, device=reference.device)
+    return workspace.borrow_local_scratch(role, shape, reference)
+
+
 def _stage_backward_source(ctx: Any, grad_output: Any, permutation_inputs: tuple[Any, ...]) -> tuple[Any, Any]:
     """Stage backward tokens and probabilities before expert scratch allocation."""
     if ctx.plan.spec.apply_probs_before_fc2:
@@ -194,6 +201,7 @@ def _allocate_backward_intermediates(
     *, weight_grad_dtype: torch.dtype | None = None,
     group_list: torch.Tensor | None = None,
     all_experts_active: bool = False,
+    scratch_workspace: MegaMoeWorkspace | None = None,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
     if group_list is None:
@@ -205,15 +213,9 @@ def _allocate_backward_intermediates(
         grad_weight2 = torch.empty_like(weight2, dtype=weight_grad_dtype, memory_format=torch.contiguous_format)
         if not all_experts_active:
             multicore_ops.zero_empty_expert_gradients(grad_weight1, grad_weight2, group_list)
-    act_grad = torch.empty(
-        (capacity, spec.intermediate_size),
-        dtype=grad_output.dtype,
-        device=grad_output.device,
-    )
-    swiglu_grad = torch.empty(
-        (capacity, spec.intermediate_size * 2),
-        dtype=grad_output.dtype,
-        device=grad_output.device,
+    act_grad = _backward_scratch(scratch_workspace, "act_grad", (capacity, spec.intermediate_size), grad_output)
+    swiglu_grad = _backward_scratch(
+        scratch_workspace, "swiglu_grad", (capacity, spec.intermediate_size * 2), grad_output,
     )
     gate_dx = reusable_dispatch if reusable_dispatch is not None else torch.empty(
         (capacity, spec.hidden_size),
@@ -282,6 +284,8 @@ def _prepare_backward_execution(
     grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
     weights = (saved.weight1, saved.weight2) if owner_weights is None else owner_weights
     groups = saved.group_list if owner_weights is None else saved.group_list[:weights[0].shape[0]]
+    reuse_scratch = getattr(workspace, "reuse_bf16_push_scratch", False) is True
+    scratch = workspace if reuse_scratch and not is_tensor_dump_active() else None
     return _BackwardExecution(
         dispatch=dispatch,
         grad_x=grad_x,
@@ -301,6 +305,7 @@ def _prepare_backward_execution(
                                else weights[0].dtype),
             group_list=groups,
             all_experts_active=bool(saved.all_experts_active.item()),
+            scratch_workspace=scratch,
         ),
     )
 

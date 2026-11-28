@@ -24,7 +24,7 @@ from .heap_manager import _HeapCapacityError
 from .route import (
     _INVALID_WEIGHT_MASK, _TENSOR_DUMP_MASK,
     PreparedTopKRoute, _materialize_route_permutation,
-    _prepare_placed_route, prepare_topk_route,
+    _permute_topk_input_out, _prepare_placed_route, prepare_topk_route,
 )
 
 if TYPE_CHECKING:
@@ -134,21 +134,31 @@ def _restore_checkpoint_route(
     resources: "_MegaMoeExecutionResources", tensor_dump: bool,
 ) -> Iterator[PreparedTopKRoute]:
     """Permute current inputs with the exact descriptors selected in forward."""
-    pull = resources.spec.dispatch_mode == "pull"
     workspace = resources.workspace
-    if pull:
+    reuse_source = (getattr(workspace, "reuse_bf16_push_scratch", False) is True
+                    and not tensor_dump and bool(hidden.shape[0]))
+    claimed = resources.spec.dispatch_mode == "pull" or reuse_source
+    if claimed:
         # Forward committed this capacity. A restart only grows or rebinds it.
         workspace.claim()
     try:
         with torch.inference_mode(False), torch.no_grad():
             binding = route.weight_binding
             virtual_ids = binding.placement.virtual_ids if binding is not None else ids
-            rows, mapping = _materialize_route_permutation(hidden, virtual_ids, resources.spec, workspace)
+            if reuse_source:
+                shape = (virtual_ids.numel(), hidden.shape[1])
+                source = workspace.borrow_local_scratch("push_source_rows", shape, hidden)
+                rows, mapping = _permute_topk_input_out(hidden, virtual_ids, source)
+            else:
+                rows, mapping = _materialize_route_permutation(hidden, virtual_ids, resources.spec, workspace)
         resources.placement.statistics["route_replays"] += 1
-        yield replace(route, routed_tokens=rows, unpermute_mapping=mapping, tensor_dump=tensor_dump)
+        yield replace(
+            route, routed_tokens=rows, unpermute_mapping=mapping, tensor_dump=tensor_dump,
+            workspace_claimed=claimed,
+        )
     finally:
-        if pull:
-            workspace.release()
+        if claimed:
+            workspace.release(stream=workspace.lease_stream)
 
 
 def _record_checkpoint_route(route, record, counts):
