@@ -243,8 +243,8 @@ def native_context() -> str:
     return f"runtime={_selection['actual']} adapter={_selection['variant']} built={record}"
 
 
-def preload_vendor_library(vendor_root: Path) -> None:
-    """Load the exact ACLNN library without exposing its dependency symbols globally."""
+def preload_vendor_library(vendor_root: Path) -> Path:
+    """Load the exact ACLNN library locally and return its path."""
     library_path = vendor_root / "op_api" / "lib" / "libcust_opapi.so"
     try:
         # CANN libraries can export identically named globals. Global promotion
@@ -255,6 +255,7 @@ def preload_vendor_library(vendor_root: Path) -> None:
         raise NativeComponentUnavailableError(
             f"[HP-NATIVE-VENDOR-LOAD-FAILED] library={library_path} {native_context()} error={error}."
         ) from error
+    return library_path
 
 
 def _component_root() -> Path:

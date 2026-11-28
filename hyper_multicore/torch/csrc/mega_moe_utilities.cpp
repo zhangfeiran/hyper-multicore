@@ -1,11 +1,12 @@
 // Copyright 2026 Huawei Technologies Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0
 // Framework bindings for component-owned MoE utility providers.
+#include <acl/acl.h>
+
 #include <c10/core/DeviceGuard.h>
 #include <torch/library.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
-#include <acl/acl.h>
 #include <cstdint>
 #include <tuple>
 

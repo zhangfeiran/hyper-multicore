@@ -47,6 +47,12 @@ bash build.sh --jobs 24
 payload 位于 `build/native/payload/hyper_multicore/`。
 生成的 wheel 可安装到运行环境，本地 payload 可直接用于源码验证。
 
+使用官方 TorchNPU 2.7.1 在 Atlas A3 上构建时，激活目标环境后执行
+`bash build.sh --soc-list ascend910_93`。这个发行包缺少 OpPlugin 扩展头，构建会选择 CANN
+公开 ACLNN 桥，使用 Toolkit 的 `aclnnop` 头文件和 `libnnopbase.so`。该桥处理基础格式张量。
+该版本训练使用显式 ACLNN unpermute 反向计算 FP32 Router 概率的梯度，Push 分开执行置换和专家计数。
+使用带 OpPlugin 扩展头的环境构建时，仍通过 OpPlugin 提交算子。
+
 ## 安装与验证
 
 ### 安装已有 wheel
