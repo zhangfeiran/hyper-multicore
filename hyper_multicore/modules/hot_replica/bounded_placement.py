@@ -105,8 +105,7 @@ def _placement_metadata(counts, spec, capacity, plan_tokens, tokens, device):
         dispatch_source, dispatch_target, dispatch_sizes = source[rank], targets[:, :, rank].reshape(-1), counts[rank]
     wide = (dispatch_source, dispatch_target, receive_target, receive_source, ends[rank, ranks - 1::ranks])
     sizes = (dispatch_sizes, receive_sizes)
-    metadata = _pack_host_route(tuple(a.tolist() for a in wide), tuple(a.tolist() for a in sizes),
-                                capacity, device, spec.hidden_size)
+    metadata = _pack_host_route(wide, sizes, capacity, device, spec.hidden_size)
     return replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens)
 
 

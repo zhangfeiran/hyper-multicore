@@ -23,6 +23,7 @@ from dataclasses import dataclass, field, replace
 from itertools import accumulate
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.autograd.function import once_differentiable
@@ -463,8 +464,8 @@ def _host_route_prefixes(
 
 
 def _pack_host_route(
-    wide: tuple[list[int], ...],
-    size_fields: tuple[list[int], ...],
+    wide: tuple[list[int] | np.ndarray, ...],
+    size_fields: tuple[list[int] | np.ndarray, ...],
     capacity: int,
     device: Any,
     hidden_size: int = 1,
@@ -472,13 +473,26 @@ def _pack_host_route(
     """Upload row and native element descriptors in one retained allocation."""
     fields = [*wide, *size_fields]
     dtypes = [torch.int64] * len(wide) + [torch.int32] * 2
-    element_fields = [[value * hidden_size for value in values] for values in (*wide[:4], *size_fields)]
+    array_fields = isinstance(wide[0], np.ndarray)
+    scaled = (*wide[:4], *size_fields)
+    if array_fields:
+        element_fields = [np.multiply(values, hidden_size, dtype=np.int64) for values in scaled]
+    else:
+        element_fields = [[value * hidden_size for value in values] for values in scaled]
     fields += element_fields
     dtypes += [torch.int64] * 4 + [torch.int32] * 2
     storage = bytearray()
     slices = []
     for values, dtype in zip(fields, dtypes):
-        encoded = array("q" if dtype == torch.int64 else "i", values).tobytes()
+        if array_fields:
+            storage_dtype = np.int64 if dtype == torch.int64 else np.int32
+            if storage_dtype == np.int32 and values.dtype != np.int32 and values.size:
+                limits = np.iinfo(np.int32)
+                if values.min() < limits.min or values.max() > limits.max:
+                    raise OverflowError("MegaMoe route size does not fit INT32")
+            encoded = memoryview(np.ascontiguousarray(values, dtype=storage_dtype)).cast("B")
+        else:
+            encoded = array("q" if dtype == torch.int64 else "i", values).tobytes()
         start = len(storage)
         storage.extend(encoded)
         slices.append((start, len(storage), dtype))
